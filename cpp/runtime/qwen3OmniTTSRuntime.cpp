@@ -33,10 +33,15 @@
 #include <algorithm>
 #include <chrono>
 #include <cmath>
+#include <cstdlib>
 #include <cuda_runtime.h>
+#include <cstring>
 #include <filesystem>
 #include <fstream>
+#include <iterator>
 #include <nlohmann/json.hpp>
+#include <random>
+#include <sstream>
 #include <unordered_set>
 
 namespace trt_edgellm
@@ -49,6 +54,148 @@ using namespace talker_constants;
 
 namespace
 {
+uint32_t halfToFloatBits(uint16_t h)
+{
+    uint32_t const sign = (h >> 15) & 1;
+    uint32_t const exp = (h >> 10) & 0x1F;
+    uint32_t const mant = h & 0x3FF;
+    if (exp == 0x1F)
+    {
+        return (sign << 31) | (0xFF << 23) | (mant << 13);
+    }
+    if (exp == 0)
+    {
+        return sign << 31;
+    }
+    return (sign << 31) | ((exp + 112) << 23) | (mant << 13);
+}
+
+std::vector<float> copyHalfTensorToHostFloat(rt::Tensor const& tensor, int64_t elements, cudaStream_t stream)
+{
+    std::vector<uint16_t> raw(static_cast<size_t>(elements));
+    std::vector<float> out(static_cast<size_t>(elements));
+    CUDA_CHECK(cudaMemcpyAsync(raw.data(), tensor.rawPointer(), raw.size() * sizeof(uint16_t),
+        cudaMemcpyDeviceToHost, stream));
+    CUDA_CHECK(cudaStreamSynchronize(stream));
+    for (int64_t i = 0; i < elements; ++i)
+    {
+        uint32_t const bits = halfToFloatBits(raw[static_cast<size_t>(i)]);
+        std::memcpy(&out[static_cast<size_t>(i)], &bits, sizeof(float));
+    }
+    return out;
+}
+
+int32_t sampleLogitsCPU(rt::Tensor const& deviceLogits, int32_t vocabSize, int32_t topK, float temperature,
+    bool suppressEos, int32_t eosId, float eosBias, bool suppressRange, std::mt19937& rng, cudaStream_t stream)
+{
+    std::vector<double> logits(static_cast<size_t>(vocabSize));
+    std::vector<float> host(static_cast<size_t>(vocabSize));
+    CUDA_CHECK(cudaMemcpyAsync(host.data(), deviceLogits.rawPointer(), host.size() * sizeof(float),
+        cudaMemcpyDeviceToHost, stream));
+    CUDA_CHECK(cudaStreamSynchronize(stream));
+
+    for (int32_t i = 0; i < vocabSize; ++i)
+    {
+        logits[i] = static_cast<double>(host[i]);
+    }
+
+    if (suppressEos && eosId >= 0 && eosId < vocabSize)
+    {
+        logits[eosId] = -1e30;
+    }
+    if (suppressRange)
+    {
+        int32_t const suppressStart = vocabSize - 1024;
+        for (int32_t i = suppressStart; i < vocabSize; ++i)
+        {
+            if (i != eosId)
+            {
+                logits[i] = -1e30;
+            }
+        }
+    }
+    if (eosBias != 0.0f && !suppressEos && eosId >= 0 && eosId < vocabSize)
+    {
+        logits[eosId] += static_cast<double>(eosBias);
+    }
+    if (temperature > 1e-6f)
+    {
+        for (auto& v : logits)
+        {
+            v /= static_cast<double>(temperature);
+        }
+    }
+    if (topK > 0 && topK < vocabSize)
+    {
+        std::vector<double> sorted(logits);
+        std::nth_element(sorted.begin(), sorted.end() - topK, sorted.end());
+        double const threshold = sorted[sorted.size() - topK];
+        for (auto& v : logits)
+        {
+            if (v < threshold)
+            {
+                v = -1e30;
+            }
+        }
+    }
+
+    double const maxVal = *std::max_element(logits.begin(), logits.end());
+    double sum = 0.0;
+    for (auto& v : logits)
+    {
+        v = std::exp(v - maxVal);
+        sum += v;
+    }
+    for (auto& v : logits)
+    {
+        v /= sum;
+    }
+
+    std::discrete_distribution<int32_t> dist(logits.begin(), logits.end());
+    return dist(rng);
+}
+
+bool detectPrimaryRepetition(std::vector<int32_t> const& history, int32_t minRepeat)
+{
+    int32_t const n = static_cast<int32_t>(history.size());
+    if (n < minRepeat)
+    {
+        return false;
+    }
+    int32_t const last = history.back();
+    int32_t count = 0;
+    for (int32_t i = n - 1; i >= 0 && history[i] == last; --i)
+    {
+        ++count;
+    }
+    if (count >= minRepeat)
+    {
+        return true;
+    }
+    if (n >= minRepeat * 2)
+    {
+        int32_t const a = history[n - 2];
+        int32_t const b = history[n - 1];
+        int32_t pairs = 0;
+        for (int32_t i = n - 2; i >= 1; i -= 2)
+        {
+            if (history[i - 1] == a && history[i] == b)
+            {
+                ++pairs;
+            }
+            else
+            {
+                break;
+            }
+        }
+        if (pairs >= minRepeat)
+        {
+            return true;
+        }
+    }
+    return false;
+}
+
 // Helper: Extract MLP weights from safetensors (eliminates code duplication)
 bool extractMLPWeightsFromTensors(std::vector<rt::Tensor>& tensors, rt::Tensor& fc1Weight, rt::Tensor& fc1Bias,
     rt::Tensor& fc2Weight, rt::Tensor& fc2Bias, std::string const& projectionName)
@@ -94,6 +241,372 @@ bool extractMLPWeightsFromTensors(std::vector<rt::Tensor>& tensors, rt::Tensor& 
 }
 } // anonymous namespace
 
+class Qwen3OmniTTSRuntime::SpecialCodePredictorEngine
+{
+public:
+    SpecialCodePredictorEngine(std::filesystem::path const& enginePath, std::filesystem::path const& embedPath,
+        int32_t hiddenSize, int32_t codebookSize, int32_t numLayers, int32_t numHeads, int32_t headDim,
+        int32_t numGroups, cudaStream_t stream)
+        : mHiddenSize(hiddenSize)
+        , mCodebookSize(codebookSize)
+        , mNumLayers(numLayers)
+        , mNumHeads(numHeads)
+        , mHeadDim(headDim)
+        , mNumGroups(numGroups)
+        , mStream(stream)
+        , mRng(static_cast<uint32_t>(std::chrono::high_resolution_clock::now().time_since_epoch().count()))
+    {
+        loadEmbeddings(embedPath);
+
+        std::ifstream engineFile(enginePath, std::ios::binary);
+        if (!engineFile)
+        {
+            throw std::runtime_error("Failed to open special CodePredictor engine: " + enginePath.string());
+        }
+        std::vector<char> engineBlob((std::istreambuf_iterator<char>(engineFile)), std::istreambuf_iterator<char>());
+        mRuntime.reset(nvinfer1::createInferRuntime(gLogger));
+        mEngine.reset(mRuntime->deserializeCudaEngine(engineBlob.data(), engineBlob.size()));
+        if (!mEngine)
+        {
+            throw std::runtime_error("Failed to deserialize special CodePredictor engine: " + enginePath.string());
+        }
+        if (mEngine->getNbOptimizationProfiles() >= 2)
+        {
+            mPrefillContext.reset(mEngine->createExecutionContext());
+            mDecodeContext.reset(mEngine->createExecutionContext());
+            mPrefillContext->setOptimizationProfileAsync(0, mStream);
+            mDecodeContext->setOptimizationProfileAsync(1, mStream);
+        }
+        else
+        {
+            mPrefillContext.reset(mEngine->createExecutionContext());
+            mDecodeContext.reset(mEngine->createExecutionContext());
+        }
+
+        mLogitsName = hasTensor("logits_all") ? "logits_all" : "logits";
+        mHasGenStep = hasTensor("gen_step");
+        mHasPastLength = hasTensor("past_length");
+        mKVElementSize = trtElementSize(mEngine->getTensorDataType("new_past_key_0"));
+        mLogitsElementSize = trtElementSize(mEngine->getTensorDataType(mLogitsName.c_str()));
+        mLogitsAreBf16 = mEngine->getTensorDataType(mLogitsName.c_str()) == nvinfer1::DataType::kBF16;
+
+        mPastKeyNames.reserve(mNumLayers);
+        mPastValueNames.reserve(mNumLayers);
+        mNewPastKeyNames.reserve(mNumLayers);
+        mNewPastValueNames.reserve(mNumLayers);
+        for (int32_t i = 0; i < mNumLayers; ++i)
+        {
+            mPastKeyNames.push_back("past_key_" + std::to_string(i));
+            mPastValueNames.push_back("past_value_" + std::to_string(i));
+            mNewPastKeyNames.push_back("new_past_key_" + std::to_string(i));
+            mNewPastValueNames.push_back("new_past_value_" + std::to_string(i));
+        }
+
+        CUDA_CHECK(cudaMalloc(&mDeviceEmbeds, static_cast<size_t>(2 * mHiddenSize) * sizeof(float)));
+        CUDA_CHECK(cudaMalloc(&mDeviceCachePosition, static_cast<size_t>(32) * sizeof(int64_t)));
+        CUDA_CHECK(cudaMalloc(&mDeviceGenStep, sizeof(int64_t)));
+        CUDA_CHECK(cudaMalloc(&mDevicePastLength, sizeof(int64_t)));
+        CUDA_CHECK(cudaMalloc(&mDeviceDummyKV, 16));
+        CUDA_CHECK(cudaMalloc(&mDeviceLogits, static_cast<size_t>(mNumGroups) * mCodebookSize * mLogitsElementSize));
+
+        std::vector<int64_t> cachePositions(32);
+        for (int32_t i = 0; i < static_cast<int32_t>(cachePositions.size()); ++i)
+        {
+            cachePositions[i] = i;
+        }
+        CUDA_CHECK(cudaMemcpyAsync(mDeviceCachePosition, cachePositions.data(),
+            cachePositions.size() * sizeof(int64_t), cudaMemcpyHostToDevice, mStream));
+
+        size_t const kvBytes = static_cast<size_t>(mNumHeads) * 32 * mHeadDim * mKVElementSize;
+        mKVA.resize(2 * mNumLayers, nullptr);
+        mKVB.resize(2 * mNumLayers, nullptr);
+        for (int32_t i = 0; i < 2 * mNumLayers; ++i)
+        {
+            CUDA_CHECK(cudaMalloc(&mKVA[i], kvBytes));
+            CUDA_CHECK(cudaMalloc(&mKVB[i], kvBytes));
+        }
+        LOG_INFO("Special Qwen3-TTS CodePredictor enabled: %s", enginePath.string().c_str());
+    }
+
+    ~SpecialCodePredictorEngine()
+    {
+        for (void* p : mKVA)
+        {
+            if (p)
+            {
+                cudaFree(p);
+            }
+        }
+        for (void* p : mKVB)
+        {
+            if (p)
+            {
+                cudaFree(p);
+            }
+        }
+        if (mDeviceEmbeds)
+            cudaFree(mDeviceEmbeds);
+        if (mDeviceCachePosition)
+            cudaFree(mDeviceCachePosition);
+        if (mDeviceGenStep)
+            cudaFree(mDeviceGenStep);
+        if (mDevicePastLength)
+            cudaFree(mDevicePastLength);
+        if (mDeviceDummyKV)
+            cudaFree(mDeviceDummyKV);
+        if (mDeviceLogits)
+            cudaFree(mDeviceLogits);
+    }
+
+    bool generate(std::vector<float> const& hidden, std::vector<float> const& primaryEmbedding, int32_t activeGroups,
+        int32_t topK, float temperature, std::vector<int32_t>& residualCodes)
+    {
+        mRng.seed(42);
+        residualCodes.assign(static_cast<size_t>(mNumGroups), 0);
+        zeroKV();
+
+        size_t const bytes = static_cast<size_t>(mHiddenSize) * sizeof(float);
+        CUDA_CHECK(cudaMemcpyAsync(mDeviceEmbeds, hidden.data(), bytes, cudaMemcpyHostToDevice, mStream));
+        CUDA_CHECK(cudaMemcpyAsync(static_cast<char*>(mDeviceEmbeds) + bytes, primaryEmbedding.data(), bytes,
+            cudaMemcpyHostToDevice, mStream));
+
+        nvinfer1::IExecutionContext* prefill = mPrefillContext.get();
+        setScalar(mDeviceGenStep, 0);
+        setScalar(mDevicePastLength, 0);
+        prefill->setInputShape("inputs_embeds", nvinfer1::Dims3{1, 2, mHiddenSize});
+        prefill->setTensorAddress("inputs_embeds", mDeviceEmbeds);
+        prefill->setInputShape("cache_position", nvinfer1::Dims{1, {2}});
+        prefill->setTensorAddress("cache_position", mDeviceCachePosition);
+        if (mHasGenStep)
+        {
+            prefill->setTensorAddress("gen_step", mDeviceGenStep);
+        }
+        if (mHasPastLength)
+        {
+            prefill->setTensorAddress("past_length", mDevicePastLength);
+        }
+        for (int32_t i = 0; i < mNumLayers; ++i)
+        {
+            prefill->setInputShape(mPastKeyNames[i].c_str(), nvinfer1::Dims4{1, mNumHeads, 0, mHeadDim});
+            prefill->setInputShape(mPastValueNames[i].c_str(), nvinfer1::Dims4{1, mNumHeads, 0, mHeadDim});
+            prefill->setTensorAddress(mPastKeyNames[i].c_str(), mDeviceDummyKV);
+            prefill->setTensorAddress(mPastValueNames[i].c_str(), mDeviceDummyKV);
+            prefill->setTensorAddress(mNewPastKeyNames[i].c_str(), mKVB[2 * i]);
+            prefill->setTensorAddress(mNewPastValueNames[i].c_str(), mKVB[2 * i + 1]);
+        }
+        prefill->setTensorAddress(mLogitsName.c_str(), mDeviceLogits);
+        if (!prefill->enqueueV3(mStream))
+        {
+            LOG_ERROR("Special CodePredictor prefill failed");
+            return false;
+        }
+        residualCodes[0] = sampleDeviceLogits(0, topK, temperature);
+
+        nvinfer1::IExecutionContext* decode = mDecodeContext.get();
+        decode->setInputShape("inputs_embeds", nvinfer1::Dims3{1, 1, mHiddenSize});
+        decode->setTensorAddress("inputs_embeds", mDeviceEmbeds);
+        decode->setInputShape("cache_position", nvinfer1::Dims{1, {1}});
+        decode->setTensorAddress("cache_position", mDeviceCachePosition);
+        decode->setTensorAddress(mLogitsName.c_str(), mDeviceLogits);
+        if (mHasGenStep)
+        {
+            decode->setTensorAddress("gen_step", mDeviceGenStep);
+        }
+        if (mHasPastLength)
+        {
+            decode->setTensorAddress("past_length", mDevicePastLength);
+        }
+
+        std::vector<void*>* read = &mKVB;
+        std::vector<void*>* write = &mKVA;
+        int32_t const groupsToGenerate = std::min(activeGroups, mNumGroups);
+        for (int32_t j = 1; j < groupsToGenerate; ++j)
+        {
+            float const* embed = embedding(j - 1, residualCodes[j - 1]);
+            CUDA_CHECK(cudaMemcpyAsync(mDeviceEmbeds, embed, bytes, cudaMemcpyHostToDevice, mStream));
+            int64_t const actualPast = j + 1;
+            setScalar(mDeviceGenStep, j);
+            setScalar(mDevicePastLength, actualPast);
+            CUDA_CHECK(cudaMemcpyAsync(mDeviceCachePosition, &actualPast, sizeof(int64_t), cudaMemcpyHostToDevice, mStream));
+            for (int32_t i = 0; i < mNumLayers; ++i)
+            {
+                decode->setInputShape(mPastKeyNames[i].c_str(), nvinfer1::Dims4{1, mNumHeads, actualPast, mHeadDim});
+                decode->setInputShape(mPastValueNames[i].c_str(), nvinfer1::Dims4{1, mNumHeads, actualPast, mHeadDim});
+                decode->setTensorAddress(mPastKeyNames[i].c_str(), (*read)[2 * i]);
+                decode->setTensorAddress(mPastValueNames[i].c_str(), (*read)[2 * i + 1]);
+                decode->setTensorAddress(mNewPastKeyNames[i].c_str(), (*write)[2 * i]);
+                decode->setTensorAddress(mNewPastValueNames[i].c_str(), (*write)[2 * i + 1]);
+            }
+            if (!decode->enqueueV3(mStream))
+            {
+                LOG_ERROR("Special CodePredictor decode failed at group %d", j);
+                return false;
+            }
+            residualCodes[j] = sampleDeviceLogits(j, topK, temperature);
+            std::swap(read, write);
+        }
+        return true;
+    }
+
+private:
+    struct EngineDeleter
+    {
+        template <typename T>
+        void operator()(T* ptr) const
+        {
+            delete ptr;
+        }
+    };
+
+    static size_t trtElementSize(nvinfer1::DataType dtype)
+    {
+        switch (dtype)
+        {
+        case nvinfer1::DataType::kFLOAT: return 4;
+        case nvinfer1::DataType::kHALF:
+        case nvinfer1::DataType::kBF16: return 2;
+        case nvinfer1::DataType::kINT32: return 4;
+        case nvinfer1::DataType::kINT64: return 8;
+        default: return 4;
+        }
+    }
+
+    bool hasTensor(char const* name) const
+    {
+        for (int32_t i = 0; i < mEngine->getNbIOTensors(); ++i)
+        {
+            if (std::string(mEngine->getIOTensorName(i)) == name)
+            {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    void loadEmbeddings(std::filesystem::path const& embedPath)
+    {
+        std::ifstream file(embedPath, std::ios::binary | std::ios::ate);
+        if (!file)
+        {
+            throw std::runtime_error("Failed to open CP embedding table: " + embedPath.string());
+        }
+        size_t const bytes = static_cast<size_t>(file.tellg());
+        size_t const expected = static_cast<size_t>(mNumGroups) * mCodebookSize * mHiddenSize * sizeof(float);
+        if (bytes != expected)
+        {
+            throw std::runtime_error("Unexpected CP embedding table size: " + std::to_string(bytes)
+                + ", expected " + std::to_string(expected));
+        }
+        file.seekg(0);
+        mEmbeddings.resize(expected / sizeof(float));
+        file.read(reinterpret_cast<char*>(mEmbeddings.data()), static_cast<std::streamsize>(bytes));
+    }
+
+    float const* embedding(int32_t group, int32_t token) const
+    {
+        group = std::clamp(group, 0, mNumGroups - 1);
+        token = std::clamp(token, 0, mCodebookSize - 1);
+        size_t const offset = (static_cast<size_t>(group) * mCodebookSize + token) * mHiddenSize;
+        return mEmbeddings.data() + offset;
+    }
+
+    void zeroKV()
+    {
+        size_t const kvBytes = static_cast<size_t>(mNumHeads) * 32 * mHeadDim * mKVElementSize;
+        for (void* p : mKVA)
+        {
+            CUDA_CHECK(cudaMemsetAsync(p, 0, kvBytes, mStream));
+        }
+        for (void* p : mKVB)
+        {
+            CUDA_CHECK(cudaMemsetAsync(p, 0, kvBytes, mStream));
+        }
+    }
+
+    void setScalar(void* devicePtr, int64_t value)
+    {
+        CUDA_CHECK(cudaMemcpyAsync(devicePtr, &value, sizeof(int64_t), cudaMemcpyHostToDevice, mStream));
+    }
+
+    int32_t sampleDeviceLogits(int32_t group, int32_t topK, float temperature)
+    {
+        std::vector<float> logits(static_cast<size_t>(mCodebookSize));
+        size_t const offset = mLogitsName == "logits_all" ? static_cast<size_t>(group) * mCodebookSize : 0;
+        if (mLogitsElementSize == sizeof(float))
+        {
+            CUDA_CHECK(cudaMemcpyAsync(logits.data(), static_cast<char*>(mDeviceLogits) + offset * sizeof(float),
+                logits.size() * sizeof(float), cudaMemcpyDeviceToHost, mStream));
+        }
+        else
+        {
+            std::vector<uint16_t> raw(logits.size());
+            CUDA_CHECK(cudaMemcpyAsync(raw.data(), static_cast<char*>(mDeviceLogits) + offset * mLogitsElementSize,
+                raw.size() * mLogitsElementSize, cudaMemcpyDeviceToHost, mStream));
+            CUDA_CHECK(cudaStreamSynchronize(mStream));
+            for (size_t i = 0; i < raw.size(); ++i)
+            {
+                uint32_t bits = mLogitsAreBf16 ? (static_cast<uint32_t>(raw[i]) << 16) : halfToFloatBits(raw[i]);
+                std::memcpy(&logits[i], &bits, sizeof(float));
+            }
+        }
+        CUDA_CHECK(cudaStreamSynchronize(mStream));
+        int32_t const k = std::clamp(topK, 1, mCodebookSize);
+        std::vector<std::pair<float, int32_t>> vals(static_cast<size_t>(mCodebookSize));
+        for (int32_t i = 0; i < mCodebookSize; ++i)
+        {
+            vals[i] = {logits[i], i};
+        }
+        std::partial_sort(vals.begin(), vals.begin() + k, vals.end(),
+            [](auto const& a, auto const& b) { return a.first > b.first; });
+        double const maxVal = vals[0].first;
+        std::vector<double> probs(static_cast<size_t>(k));
+        double sum = 0.0;
+        float const temp = temperature > 1e-6f ? temperature : 0.9f;
+        for (int32_t i = 0; i < k; ++i)
+        {
+            probs[i] = std::exp((static_cast<double>(vals[i].first) - maxVal) / temp);
+            sum += probs[i];
+        }
+        for (auto& p : probs)
+        {
+            p /= sum;
+        }
+        std::discrete_distribution<int32_t> dist(probs.begin(), probs.end());
+        return vals[dist(mRng)].second;
+    }
+    int32_t mHiddenSize{};
+    int32_t mCodebookSize{};
+    int32_t mNumLayers{};
+    int32_t mNumHeads{};
+    int32_t mHeadDim{};
+    int32_t mNumGroups{};
+    cudaStream_t mStream{};
+    std::mt19937 mRng;
+    std::vector<float> mEmbeddings;
+    std::unique_ptr<nvinfer1::IRuntime, EngineDeleter> mRuntime;
+    std::unique_ptr<nvinfer1::ICudaEngine, EngineDeleter> mEngine;
+    std::unique_ptr<nvinfer1::IExecutionContext, EngineDeleter> mPrefillContext;
+    std::unique_ptr<nvinfer1::IExecutionContext, EngineDeleter> mDecodeContext;
+    std::string mLogitsName;
+    bool mHasGenStep{false};
+    bool mHasPastLength{false};
+    bool mLogitsAreBf16{false};
+    size_t mKVElementSize{4};
+    size_t mLogitsElementSize{4};
+    void* mDeviceEmbeds{nullptr};
+    void* mDeviceCachePosition{nullptr};
+    void* mDeviceGenStep{nullptr};
+    void* mDevicePastLength{nullptr};
+    void* mDeviceDummyKV{nullptr};
+    void* mDeviceLogits{nullptr};
+    std::vector<void*> mKVA;
+    std::vector<void*> mKVB;
+    std::vector<std::string> mPastKeyNames;
+    std::vector<std::string> mPastValueNames;
+    std::vector<std::string> mNewPastKeyNames;
+    std::vector<std::string> mNewPastValueNames;
+};
+
 Qwen3OmniTTSRuntime::Qwen3OmniTTSRuntime(std::string const& talkerEngineDir, std::string const& codePredictorEngineDir,
     std::string const& tokenizerDir, cudaStream_t stream)
     : mStream(stream)
@@ -102,6 +615,7 @@ Qwen3OmniTTSRuntime::Qwen3OmniTTSRuntime(std::string const& talkerEngineDir, std
     LOG_INFO("Initializing Qwen3-Omni Talker runner");
     LOG_INFO("  Talker: %s", talkerEngineDir.c_str());
     LOG_INFO("  CodePredictor: %s", codePredictorEngineDir.c_str());
+    mUseSpecialCodePredictor = std::getenv("QWEN3_TTS_CP_ENGINE") && std::getenv("QWEN3_TTS_CP_EMBED_FP32");
 
     // Load tokenizer
     std::filesystem::path const tokenizerPath = tokenizerDir.empty()
@@ -147,6 +661,16 @@ Qwen3OmniTTSRuntime::Qwen3OmniTTSRuntime(std::string const& talkerEngineDir, std
     if (!loadCodePredictorWeights(codePredictorEngineDir))
     {
         throw std::runtime_error("Failed to load CodePredictor weights");
+    }
+
+    char const* specialCPEnginePath = std::getenv("QWEN3_TTS_CP_ENGINE");
+    char const* specialCPEmbedPath = std::getenv("QWEN3_TTS_CP_EMBED_FP32");
+    if (specialCPEnginePath && specialCPEmbedPath)
+    {
+        mSpecialCodePredictorEngine = std::make_unique<SpecialCodePredictorEngine>(specialCPEnginePath,
+            specialCPEmbedPath, mTalkerConfig.codePredictorHiddenSize, mTalkerConfig.codebookSize,
+            mCodePredictorConfig.numDecoderLayers, mCodePredictorConfig.numKVHeads,
+            mCodePredictorConfig.headDim, talker_constants::kNumRvqLayers, stream);
     }
 
 #ifdef CUTE_DSL_GEMM_ENABLED
@@ -206,6 +730,12 @@ bool Qwen3OmniTTSRuntime::initializeEngineRunners(
         return false;
     }
 
+    if (mUseSpecialCodePredictor)
+    {
+        LOG_INFO("Special CodePredictor requested; loading CodePredictor config only.");
+        return loadCodePredictorConfig(codePredictorEngineDir);
+    }
+
     // Load CodePredictor engine from separate directory
     std::filesystem::path codePredictorEnginePath = std::filesystem::path(codePredictorEngineDir) / "llm.engine";
     std::filesystem::path codePredictorConfigPath = std::filesystem::path(codePredictorEngineDir) / "config.json";
@@ -241,6 +771,47 @@ bool Qwen3OmniTTSRuntime::initializeEngineRunners(
         return false;
     }
 
+    return true;
+}
+
+bool Qwen3OmniTTSRuntime::loadCodePredictorConfig(std::string const& codePredictorEngineDir)
+{
+    std::filesystem::path codePredictorConfigPath = std::filesystem::path(codePredictorEngineDir) / "config.json";
+    std::ifstream configStream(codePredictorConfigPath);
+    if (!configStream.is_open())
+    {
+        LOG_ERROR("Failed to open CodePredictor config: %s", codePredictorConfigPath.string().c_str());
+        return false;
+    }
+    Json configJson;
+    try
+    {
+        configJson = Json::parse(configStream);
+    }
+    catch (Json::parse_error const& e)
+    {
+        LOG_ERROR("Failed to parse CodePredictor config: %s", e.what());
+        return false;
+    }
+
+    mCodePredictorConfig.numDecoderLayers = configJson.value("num_hidden_layers", 5);
+    mCodePredictorConfig.numKVHeads = configJson.value("num_key_value_heads", 8);
+    mCodePredictorConfig.headDim = configJson.value("head_dim", 128);
+    mCodePredictorConfig.hiddenSize = configJson.value("hidden_size", 1024);
+    mCodePredictorConfig.vocabSize = configJson.value("vocab_size", 2048);
+    mCodePredictorConfig.maxSupportedInputLength = configJson.value("max_input_len", 16);
+    mCodePredictorConfig.maxKVCacheCapacity = configJson.value("max_kv_cache_capacity", 128);
+    if (configJson.contains("builder_config"))
+    {
+        auto const& builderConfig = configJson["builder_config"];
+        mCodePredictorConfig.maxSupportedInputLength
+            = builderConfig.value("max_input_len", mCodePredictorConfig.maxSupportedInputLength);
+        mCodePredictorConfig.maxKVCacheCapacity
+            = builderConfig.value("max_kv_cache_capacity", mCodePredictorConfig.maxKVCacheCapacity);
+    }
+    mTalkerConfig.codePredictorHiddenSize = mCodePredictorConfig.hiddenSize;
+    LOG_INFO("CodePredictor config loaded without generic engine: vocabSize=%d, hiddenSize=%d, numLayers=%d",
+        mCodePredictorConfig.vocabSize, mCodePredictorConfig.hiddenSize, mCodePredictorConfig.numDecoderLayers);
     return true;
 }
 
@@ -298,6 +869,7 @@ bool Qwen3OmniTTSRuntime::validateAndFillConfig(std::string const& talkerEngineD
 
     // Codec special tokens (from talker vocab)
     mTalkerConfig.codecNothinkId = configJson["codec_nothink_id"].get<int32_t>();
+    mTalkerConfig.codecThinkId = configJson.value("codec_think_id", mTalkerConfig.codecNothinkId);
     mTalkerConfig.codecThinkBosId = configJson["codec_think_bos_id"].get<int32_t>();
     mTalkerConfig.codecThinkEosId = configJson["codec_think_eos_id"].get<int32_t>();
     mTalkerConfig.codecPadId = configJson["codec_pad_id"].get<int32_t>();
@@ -314,6 +886,16 @@ bool Qwen3OmniTTSRuntime::validateAndFillConfig(std::string const& talkerEngineD
 
     // Speaker ID configuration
     mTalkerConfig.defaultSpeakerId = configJson.value("default_speaker_id", 2301);
+
+    // Parse codec_language_id
+    if (configJson.contains("codec_language_id") && configJson["codec_language_id"].is_object())
+    {
+        for (auto const& [lang_name, lang_id] : configJson["codec_language_id"].items())
+        {
+            mTalkerConfig.languageIdMap[lang_name] = lang_id.get<int32_t>();
+        }
+        LOG_INFO("Loaded %zu language IDs", mTalkerConfig.languageIdMap.size());
+    }
 
     // Load speaker ID mapping if available
     if (configJson.contains("speaker_id") && configJson["speaker_id"].is_object())
@@ -676,16 +1258,26 @@ void Qwen3OmniTTSRuntime::initializeTTSEmbeddings(cudaStream_t stream)
 }
 
 bool Qwen3OmniTTSRuntime::projectToTalkerInput(
-    rt::Tensor const& thinkerEmbed, int32_t speakerId, rt::Tensor& output, int64_t& outputSeqLen, cudaStream_t stream)
+    rt::Tensor const& thinkerEmbed, int32_t langId, rt::Tensor& output, int64_t& outputSeqLen, cudaStream_t stream)
 {
     int64_t const seqLen = thinkerEmbed.getShape()[0];
     int64_t const hiddenSize = mTalkerConfig.talkerHiddenSize;
     int64_t const thinkerHiddenSize = mTalkerConfig.thinkerHiddenSize;
 
-    // N = text tokens after stripping 3-token role prefix and 5-token suffix
-    int64_t const N = seqLen - kAssistantPrefixLen - kAssistantTrailingSuffix;
-    // Non-streaming prefill: 8 fixed prefix rows + N text rows + 2 suffix rows
-    outputSeqLen = kNonStreamingPrefixRows + N + 2; // = seqLen + 2
+    // N = raw text body tokens after the fixed assistant role prefix.
+    // The official Qwen3-TTS prefill uses role=[151644, 77091, 198] + raw text,
+    // not a full chat-template sequence.
+    int64_t const N = seqLen - kAssistantPrefixLen;
+    if (N <= 0)
+    {
+        LOG_ERROR("projectToTalkerInput: no text body tokens after assistant prefix");
+        return false;
+    }
+    // Fixed 9-row prefill matching old working runner (body[0] only, rest in trailing)
+    outputSeqLen = 9;
+
+    // Store trailing text length for residual addend (body[1:] + tts_eos)
+    mTrailingTextLen = static_cast<int32_t>(N);
 
     // Project all tokens via text_projection MLP
     check::check(mProjectedBuffer.reshape({seqLen, hiddenSize}), "Tensor reshape failed");
@@ -696,8 +1288,10 @@ bool Qwen3OmniTTSRuntime::projectToTalkerInput(
     // Fused kernel: build complete non-streaming prefill buffer
     check::check(output.reshape({outputSeqLen, hiddenSize}), "Tensor reshape failed");
     kernel::invokeAssistantPreamble(mProjectedBuffer, mTtsPadEmbed, mTtsBosEmbed, mTtsEosEmbed, mTalkerEmbeddingTable,
-        mTalkerConfig.codecNothinkId, mTalkerConfig.codecThinkBosId, mTalkerConfig.codecThinkEosId, speakerId,
-        mTalkerConfig.codecPadId, mTalkerConfig.codecBosId, static_cast<int32_t>(N), output, stream);
+        mTalkerConfig.codecThinkId, mTalkerConfig.codecThinkBosId,
+        langId, mTalkerConfig.codecThinkEosId,
+        mTalkerConfig.codecPadId, mTalkerConfig.codecBosId,
+        output, stream);
 
     return true;
 }
@@ -809,10 +1403,18 @@ bool Qwen3OmniTTSRuntime::executeCodePredictorDecodingStep(int32_t tokenId, int3
             cudaMemcpyAsync(dst, mRawCodecEmbed.rawPointer(), H * sizeof(__half), cudaMemcpyDeviceToDevice, stream));
     }
 
-    // Project mRawCodecEmbed (2048) → mCodePredictorCodecEmbed (1024) via small_to_mtp_projection
+    // Project/copy mRawCodecEmbed to CodePredictor hidden size.
     check::check(mRawCodecEmbed.reshape({1, mTalkerConfig.talkerHiddenSize}), "Tensor reshape failed");
     check::check(mCodePredictorCodecEmbed.reshape({1, mTalkerConfig.codePredictorHiddenSize}), "Tensor reshape failed");
-    kernel::invokeLinearLayer(mRawCodecEmbed, mSmallToMtpWeight, mSmallToMtpBias, mCodePredictorCodecEmbed, stream);
+    if (mTalkerConfig.talkerHiddenSize == mTalkerConfig.codePredictorHiddenSize)
+    {
+        CUDA_CHECK(cudaMemcpyAsync(mCodePredictorCodecEmbed.rawPointer(), mRawCodecEmbed.rawPointer(),
+            mTalkerConfig.codePredictorHiddenSize * sizeof(__half), cudaMemcpyDeviceToDevice, stream));
+    }
+    else
+    {
+        kernel::invokeLinearLayer(mRawCodecEmbed, mSmallToMtpWeight, mSmallToMtpBias, mCodePredictorCodecEmbed, stream);
+    }
 
     int32_t const lmHeadIdx = std::min(generationStep, kNumRvqLayers - 1);
 
@@ -866,6 +1468,13 @@ bool Qwen3OmniTTSRuntime::captureDecodingCUDAGraph(cudaStream_t stream)
     // CodePredictor: 15 graphs, one per lm_head_weight.
     // Each graph uses a distinct output logits buffer so that the decodingKey (which includes
     // the output address) naturally produces a unique key per graph.
+    if (mUseSpecialCodePredictor)
+    {
+        mCodePredictorGraphsCaptured = false;
+        LOG_INFO("Skipping generic CodePredictor CUDA graph capture; special Qwen3-TTS CP engine is enabled.");
+        return captureStatus;
+    }
+
     check::check(
         mCodePredictorCodecEmbed.reshape({1, 1, mTalkerConfig.codePredictorHiddenSize}), "Tensor reshape failed");
     check::check(mCodePredictorHiddenStatesBuffer.reshape({1, 1, mTalkerConfig.codePredictorHiddenSize}),
@@ -917,20 +1526,20 @@ bool Qwen3OmniTTSRuntime::prepareTalkerInput(std::vector<int32_t> const& textTok
     kernel::embeddingLookup(mGpuTokenIdsBuffer, mTextEmbeddingTable, std::nullopt, mThinkerEmbedBuffer, stream);
     check::check(mThinkerEmbedBuffer.reshape({seqLen, thinkerHiddenSize}), "Tensor reshape failed");
 
-    // Determine speaker ID
-    int32_t speakerId = mTalkerConfig.defaultSpeakerId;
-    if (request.speakerId >= 0)
+    // Determine language ID for codec embedding (default: Chinese 2055)
+    int32_t langId = 2055;
+    if (!request.language.empty())
     {
-        speakerId = request.speakerId;
-    }
-    else if (!request.speakerName.empty())
-    {
-        speakerId = getSpeakerIdByName(request.speakerName);
+        auto it = mTalkerConfig.languageIdMap.find(request.language);
+        if (it != mTalkerConfig.languageIdMap.end())
+        {
+            langId = it->second;
+        }
     }
 
-    // MLP projection: thinker embed → talker input embeds (non-streaming, outputSeqLen = seqLen + 2)
+    // MLP projection: thinker embed → talker input embeds (9-row prefill)
     int64_t const hiddenSize = mTalkerConfig.talkerHiddenSize;
-    if (!projectToTalkerInput(mThinkerEmbedBuffer, speakerId, mTalkerInputEmbeds, outSeqLen, stream))
+    if (!projectToTalkerInput(mThinkerEmbedBuffer, langId, mTalkerInputEmbeds, outSeqLen, stream))
     {
         LOG_ERROR("MLP projection failed");
         return false;
@@ -990,23 +1599,67 @@ bool Qwen3OmniTTSRuntime::handleAudioGeneration(
 
     // Prepare host reuse lengths tensor (all zeros for new sequence)
 
-    // Tokenize: apply chat template then encode
-    LLMGenerationRequest::Request llmReq;
-    llmReq.messages = request.messages;
-    LLMGenerationRequest::FormattedRequest formatted;
-    if (!mTokenizer->applyChatTemplate(
-            llmReq, formatted, request.applyChatTemplate, request.addGenerationPrompt, request.enableThinking))
+    // Build the official Qwen3-TTS text sequence:
+    //   [<|im_start|>, assistant, "\n"] + raw text tokens
+    // EdgeLLM's generic chat-template path formats the user message directly, which
+    // does not match the Talker prefill layout expected by Qwen3-TTS.
+    std::string rawText;
+    for (auto const& message : request.messages)
     {
-        LOG_ERROR("Chat template failed");
+        for (auto const& content : message.contents)
+        {
+            if (content.type.empty() || content.type == "text")
+            {
+                rawText += content.content;
+            }
+        }
+    }
+    if (rawText.empty())
+    {
+        LOG_ERROR("TTS request has no text content");
         return false;
     }
-    std::vector<int32_t> const textTokenIds = mTokenizer->encode(formatted.formattedCompleteRequest);
+
+    std::vector<int32_t> textTokenIds{151644, 77091, 198};
+    std::vector<int32_t> bodyTokenIds = mTokenizer->encode(rawText);
+    textTokenIds.insert(textTokenIds.end(), bodyTokenIds.begin(), bodyTokenIds.end());
+
+    TalkerGenerationRequest effectiveRequest = request;
+    if (effectiveRequest.language.empty())
+    {
+        effectiveRequest.language = "english";
+        for (char const ch : rawText)
+        {
+            unsigned char const c = static_cast<unsigned char>(ch);
+            if (c >= 0x80)
+            {
+                effectiveRequest.language = "chinese";
+                break;
+            }
+        }
+    }
+
+    {
+        std::ostringstream oss;
+        for (size_t i = 0; i < bodyTokenIds.size(); ++i)
+        {
+            if (i)
+            {
+                oss << ",";
+            }
+            oss << bodyTokenIds[i];
+        }
+        LOG_INFO("TTS debug rawText='%s' bodyTokenIds=[%s] effectiveLanguage=%s", rawText.c_str(),
+            oss.str().c_str(), effectiveRequest.language.c_str());
+    }
 
     std::vector<std::vector<int32_t>> rvqCodes;
+    std::vector<int32_t> primaryHistory;
+    std::mt19937 talkerRng(42);
 
     // Prepare Talker input: validate hidden states, project via MLP, reshape buffers
     int64_t seqLen = 0;
-    if (!prepareTalkerInput(textTokenIds, request, seqLen, stream))
+    if (!prepareTalkerInput(textTokenIds, effectiveRequest, seqLen, stream))
     {
         LOG_ERROR("Input preparation failed");
         return false;
@@ -1019,22 +1672,43 @@ bool Qwen3OmniTTSRuntime::handleAudioGeneration(
         return false;
     }
 
+    {
+        std::vector<float> hostLogits(static_cast<size_t>(mTalkerConfig.talkerVocabSize));
+        CUDA_CHECK(cudaMemcpyAsync(hostLogits.data(), mTalkerLogits.rawPointer(),
+            hostLogits.size() * sizeof(float), cudaMemcpyDeviceToHost, stream));
+        CUDA_CHECK(cudaStreamSynchronize(stream));
+        auto const maxIt = std::max_element(hostLogits.begin(), hostLogits.end());
+        int32_t const argmax = static_cast<int32_t>(std::distance(hostLogits.begin(), maxIt));
+        LOG_INFO("TTS debug pre-adjust logits: argmax=%d max=%f eos=%f seqLen=%ld", argmax, *maxIt,
+            hostLogits[mTalkerConfig.codecEosId], seqLen);
+    }
+
     // Suppress special tokens and apply repetition penalty, then sample first codec token
     adjustTalkerLogits(stream);
-    trt_edgellm::topKtopPSamplingFromLogits(
-        mTalkerLogits, mTalkerSelectedIndices, talkerSamplingParams, mSamplingWorkspace, stream);
-    CUDA_CHECK(cudaMemcpyAsync(mHostSelectedTokenIds.rawPointer(), mTalkerSelectedIndices.rawPointer(), sizeof(int32_t),
-        cudaMemcpyDeviceToHost, stream));
-    CUDA_CHECK(cudaStreamSynchronize(stream));
-
-    int32_t codecToken = mHostSelectedTokenIds.dataPointer<int32_t>()[0];
+    {
+        std::vector<float> hostLogits(static_cast<size_t>(mTalkerConfig.talkerVocabSize));
+        CUDA_CHECK(cudaMemcpyAsync(hostLogits.data(), mTalkerLogits.rawPointer(),
+            hostLogits.size() * sizeof(float), cudaMemcpyDeviceToHost, stream));
+        CUDA_CHECK(cudaStreamSynchronize(stream));
+        auto const maxIt = std::max_element(hostLogits.begin(), hostLogits.end());
+        int32_t const argmax = static_cast<int32_t>(std::distance(hostLogits.begin(), maxIt));
+        LOG_INFO("TTS debug adjusted logits: argmax=%d max=%f eos=%f", argmax, *maxIt,
+            hostLogits[mTalkerConfig.codecEosId]);
+    }
+    int32_t codecToken = sampleLogitsCPU(mTalkerLogits, mTalkerConfig.talkerVocabSize, talkerTopK,
+        talkerTemperature, true, mTalkerConfig.codecEosId, 0.0f, true, talkerRng, stream);
+    CUDA_CHECK(cudaMemcpyAsync(
+        mTalkerSelectedIndices.rawPointer(), &codecToken, sizeof(int32_t), cudaMemcpyHostToDevice, stream));
     trackSeenToken(codecToken, stream);
+    primaryHistory.push_back(codecToken);
     LOG_INFO("First codec token (from prefill): %d (eos=%d)", codecToken, mTalkerConfig.codecEosId);
 
     // Clamp maxAudioLength to avoid Talker KV cache overflow.
     int32_t const talkerKVCapacity = mTalkerLLMConfig.maxKVCacheCapacity;
     int32_t const safeMaxFrames = std::max(1, talkerKVCapacity - static_cast<int32_t>(seqLen));
-    int32_t const effectiveMaxAudio = std::min(request.maxAudioLength, safeMaxFrames);
+    int32_t const textBasedMax = std::max(50, mTrailingTextLen * 10);
+    int32_t const requestedMaxAudio = std::min(request.maxAudioLength, textBasedMax);
+    int32_t const effectiveMaxAudio = std::min(requestedMaxAudio, safeMaxFrames);
     if (effectiveMaxAudio < request.maxAudioLength)
     {
         LOG_WARNING("Clamped maxAudioLength from %d to %d (prefill=%lld, KV capacity=%d)", request.maxAudioLength,
@@ -1077,7 +1751,7 @@ bool Qwen3OmniTTSRuntime::handleAudioGeneration(
 
             // Compute residual connection using pre-allocated buffer
             // Non-streaming: always add tts_pad_embed as addend
-            if (!computeResidualConnection(frameCodes, mResidualEmbedBuffer, stream))
+            if (!computeResidualConnection(frameCodes, mResidualEmbedBuffer, numFrames, stream))
             {
                 LOG_ERROR("Residual connection failed at frame %d", numFrames);
                 break;
@@ -1102,15 +1776,27 @@ bool Qwen3OmniTTSRuntime::handleAudioGeneration(
 
             // Suppress special tokens and apply repetition penalty, then sample next codec token
             adjustTalkerLogits(stream);
-            trt_edgellm::topKtopPSamplingFromLogits(mTalkerLogits, mTalkerSelectedIndices, talkerSamplingParams,
-                mSamplingWorkspace, stream, 42, static_cast<uint64_t>(numFrames + 1));
-            CUDA_CHECK(cudaMemcpyAsync(mHostSelectedTokenIds.rawPointer(), mTalkerSelectedIndices.rawPointer(),
-                sizeof(int32_t), cudaMemcpyDeviceToHost, stream));
-            CUDA_CHECK(cudaStreamSynchronize(stream));
-            trackSeenToken(codecToken, stream);
+            int32_t const sampleStep = numFrames + 1;
+            int32_t const biasOnset = mTrailingTextLen * 3;
+            int32_t const stepsPastOnset = sampleStep - biasOnset;
+            float eosBias = 0.0f;
+            if (stepsPastOnset >= 0)
+            {
+                eosBias = std::min(25.0f, 5.0f + static_cast<float>(stepsPastOnset) * 0.5f);
+            }
+            codecToken = sampleLogitsCPU(mTalkerLogits, mTalkerConfig.talkerVocabSize, talkerTopK, talkerTemperature,
+                sampleStep < 2, mTalkerConfig.codecEosId, eosBias, true, talkerRng, stream);
+            CUDA_CHECK(cudaMemcpyAsync(
+                mTalkerSelectedIndices.rawPointer(), &codecToken, sizeof(int32_t), cudaMemcpyHostToDevice, stream));
 
-            codecToken = mHostSelectedTokenIds.dataPointer<int32_t>()[0];
+            trackSeenToken(codecToken, stream);
+            primaryHistory.push_back(codecToken);
             numFrames++;
+            if (detectPrimaryRepetition(primaryHistory, 5))
+            {
+                LOG_INFO("Force EOS at frame %d due to primary-code repetition", numFrames);
+                codecToken = mTalkerConfig.codecEosId;
+            }
         }
 
     } // end TIME_STAGE talker_generation
@@ -1137,6 +1823,8 @@ bool Qwen3OmniTTSRuntime::runCodePredictorGenerationForFrame(int32_t codecToken,
     // - codes: code_0 (from Talker) + code_1 to code_15 (from CodePredictor) = 16 codes
     // - hidden_states: written directly to mCodecHiddensBuffer
 
+    static thread_local std::mt19937 predictorRng(42);
+
     outputCodes.clear();
     outputCodes.reserve(16); // code_0 to code_15
 
@@ -1144,6 +1832,8 @@ bool Qwen3OmniTTSRuntime::runCodePredictorGenerationForFrame(int32_t codecToken,
     outputCodes.push_back(codecToken);
 
     int64_t const hiddenSize = mTalkerConfig.codePredictorHiddenSize;
+    constexpr int32_t kActiveGroups = talker_constants::kActiveCodePredictorGroups;
+    static_assert(kActiveGroups > 0 && kActiveGroups <= kNumRvqLayers);
 
     // ========== Prefill: generate code_1 ==========
     // Input: concat([proj(talker_hidden), proj(embed(code_0))]) -> [1, 2, codePredictorHiddenSize]
@@ -1156,15 +1846,70 @@ bool Qwen3OmniTTSRuntime::runCodePredictorGenerationForFrame(int32_t codecToken,
     check::check(mRawCodecEmbed.reshape({1, 1, mTalkerConfig.talkerHiddenSize}), "Tensor reshape failed");
     kernel::embeddingLookup(mCodePredictorCodecIds, mTalkerEmbeddingTable, std::nullopt, mRawCodecEmbed, stream);
 
-    // Step 2: Project talkerHiddenState (2048) → mSmallToMtpProjectedHidden (1024)
-    // talkerHiddenState is mTalkerLastHidden with shape {1, talkerHiddenSize=2048}
-    kernel::invokeLinearLayer(
-        talkerHiddenState, mSmallToMtpWeight, mSmallToMtpBias, mSmallToMtpProjectedHidden, stream);
+    // Step 2: Project/copy talkerHiddenState to CodePredictor hidden size.
+    // Official qwen_tts uses small_to_mtp_projection only when the Talker and
+    // CodePredictor hidden sizes differ; Qwen3-TTS 0.6B uses 1024 for both.
+    if (mTalkerConfig.talkerHiddenSize == mTalkerConfig.codePredictorHiddenSize)
+    {
+        CUDA_CHECK(cudaMemcpyAsync(mSmallToMtpProjectedHidden.rawPointer(), talkerHiddenState.rawPointer(),
+            mTalkerConfig.codePredictorHiddenSize * sizeof(__half), cudaMemcpyDeviceToDevice, stream));
+    }
+    else
+    {
+        kernel::invokeLinearLayer(
+            talkerHiddenState, mSmallToMtpWeight, mSmallToMtpBias, mSmallToMtpProjectedHidden, stream);
+    }
 
-    // Step 3: Project mRawCodecEmbed (2048) → mCodePredictorCodecEmbed (1024)
+    // Step 3: Project/copy mRawCodecEmbed to CodePredictor hidden size.
     check::check(mRawCodecEmbed.reshape({1, mTalkerConfig.talkerHiddenSize}), "Tensor reshape failed");
     check::check(mCodePredictorCodecEmbed.reshape({1, mTalkerConfig.codePredictorHiddenSize}), "Tensor reshape failed");
-    kernel::invokeLinearLayer(mRawCodecEmbed, mSmallToMtpWeight, mSmallToMtpBias, mCodePredictorCodecEmbed, stream);
+    if (mTalkerConfig.talkerHiddenSize == mTalkerConfig.codePredictorHiddenSize)
+    {
+        CUDA_CHECK(cudaMemcpyAsync(mCodePredictorCodecEmbed.rawPointer(), mRawCodecEmbed.rawPointer(),
+            mTalkerConfig.codePredictorHiddenSize * sizeof(__half), cudaMemcpyDeviceToDevice, stream));
+    }
+    else
+    {
+        kernel::invokeLinearLayer(mRawCodecEmbed, mSmallToMtpWeight, mSmallToMtpBias, mCodePredictorCodecEmbed, stream);
+    }
+
+    if (mSpecialCodePredictorEngine)
+    {
+        std::vector<float> hiddenHost
+            = copyHalfTensorToHostFloat(mSmallToMtpProjectedHidden, mTalkerConfig.codePredictorHiddenSize, stream);
+        std::vector<float> primaryEmbeddingHost
+            = copyHalfTensorToHostFloat(mCodePredictorCodecEmbed, mTalkerConfig.codePredictorHiddenSize, stream);
+        std::vector<int32_t> residualCodes;
+        if (!mSpecialCodePredictorEngine->generate(hiddenHost, primaryEmbeddingHost, kActiveGroups,
+                samplingParams.topK, samplingParams.temperature, residualCodes))
+        {
+            return false;
+        }
+
+        check::check(mCodecHiddensBuffer.reshape({1, 16, mTalkerConfig.talkerHiddenSize}), "Tensor reshape failed");
+        CUDA_CHECK(cudaMemsetAsync(mCodecHiddensBuffer.rawPointer(), 0, mCodecHiddensBuffer.getMemoryCapacity(), stream));
+
+        int32_t const groupsToMaterialize = std::min<int32_t>(kActiveGroups, static_cast<int32_t>(residualCodes.size()));
+        for (int32_t group = 0; group < groupsToMaterialize; ++group)
+        {
+            int32_t const residualCode = residualCodes[group];
+            outputCodes.push_back(residualCode);
+            CUDA_CHECK(cudaMemcpyAsync(mCodePredictorCodecIds.rawPointer(), &residualCode, sizeof(int32_t),
+                cudaMemcpyHostToDevice, stream));
+            check::check(mRawCodecEmbed.reshape({1, 1, mTalkerConfig.talkerHiddenSize}), "Tensor reshape failed");
+            kernel::embeddingLookup(
+                mCodePredictorCodecIds, mCodePredictorEmbeddingTables[group], std::nullopt, mRawCodecEmbed, stream);
+            __half* dst = static_cast<__half*>(mCodecHiddensBuffer.rawPointer())
+                + static_cast<int64_t>(group + 1) * mTalkerConfig.talkerHiddenSize;
+            CUDA_CHECK(cudaMemcpyAsync(dst, mRawCodecEmbed.rawPointer(),
+                static_cast<size_t>(mTalkerConfig.talkerHiddenSize) * sizeof(__half), cudaMemcpyDeviceToDevice, stream));
+        }
+        while (static_cast<int32_t>(outputCodes.size()) < 16)
+        {
+            outputCodes.push_back(0);
+        }
+        return true;
+    }
 
     // Step 4: Concat projected tensors into mCodePredictorPrefillInput [1, 2, codePredictorHiddenSize]
     CUDA_CHECK(cudaMemcpyAsync(mCodePredictorPrefillInput.rawPointer(), mSmallToMtpProjectedHidden.rawPointer(),
@@ -1184,13 +1929,8 @@ bool Qwen3OmniTTSRuntime::runCodePredictorGenerationForFrame(int32_t codecToken,
     }
 
     // Sample code_1
-    trt_edgellm::topKtopPSamplingFromLogits(
-        mCodePredictorLogits, mCodePredictorSelectedIndices, samplingParams, mSamplingWorkspace, stream);
-    CUDA_CHECK(cudaMemcpyAsync(mHostSelectedCodeIds.rawPointer(), mCodePredictorSelectedIndices.rawPointer(),
-        sizeof(int32_t), cudaMemcpyDeviceToHost, stream));
-    CUDA_CHECK(cudaStreamSynchronize(stream));
-
-    int32_t code = mHostSelectedCodeIds.dataPointer<int32_t>()[0];
+    int32_t code = sampleLogitsCPU(mCodePredictorLogits, mTalkerConfig.codebookSize, samplingParams.topK,
+        samplingParams.temperature, false, -1, 0.0f, false, predictorRng, stream);
     outputCodes.push_back(code); // code_1
 
     // ========== Write embedding lookups to mCodecHiddensBuffer for residual connection ==========
@@ -1206,9 +1946,10 @@ bool Qwen3OmniTTSRuntime::runCodePredictorGenerationForFrame(int32_t codecToken,
 
     // mCodecHiddensBuffer stores raw (2048-dim) codec embeddings for the residual connection
     check::check(mCodecHiddensBuffer.reshape({1, 16, mTalkerConfig.talkerHiddenSize}), "Tensor reshape failed");
+    CUDA_CHECK(cudaMemsetAsync(mCodecHiddensBuffer.rawPointer(), 0, mCodecHiddensBuffer.getMemoryCapacity(), stream));
 
-    // ========== Decoding loop: generate code_2 to code_15 (14 steps) ==========
-    for (int step = 2; step <= 15; ++step)
+    // ========== Decoding loop: generate active residual codes only ==========
+    for (int step = 2; step <= kActiveGroups; ++step)
     {
         check::check(mCodePredictorHiddenStatesBuffer.reshape({1, 1, mTalkerConfig.codePredictorHiddenSize}),
             "Tensor reshape failed");
@@ -1232,27 +1973,38 @@ bool Qwen3OmniTTSRuntime::runCodePredictorGenerationForFrame(int32_t codecToken,
 
         // Embedding is now saved inside executeCodePredictorDecodingStep before engine execution
 
-        trt_edgellm::topKtopPSamplingFromLogits(
-            mCodePredictorLogits, mCodePredictorSelectedIndices, samplingParams, mSamplingWorkspace, stream);
-        CUDA_CHECK(cudaMemcpyAsync(mHostSelectedCodeIds.rawPointer(), mCodePredictorSelectedIndices.rawPointer(),
-            sizeof(int32_t), cudaMemcpyDeviceToHost, stream));
-        CUDA_CHECK(cudaStreamSynchronize(stream));
+        code = sampleLogitsCPU(mCodePredictorLogits, mTalkerConfig.codebookSize, samplingParams.topK,
+            samplingParams.temperature, false, -1, 0.0f, false, predictorRng, stream);
+        outputCodes.push_back(code); // code_2 to code_kActiveGroups
+    }
 
-        code = mHostSelectedCodeIds.dataPointer<int32_t>()[0];
-        outputCodes.push_back(code); // code_2 to code_15
+    // The final active code embedding is normally materialized as the input
+    // to the next CP decode step. When inactive groups are zero-filled, perform
+    // just that lookup/copy without running another predictor step.
+    CUDA_CHECK(cudaMemcpyAsync(mCodePredictorCodecIds.rawPointer(), &code, sizeof(int32_t), cudaMemcpyHostToDevice, stream));
+    check::check(mRawCodecEmbed.reshape({1, 1, mTalkerConfig.talkerHiddenSize}), "Tensor reshape failed");
+    kernel::embeddingLookup(mCodePredictorCodecIds, mCodePredictorEmbeddingTables[kActiveGroups - 1], std::nullopt,
+        mRawCodecEmbed, stream);
+    {
+        int64_t const H = mTalkerConfig.talkerHiddenSize;
+        __half* dst = static_cast<__half*>(mCodecHiddensBuffer.rawPointer()) + static_cast<int64_t>(kActiveGroups) * H;
+        CUDA_CHECK(cudaMemcpyAsync(dst, mRawCodecEmbed.rawPointer(), H * sizeof(__half), cudaMemcpyDeviceToDevice, stream));
+    }
+
+    while (static_cast<int32_t>(outputCodes.size()) < 16)
+    {
+        outputCodes.push_back(0);
     }
 
     return true;
 }
 
 bool Qwen3OmniTTSRuntime::computeResidualConnection(
-    std::vector<int32_t> const& codes, rt::Tensor& outputResidual, cudaStream_t stream)
+    std::vector<int32_t> const& codes, rt::Tensor& outputResidual, int32_t frameIdx, cudaStream_t stream)
 {
     NVTX_SCOPED_RANGE(nvtx_range, "TalkerRunner::computeResidualConnection", nvtx_colors::BLUE);
 
-    // PyTorch (modeling_qwen3_omni.py:3405-3434):
-    //   codec_hiddens = cat([embed(code_0), hidden_1..14, embed(code_15)], dim=1)  # [1, 16, H]
-    //   inputs_embeds = codec_hiddens.sum(1) + tts_pad_embed  (non-streaming: always tts_pad_embed)
+    // Old working runner: codec_sum + trailing_text[step] for early frames, then tts_pad
     // mCodecHiddensBuffer positions 1-14 are pre-filled by runCodePredictorGenerationForFrame.
 
     check::check(codes.size() == 16, "Expected 16 codes (code_0 from Talker + code_1-15 from CodePredictor)");
@@ -1261,11 +2013,29 @@ bool Qwen3OmniTTSRuntime::computeResidualConnection(
     int64_t const hiddenSize = mTalkerConfig.talkerHiddenSize;
     check::check(outputResidual.reshape({1, 1, hiddenSize}), "Tensor reshape failed");
 
-    // Non-streaming: always use tts_pad_embed as addend
-    __half const* addend = mTtsPadEmbed.dataPointer<__half>();
+    // Select addend: trailing text for early frames, tts_pad for later
+    __half const* addend;
+    if (frameIdx < mTrailingTextLen)
+    {
+        if (frameIdx == mTrailingTextLen - 1)
+        {
+            // Last trailing entry: tts_eos
+            addend = mTtsEosEmbed.dataPointer<__half>();
+        }
+        else
+        {
+            // body[1 + frameIdx] from projected buffer (text starts at index 3)
+            int32_t const textIdx = kAssistantPrefixLen + 1 + frameIdx;
+            addend = mProjectedBuffer.dataPointer<__half>() + static_cast<int64_t>(textIdx) * hiddenSize;
+        }
+    }
+    else
+    {
+        addend = mTtsPadEmbed.dataPointer<__half>();
+    }
 
     kernel::invokeResidualConnection(mCodecHiddensBuffer, mTalkerEmbeddingTable, mCodePredictorEmbeddingTables[14],
-        codes[0], codes[15], addend, outputResidual, stream);
+        codes[0], codes[15], talker_constants::kActiveCodePredictorGroups, addend, outputResidual, stream);
 
     return true;
 }

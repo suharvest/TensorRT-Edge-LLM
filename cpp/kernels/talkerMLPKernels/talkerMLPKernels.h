@@ -122,18 +122,19 @@ void invokeAssistantPreamble(rt::Tensor const& projected, rt::Tensor const& ttsP
 
 //! \brief Fused residual connection for TTS decode input
 //!
-//! Computes: output = embed0[code0] + embed15[code15] + addend + sum(codecHiddens[1..14])
+//! Computes: output = embed0[code0] + addend + sum(active codecHiddens rows), optionally plus embed15[code15].
 //! Eliminates 7 separate dispatches (2x H→D, 2x embLookup, 2x D→D, sumReduce) in one kernel.
 //!
 //! \param codecHiddens   [1, 16, H] buffer — rows 1-14 pre-filled by CodePredictor (FP16)
 //! \param embTable0      Talker embedding table [vocabSize, H] (FP16) — for embed(code0)
 //! \param embTable15     CodePredictor embedding table[-1] [vocabSize, H] (FP16) — for embed(code15)
-//! \param code0/code15   Token IDs passed as scalars (no H→D upload needed)
+//! \param code0/code15   Token IDs passed as scalars (no H->D upload needed)
+//! \param activeGroups   Number of residual CP groups to include (1..15)
 //! \param addend         Row pointer [H] — trailing_text_hidden[generationStep] or tts_pad_embed (FP16)
 //! \param output         Output tensor [1, 1, H] (FP16)
 //! \param stream         CUDA stream
 void invokeResidualConnection(rt::Tensor const& codecHiddens, rt::Tensor const& embTable0, rt::Tensor const& embTable15,
-    int32_t code0, int32_t code15, half const* addend, rt::Tensor& output, cudaStream_t stream);
+    int32_t code0, int32_t code15, int32_t activeGroups, half const* addend, rt::Tensor& output, cudaStream_t stream);
 
 //! \brief Adjust Talker logits: suppress special tokens and apply repetition penalty.
 //!

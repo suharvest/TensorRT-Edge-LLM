@@ -564,12 +564,12 @@ void invokeAssistantPreamble(rt::Tensor const& projected, rt::Tensor const& ttsP
 
 //! Fused residual connection kernel
 //!
-//! Computes: output[j] = embed0[code0,j] + embed15[code15,j] + addend[j] + sum_{k=1}^{14}(codecHiddens[k,j])
+//! Computes output[j] from the primary code, active residual code embeddings, and text/pad addend.
 //! Single block of (hiddenDim/VEC_SIZE) threads; FP32 accumulators for precision.
 template <int32_t VEC_SIZE = 8>
 __global__ void residualConnectionKernel(half const* __restrict__ codecHiddens, half const* __restrict__ embTable0,
-    half const* __restrict__ embTable15, int32_t code0, int32_t code15, half const* __restrict__ addend,
-    int32_t hiddenDim, half* __restrict__ output)
+    half const* __restrict__ embTable15, int32_t code0, int32_t code15, int32_t activeGroups,
+    half const* __restrict__ addend, int32_t hiddenDim, half* __restrict__ output)
 {
     using vec_t = uint4;
     int32_t const vecIdx = static_cast<int32_t>(threadIdx.x);
@@ -591,7 +591,10 @@ __global__ void residualConnectionKernel(half const* __restrict__ codecHiddens, 
             acc[i] = __half2float(p[i]);
         }
     }
-    // embed(code15) from CodePredictor embedding table
+    // embed(code15) from CodePredictor embedding table. In the production
+    // Qwen3-TTS config only 13 residual groups are active, so the final slots
+    // are zero-filled for the vocoder and must not affect Talker feedback.
+    if (activeGroups >= 15)
     {
         vec_t v = reinterpret_cast<vec_t const*>(embTable15 + static_cast<int64_t>(code15) * hiddenDim)[vecIdx];
         half const* p = reinterpret_cast<half const*>(&v);
@@ -611,8 +614,11 @@ __global__ void residualConnectionKernel(half const* __restrict__ codecHiddens, 
             acc[i] += __half2float(p[i]);
         }
     }
-    // sum codecHiddens rows 1..14 (row 0 and 15 replaced by direct embedding lookups above)
-    for (int32_t k = 1; k <= 14; ++k)
+    // Sum buffered rows for active residual groups. Row 0 is represented by
+    // embTable0/code0 above; row 15 is represented by embTable15/code15 only
+    // when all 15 residual groups are active.
+    int32_t const lastBufferedRow = min(activeGroups, 14);
+    for (int32_t k = 1; k <= lastBufferedRow; ++k)
     {
         vec_t v = reinterpret_cast<vec_t const*>(codecHiddens + static_cast<int64_t>(k) * hiddenDim)[vecIdx];
         half const* p = reinterpret_cast<half const*>(&v);
@@ -635,7 +641,7 @@ __global__ void residualConnectionKernel(half const* __restrict__ codecHiddens, 
 }
 
 void invokeResidualConnection(rt::Tensor const& codecHiddens, rt::Tensor const& embTable0, rt::Tensor const& embTable15,
-    int32_t code0, int32_t code15, half const* addend, rt::Tensor& output, cudaStream_t stream)
+    int32_t code0, int32_t code15, int32_t activeGroups, half const* addend, rt::Tensor& output, cudaStream_t stream)
 {
     int32_t const hiddenDim = static_cast<int32_t>(embTable0.getShape()[1]);
     constexpr int32_t kVecSize = 8;
@@ -645,7 +651,8 @@ void invokeResidualConnection(rt::Tensor const& codecHiddens, rt::Tensor const& 
     half const* codecPtr = codecHiddens.dataPointer<half>();
 
     residualConnectionKernel<kVecSize><<<1, numVecs, 0, stream>>>(codecPtr, embTable0.dataPointer<half>(),
-        embTable15.dataPointer<half>(), code0, code15, addend, hiddenDim, static_cast<half*>(output.rawPointer()));
+        embTable15.dataPointer<half>(), code0, code15, activeGroups, addend, hiddenDim,
+        static_cast<half*>(output.rawPointer()));
     CUDA_CHECK(cudaPeekAtLastError());
 }
 

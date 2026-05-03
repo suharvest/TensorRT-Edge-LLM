@@ -163,7 +163,8 @@ enum Qwen3TTSOptionId : int
     PROFILE_OUTPUT_FILE = 909,
     DUMP_OUTPUT = 911,
     BATCH_SIZE = 912,
-    TOKENIZER_DIR = 915
+    TOKENIZER_DIR = 915,
+    STREAM = 916
 };
 
 struct Qwen3TTSInferenceArgs
@@ -179,6 +180,7 @@ struct Qwen3TTSInferenceArgs
     bool debug{false};
     bool dumpProfile{false};
     bool dumpOutput{false};
+    bool stream{false};
     int32_t batchSize{-1};
 };
 
@@ -201,6 +203,7 @@ void printUsage(char const* programName)
               << "  --dumpOutput                 Print inference output to console\n"
               << "  --dumpProfile                Print performance summary to console\n"
               << "  --profileOutputFile=<path>   Path to profile JSON output\n"
+              << "  --stream                     Stream RVQ code frames as NDJSON to stdout\n"
               << std::endl;
 }
 
@@ -217,7 +220,8 @@ bool parseArgs(Qwen3TTSInferenceArgs& args, int argc, char* argv[])
         {"dumpProfile", no_argument, 0, Qwen3TTSOptionId::DUMP_PROFILE},
         {"profileOutputFile", required_argument, 0, Qwen3TTSOptionId::PROFILE_OUTPUT_FILE},
         {"dumpOutput", no_argument, 0, Qwen3TTSOptionId::DUMP_OUTPUT},
-        {"batchSize", required_argument, 0, Qwen3TTSOptionId::BATCH_SIZE}, {0, 0, 0, 0}};
+        {"batchSize", required_argument, 0, Qwen3TTSOptionId::BATCH_SIZE},
+        {"stream", no_argument, 0, Qwen3TTSOptionId::STREAM}, {0, 0, 0, 0}};
 
     int opt;
     while ((opt = getopt_long(argc, argv, "", inferenceOptions, nullptr)) != -1)
@@ -235,6 +239,7 @@ bool parseArgs(Qwen3TTSInferenceArgs& args, int argc, char* argv[])
         case Qwen3TTSOptionId::DUMP_PROFILE: args.dumpProfile = true; break;
         case Qwen3TTSOptionId::PROFILE_OUTPUT_FILE: args.profileOutputFile = optarg; break;
         case Qwen3TTSOptionId::DUMP_OUTPUT: args.dumpOutput = true; break;
+        case Qwen3TTSOptionId::STREAM: args.stream = true; break;
         case Qwen3TTSOptionId::BATCH_SIZE:
             try
             {
@@ -383,6 +388,17 @@ int main(int argc, char** argv)
         talkerReq.speakerName = input.requestSpeakers[requestIdx];
         talkerReq.maxAudioLength = input.maxAudioLength;
         talkerReq.messages = input.requests[requestIdx];
+
+        if (args.stream)
+        {
+            talkerReq.onFrameGenerated = [](int32_t frameIdx, std::vector<int32_t> const& codes)
+            {
+                nlohmann::json frame;
+                frame["frame"] = frameIdx;
+                frame["codes"] = codes;
+                std::cout << frame.dump() << std::endl;
+            };
+        }
 
         rt::Qwen3OmniTTSRuntime::TalkerGenerationResponse talkerResp;
         bool const requestStatus = ttsRuntime->handleAudioGeneration(talkerReq, talkerResp, stream);

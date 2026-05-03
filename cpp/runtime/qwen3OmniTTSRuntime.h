@@ -47,6 +47,7 @@ constexpr int32_t kAssistantTrailingSuffix
 constexpr int32_t kNonStreamingPrefixRows = 8;     //!< Fixed prefix rows in non-streaming prefill (rows 0-7)
 constexpr int32_t kCodePredictorPrefillSeqLen = 2; //!< CodePredictor prefill sequence length
 constexpr int32_t kCodecEmbeddingCount = 6;        //!< Number of codec embeddings to add
+constexpr int32_t kActiveCodePredictorGroups = 13; //!< Residual groups used by production Qwen3-TTS config
 } // namespace talker_constants
 
 /*!
@@ -105,6 +106,7 @@ public:
 
         // Speaker selection (optional, defaults to config default)
         std::string speakerName{""}; //!< Speaker name (e.g., "f245", "m02") - empty means use default
+        std::string language{""};       //!< Language hint (e.g., "chinese", "english")
         int32_t speakerId{-1};       //!< Speaker ID - if >= 0, overrides speakerName
 
         // Input: conversation messages for this request (runtime tokenizes internally)
@@ -173,6 +175,8 @@ public:
     int32_t getSpeakerIdByName(std::string const& speakerName) const;
 
 private:
+    class SpecialCodePredictorEngine;
+
     // ========== Internal Methods ==========
 
     void initializeTTSEmbeddings(cudaStream_t stream);
@@ -183,7 +187,7 @@ private:
     bool runCodePredictorGenerationForFrame(int32_t codecToken, rt::Tensor const& talkerHiddenState,
         SamplingParams const& samplingParams, std::vector<int32_t>& outputCodes, cudaStream_t stream);
 
-    bool computeResidualConnection(std::vector<int32_t> const& codes, rt::Tensor& outputResidual, cudaStream_t stream);
+    bool computeResidualConnection(std::vector<int32_t> const& codes, rt::Tensor& outputResidual, int32_t frameIdx, cudaStream_t stream);
 
     bool extractTalkerLastHidden(
         rt::Tensor const& talkerHiddenStates, rt::Tensor& outputLastHidden, cudaStream_t stream);
@@ -210,6 +214,7 @@ private:
 
         // Codec special tokens (from talker vocab, used directly)
         int32_t codecNothinkId{};  //!< Codec no-think control token (2155)
+    int32_t codecThinkId{};   //!< Codec think control token (2154)
         int32_t codecThinkBosId{}; //!< Codec think begin-of-sequence (2156)
         int32_t codecThinkEosId{}; //!< Codec think end-of-sequence (2157)
         int32_t codecPadId{};      //!< Codec padding token (2148)
@@ -218,6 +223,7 @@ private:
 
         // Speaker configuration (read from config)
         int32_t defaultSpeakerId{}; //!< Default speaker ID (e.g., 2301 for f245)
+    std::unordered_map<std::string, int32_t> languageIdMap;
     };
 
     // ========== Configuration and Initialization ==========
@@ -236,6 +242,7 @@ private:
      * @return True on success, false on failure
      */
     bool initializeEngineRunners(std::string const& talkerEngineDir, std::string const& codePredictorEngineDir);
+    bool loadCodePredictorConfig(std::string const& codePredictorEngineDir);
 
     /*!
      * @brief Load CodePredictor lm_head weights and small_to_mtp_projection
@@ -256,6 +263,9 @@ private:
     std::unique_ptr<tokenizer::Tokenizer> mTokenizer;      //!< Tokenizer for text-to-token-ID conversion
     std::unique_ptr<LLMEngineRunner> mTalkerLLMRunner;     //!< Talker LLM engine runner
     std::unique_ptr<LLMEngineRunner> mCodePredictorRunner; //!< CodePredictor engine runner
+    std::unique_ptr<SpecialCodePredictorEngine>
+        mSpecialCodePredictorEngine; //!< Optional Qwen3-TTS-specific CP engine adapter
+    bool mUseSpecialCodePredictor{false}; //!< Whether the Qwen3-TTS-specific CP engine adapter is enabled
 
     LLMEngineRunnerConfig mTalkerLLMConfig;     //!< Talker LLM configuration
     LLMEngineRunnerConfig mCodePredictorConfig; //!< CodePredictor configuration
@@ -290,6 +300,8 @@ private:
     rt::Tensor mTtsPadEmbed; //!< TTS pad embedding [talkerHiddenSize] FP16
     rt::Tensor mTtsBosEmbed; //!< TTS bos embedding [talkerHiddenSize] FP16
     rt::Tensor mTtsEosEmbed; //!< TTS eos embedding [talkerHiddenSize] FP16
+
+    int32_t mTrailingTextLen{0}; //!< Number of text tokens for trailing addend injection
 
     // Workspace tensors
     rt::Tensor mThinkerEmbedBuffer; //!< Pre-allocated text embedding output [maxSeqLen, thinkerHiddenSize] FP16

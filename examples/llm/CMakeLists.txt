@@ -24,6 +24,14 @@ target_include_directories(
                         ${CMAKE_SOURCE_DIR}/examples/utils)
 add_cross_build_link_options(llm_inference)
 
+add_executable(qwen3_asr_worker qwen3_asr_worker.cpp)
+target_link_libraries(qwen3_asr_worker PRIVATE edgellmCore exampleUtils
+                                               commonLibraryExt)
+target_include_directories(
+  qwen3_asr_worker PRIVATE ${COMMON_INCLUDE_DIRS}
+                           ${CMAKE_SOURCE_DIR}/examples/utils)
+add_cross_build_link_options(qwen3_asr_worker)
+
 add_executable(llm_stream llm_stream.cpp)
 target_link_libraries(llm_stream PRIVATE edgellmCore exampleUtils
                                          commonLibraryExt)
