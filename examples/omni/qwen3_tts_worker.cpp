@@ -11,12 +11,15 @@
 #include "multimodal/code2WavRunner.h"
 #include "runtime/llmRuntimeUtils.h"
 #include "runtime/qwen3OmniTTSRuntime.h"
+#include <algorithm>
 #include <chrono>
 #include <cstdlib>
+#include <cstring>
 #include <filesystem>
 #include <fstream>
 #include <getopt.h>
 #include <iostream>
+#include <memory>
 #include <nlohmann/json.hpp>
 #include <string>
 #include <vector>
@@ -96,6 +99,43 @@ std::vector<std::vector<int32_t>> transposeCodes(std::vector<std::vector<int32_t
     return transposed;
 }
 
+std::vector<std::vector<int32_t>> transposeFrameWindow(
+    std::vector<std::vector<int32_t>> const& frames, size_t begin, size_t end)
+{
+    if (begin >= end || end > frames.size())
+    {
+        return {};
+    }
+    size_t const numFrames = end - begin;
+    size_t const numLayers = frames[begin].size();
+    std::vector<std::vector<int32_t>> transposed(numLayers, std::vector<int32_t>(numFrames));
+    for (size_t f = 0; f < numFrames; ++f)
+    {
+        for (size_t l = 0; l < numLayers; ++l)
+        {
+            transposed[l][f] = frames[begin + f][l];
+        }
+    }
+    return transposed;
+}
+
+bool saveFloatSamplesToWav(std::string const& filepath, std::vector<float> const& samples, int32_t sampleRate)
+{
+    if (samples.empty())
+    {
+        return false;
+    }
+
+    rt::audioUtils::AudioData audio;
+    audio.sampleRate = sampleRate;
+    audio.numChannels = 1;
+    audio.hasWaveform = true;
+    audio.waveform = std::make_shared<rt::Tensor>(
+        rt::Tensor({1, static_cast<int64_t>(samples.size())}, rt::DeviceType::kCPU, nvinfer1::DataType::kFLOAT));
+    std::memcpy(audio.waveform->rawPointer(), samples.data(), samples.size() * sizeof(float));
+    return saveAudioToWav(filepath, audio);
+}
+
 Qwen3OmniTTSRuntime::TalkerGenerationRequest buildRequest(Json const& item)
 {
     Qwen3OmniTTSRuntime::TalkerGenerationRequest req;
@@ -169,6 +209,9 @@ int main(int argc, char** argv)
         {
             Json item = Json::parse(line);
             std::string const id = item.value("id", "");
+            bool const streamOutput = item.value("stream", false);
+            int32_t const firstChunkFrames = std::max(1, item.value("first_chunk_frames", 5));
+            int32_t const chunkFrames = std::max(1, item.value("chunk_frames", 25));
             std::string outputFile = item.value("output_file", "");
             if (outputFile.empty())
             {
@@ -178,11 +221,88 @@ int main(int argc, char** argv)
             auto request = buildRequest(item);
             Qwen3OmniTTSRuntime::TalkerGenerationResponse talkerResponse;
             auto const genStart = std::chrono::steady_clock::now();
-            bool ok = ttsRuntime->handleAudioGeneration(request, talkerResponse, stream);
+
+            std::vector<std::vector<int32_t>> streamedFrames;
+            int32_t lastEmittedFrames = 0;
+            int32_t nextChunkAt = firstChunkFrames;
+            int32_t chunkIndex = 0;
+            std::chrono::steady_clock::time_point firstChunkAt{};
+            auto emitChunk = [&](bool isFinal) {
+                int32_t const totalFrames = static_cast<int32_t>(streamedFrames.size());
+                if (totalFrames <= lastEmittedFrames)
+                {
+                    return;
+                }
+                if (!code2wavRunner)
+                {
+                    code2wavRunner = std::make_unique<Code2WavRunner>(args.code2wavEngineDir, stream);
+                }
+
+                int32_t const leftContext = code2wavRunner->getConfig().leftContextSize;
+                int32_t const windowStart = std::max(0, lastEmittedFrames - leftContext);
+                int32_t const skipContextFrames = lastEmittedFrames - windowStart;
+                auto windowCodes = transposeFrameWindow(
+                    streamedFrames, static_cast<size_t>(windowStart), static_cast<size_t>(totalFrames));
+
+                std::vector<float> samples;
+                auto const chunkStart = std::chrono::steady_clock::now();
+                if (!code2wavRunner->generateWaveformChunk(windowCodes, skipContextFrames, samples, stream))
+                {
+                    throw std::runtime_error("Code2Wav streaming chunk failed");
+                }
+                auto const chunkEnd = std::chrono::steady_clock::now();
+                if (samples.empty())
+                {
+                    return;
+                }
+
+                std::filesystem::path chunkPath(outputFile);
+                chunkPath.replace_filename(chunkPath.stem().string() + ".chunk" + std::to_string(chunkIndex)
+                    + chunkPath.extension().string());
+                if (!saveFloatSamplesToWav(chunkPath.string(), samples, code2wavRunner->getConfig().sampleRate))
+                {
+                    throw std::runtime_error("Failed to save chunk WAV: " + chunkPath.string());
+                }
+
+                if (chunkIndex == 0)
+                {
+                    firstChunkAt = chunkEnd;
+                }
+                Json chunk = Json{{"id", id},
+                    {"event", "chunk"},
+                    {"ok", true},
+                    {"chunk_index", chunkIndex},
+                    {"chunk_file", chunkPath.string()},
+                    {"frames", totalFrames},
+                    {"samples", samples.size()},
+                    {"sample_rate", code2wavRunner->getConfig().sampleRate},
+                    {"is_final", isFinal},
+                    {"code2wav_ms", std::chrono::duration<double, std::milli>(chunkEnd - chunkStart).count()},
+                    {"elapsed_ms", std::chrono::duration<double, std::milli>(chunkEnd - requestStart).count()}};
+                std::cout << chunk.dump() << std::endl;
+                lastEmittedFrames = totalFrames;
+                nextChunkAt = totalFrames + chunkFrames;
+                ++chunkIndex;
+            };
+
+            auto frameCallback = [&](std::vector<int32_t> const& frameCodes, int32_t totalFrames) {
+                streamedFrames.push_back(frameCodes);
+                if (streamOutput && totalFrames >= nextChunkAt)
+                {
+                    emitChunk(false);
+                }
+            };
+
+            bool ok = streamOutput ? ttsRuntime->handleAudioGeneration(request, talkerResponse, stream, frameCallback)
+                                   : ttsRuntime->handleAudioGeneration(request, talkerResponse, stream);
             auto const genEnd = std::chrono::steady_clock::now();
             if (!ok || talkerResponse.rvqCodes.empty())
             {
                 throw std::runtime_error("TTS generation failed");
+            }
+            if (streamOutput)
+            {
+                emitChunk(true);
             }
 
             rt::audioUtils::AudioData audioOutput;
@@ -222,6 +342,10 @@ int main(int argc, char** argv)
                 {"audio_s", audioSeconds},
                 {"generation_ms", std::chrono::duration<double, std::milli>(genEnd - genStart).count()},
                 {"code2wav_ms", std::chrono::duration<double, std::milli>(wavEnd - wavStart).count()},
+                {"first_chunk_ms",
+                    (streamOutput && firstChunkAt.time_since_epoch().count() != 0)
+                        ? std::chrono::duration<double, std::milli>(firstChunkAt - requestStart).count()
+                        : 0.0},
                 {"total_ms", totalMs},
                 {"rtf", audioSeconds > 0.0 ? totalMs / 1000.0 / audioSeconds : 0.0}};
         }

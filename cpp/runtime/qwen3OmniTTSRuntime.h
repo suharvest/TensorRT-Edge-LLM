@@ -22,6 +22,7 @@
 #include "runtime/llmEngineRunner.h"
 #include "runtime/llmRuntimeUtils.h"
 #include "tokenizer/tokenizer.h"
+#include <functional>
 #include <memory>
 #include <string>
 #include <unordered_map>
@@ -150,6 +151,21 @@ public:
      */
     bool handleAudioGeneration(
         TalkerGenerationRequest const& request, TalkerGenerationResponse& response, cudaStream_t stream);
+
+    //! Callback invoked after each complete RVQ frame is generated.
+    //! The callback receives the frame codes in frame-major order and the
+    //! total frame count including this frame. It may run vocoding or forward
+    //! codes to another streaming transport.
+    using RvqFrameCallback = std::function<void(std::vector<int32_t> const& frameCodes, int32_t totalFrames)>;
+
+    /*!
+     * @brief Generate audio with RVQ codes and optionally stream frames as they are produced.
+     *
+     * This keeps Code2Wav outside the Talker runtime while allowing callers to
+     * emit first audio before the whole utterance has finished generating.
+     */
+    bool handleAudioGeneration(TalkerGenerationRequest const& request, TalkerGenerationResponse& response,
+        cudaStream_t stream, RvqFrameCallback const& frameCallback);
 
     /*!
      * @brief Get performance metrics for Talker pipeline

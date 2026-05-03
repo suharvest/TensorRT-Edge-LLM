@@ -72,6 +72,15 @@ public:
     bool generateWaveform(
         std::vector<std::vector<int32_t>> const& codes, rt::audioUtils::AudioData& outputAudio, cudaStream_t stream);
 
+    //! \brief Generate only the new audio from a sliding window of RVQ codes.
+    //! \param[in] codes Windowed RVQ codes [numQuantizers][windowLen]
+    //! \param[in] skipContextFrames Number of left-context frames in the window to skip in output
+    //! \param[out] outputSamples New FP32 PCM samples after skipping context
+    //! \param[in] stream CUDA stream for execution
+    //! \return True if generation succeeded, false otherwise
+    bool generateWaveformChunk(std::vector<std::vector<int32_t>> const& codes, int64_t skipContextFrames,
+        std::vector<float>& outputSamples, cudaStream_t stream);
+
     //! \brief Get Code2Wav configuration
     //! \return Reference to Code2Wav config
     Code2WavConfig const& getConfig() const

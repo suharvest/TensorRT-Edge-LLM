@@ -1555,6 +1555,12 @@ bool Qwen3OmniTTSRuntime::prepareTalkerInput(std::vector<int32_t> const& textTok
 bool Qwen3OmniTTSRuntime::handleAudioGeneration(
     TalkerGenerationRequest const& request, TalkerGenerationResponse& response, cudaStream_t stream)
 {
+    return handleAudioGeneration(request, response, stream, RvqFrameCallback{});
+}
+
+bool Qwen3OmniTTSRuntime::handleAudioGeneration(TalkerGenerationRequest const& request,
+    TalkerGenerationResponse& response, cudaStream_t stream, RvqFrameCallback const& frameCallback)
+{
     NVTX_SCOPED_RANGE(nvtx_range, "TalkerRunner::handleAudioGeneration", nvtx_colors::PURPLE);
     LOG_INFO("Starting audio generation for request with %zu messages", request.messages.size());
 
@@ -1748,6 +1754,10 @@ bool Qwen3OmniTTSRuntime::handleAudioGeneration(
 
             // Store RVQ codes for this frame
             rvqCodes.push_back(frameCodes);
+            if (frameCallback)
+            {
+                frameCallback(rvqCodes.back(), numFrames + 1);
+            }
 
             // Compute residual connection using pre-allocated buffer
             // Non-streaming: always add tts_pad_embed as addend

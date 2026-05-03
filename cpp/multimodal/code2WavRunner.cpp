@@ -410,5 +410,32 @@ bool Code2WavRunner::generateWaveform(
     return true;
 }
 
+bool Code2WavRunner::generateWaveformChunk(std::vector<std::vector<int32_t>> const& codes,
+    int64_t skipContextFrames, std::vector<float>& outputSamples, cudaStream_t stream)
+{
+    outputSamples.clear();
+
+    rt::audioUtils::AudioData audio;
+    if (!generateWaveform(codes, audio, stream))
+    {
+        return false;
+    }
+    if (!audio.waveform || audio.waveform->isEmpty())
+    {
+        return true;
+    }
+
+    int64_t const skipSamples = std::max<int64_t>(0, skipContextFrames) * mConfig.upsampleRate;
+    int64_t const totalSamples = audio.waveform->getShape()[1];
+    if (skipSamples >= totalSamples)
+    {
+        return true;
+    }
+
+    float const* data = static_cast<float const*>(audio.waveform->rawPointer());
+    outputSamples.assign(data + skipSamples, data + totalSamples);
+    return true;
+}
+
 } // namespace rt
 } // namespace trt_edgellm
