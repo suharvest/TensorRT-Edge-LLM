@@ -13,6 +13,8 @@
 #include "runtime/qwen3OmniTTSRuntime.h"
 #include <algorithm>
 #include <chrono>
+#include <cmath>
+#include <cstdint>
 #include <cstdlib>
 #include <cstring>
 #include <filesystem>
@@ -136,6 +138,53 @@ bool saveFloatSamplesToWav(std::string const& filepath, std::vector<float> const
     return saveAudioToWav(filepath, audio);
 }
 
+std::vector<int16_t> floatSamplesToPcm16(std::vector<float> const& samples)
+{
+    std::vector<int16_t> pcm(samples.size());
+    for (size_t i = 0; i < samples.size(); ++i)
+    {
+        float const clipped = std::clamp(samples[i], -1.0f, 1.0f);
+        pcm[i] = static_cast<int16_t>(std::lrint(clipped * 32767.0f));
+    }
+    return pcm;
+}
+
+bool savePcm16(std::string const& filepath, std::vector<int16_t> const& samples)
+{
+    std::ofstream file(filepath, std::ios::binary);
+    if (!file)
+    {
+        return false;
+    }
+    file.write(reinterpret_cast<char const*>(samples.data()),
+        static_cast<std::streamsize>(samples.size() * sizeof(int16_t)));
+    return static_cast<bool>(file);
+}
+
+std::string base64Encode(uint8_t const* data, size_t len)
+{
+    static constexpr char kTable[] = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    std::string out;
+    out.reserve(((len + 2) / 3) * 4);
+    for (size_t i = 0; i < len; i += 3)
+    {
+        uint32_t const b0 = data[i];
+        uint32_t const b1 = (i + 1 < len) ? data[i + 1] : 0;
+        uint32_t const b2 = (i + 2 < len) ? data[i + 2] : 0;
+        uint32_t const triple = (b0 << 16) | (b1 << 8) | b2;
+        out.push_back(kTable[(triple >> 18) & 0x3F]);
+        out.push_back(kTable[(triple >> 12) & 0x3F]);
+        out.push_back((i + 1 < len) ? kTable[(triple >> 6) & 0x3F] : '=');
+        out.push_back((i + 2 < len) ? kTable[triple & 0x3F] : '=');
+    }
+    return out;
+}
+
+std::string base64EncodePcm16(std::vector<int16_t> const& samples)
+{
+    return base64Encode(reinterpret_cast<uint8_t const*>(samples.data()), samples.size() * sizeof(int16_t));
+}
+
 Qwen3OmniTTSRuntime::TalkerGenerationRequest buildRequest(Json const& item)
 {
     Qwen3OmniTTSRuntime::TalkerGenerationRequest req;
@@ -210,12 +259,31 @@ int main(int argc, char** argv)
             Json item = Json::parse(line);
             std::string const id = item.value("id", "");
             bool const streamOutput = item.value("stream", false);
+            bool const streamOnly = item.value("stream_only", false);
             int32_t const firstChunkFrames = std::max(1, item.value("first_chunk_frames", 5));
             int32_t const chunkFrames = std::max(1, item.value("chunk_frames", 25));
+            std::string const chunkFormat = item.value("chunk_format", "wav");
+            std::string const chunkTransport = item.value("chunk_transport", "file");
             std::string outputFile = item.value("output_file", "");
             if (outputFile.empty())
             {
                 outputFile = "/tmp/qwen3_tts_worker_" + id + ".wav";
+            }
+            if (streamOnly && !streamOutput)
+            {
+                throw std::runtime_error("stream_only requires stream=true");
+            }
+            if (chunkFormat != "wav" && chunkFormat != "pcm_s16le")
+            {
+                throw std::runtime_error("Unsupported chunk_format: " + chunkFormat);
+            }
+            if (chunkTransport != "file" && chunkTransport != "base64")
+            {
+                throw std::runtime_error("Unsupported chunk_transport: " + chunkTransport);
+            }
+            if (chunkFormat == "wav" && chunkTransport != "file")
+            {
+                throw std::runtime_error("wav chunks currently support file transport only");
             }
 
             auto request = buildRequest(item);
@@ -226,6 +294,8 @@ int main(int argc, char** argv)
             int32_t lastEmittedFrames = 0;
             int32_t nextChunkAt = firstChunkFrames;
             int32_t chunkIndex = 0;
+            int64_t streamedSamples = 0;
+            double streamedCode2WavMs = 0.0;
             std::chrono::steady_clock::time_point firstChunkAt{};
             auto emitChunk = [&](bool isFinal) {
                 int32_t const totalFrames = static_cast<int32_t>(streamedFrames.size());
@@ -256,29 +326,56 @@ int main(int argc, char** argv)
                     return;
                 }
 
-                std::filesystem::path chunkPath(outputFile);
-                chunkPath.replace_filename(chunkPath.stem().string() + ".chunk" + std::to_string(chunkIndex)
-                    + chunkPath.extension().string());
-                if (!saveFloatSamplesToWav(chunkPath.string(), samples, code2wavRunner->getConfig().sampleRate))
-                {
-                    throw std::runtime_error("Failed to save chunk WAV: " + chunkPath.string());
-                }
-
                 if (chunkIndex == 0)
                 {
                     firstChunkAt = chunkEnd;
                 }
+                double const code2wavMs = std::chrono::duration<double, std::milli>(chunkEnd - chunkStart).count();
+                streamedCode2WavMs += code2wavMs;
+                streamedSamples += static_cast<int64_t>(samples.size());
                 Json chunk = Json{{"id", id},
                     {"event", "chunk"},
                     {"ok", true},
                     {"chunk_index", chunkIndex},
-                    {"chunk_file", chunkPath.string()},
+                    {"chunk_format", chunkFormat},
+                    {"chunk_transport", chunkTransport},
                     {"frames", totalFrames},
                     {"samples", samples.size()},
                     {"sample_rate", code2wavRunner->getConfig().sampleRate},
                     {"is_final", isFinal},
-                    {"code2wav_ms", std::chrono::duration<double, std::milli>(chunkEnd - chunkStart).count()},
+                    {"code2wav_ms", code2wavMs},
                     {"elapsed_ms", std::chrono::duration<double, std::milli>(chunkEnd - requestStart).count()}};
+                if (chunkFormat == "wav")
+                {
+                    std::filesystem::path chunkPath(outputFile);
+                    chunkPath.replace_filename(chunkPath.stem().string() + ".chunk" + std::to_string(chunkIndex)
+                        + chunkPath.extension().string());
+                    if (!saveFloatSamplesToWav(chunkPath.string(), samples, code2wavRunner->getConfig().sampleRate))
+                    {
+                        throw std::runtime_error("Failed to save chunk WAV: " + chunkPath.string());
+                    }
+                    chunk["chunk_file"] = chunkPath.string();
+                }
+                else
+                {
+                    auto pcm = floatSamplesToPcm16(samples);
+                    chunk["bytes"] = pcm.size() * sizeof(int16_t);
+                    if (chunkTransport == "base64")
+                    {
+                        chunk["audio_b64"] = base64EncodePcm16(pcm);
+                    }
+                    else
+                    {
+                        std::filesystem::path chunkPath(outputFile);
+                        chunkPath.replace_filename(chunkPath.stem().string() + ".chunk" + std::to_string(chunkIndex)
+                            + ".pcm");
+                        if (!savePcm16(chunkPath.string(), pcm))
+                        {
+                            throw std::runtime_error("Failed to save chunk PCM: " + chunkPath.string());
+                        }
+                        chunk["chunk_file"] = chunkPath.string();
+                    }
+                }
                 std::cout << chunk.dump() << std::endl;
                 lastEmittedFrames = totalFrames;
                 nextChunkAt = totalFrames + chunkFrames;
@@ -303,6 +400,36 @@ int main(int argc, char** argv)
             if (streamOutput)
             {
                 emitChunk(true);
+            }
+
+            if (streamOnly)
+            {
+                auto const doneAt = std::chrono::steady_clock::now();
+                int32_t const streamSampleRate = code2wavRunner ? code2wavRunner->getConfig().sampleRate : 24000;
+                double const audioSeconds = static_cast<double>(streamedSamples) / streamSampleRate;
+                double const totalMs = std::chrono::duration<double, std::milli>(doneAt - requestStart).count();
+                if (lazyCode2Wav)
+                {
+                    code2wavRunner.reset();
+                }
+                response = Json{{"id", id},
+                    {"event", "done"},
+                    {"ok", true},
+                    {"stream_only", true},
+                    {"frames", talkerResponse.numFrames},
+                    {"samples", streamedSamples},
+                    {"sample_rate", streamSampleRate},
+                    {"audio_s", audioSeconds},
+                    {"generation_ms", std::chrono::duration<double, std::milli>(genEnd - genStart).count()},
+                    {"code2wav_ms", streamedCode2WavMs},
+                    {"first_chunk_ms",
+                        (firstChunkAt.time_since_epoch().count() != 0)
+                            ? std::chrono::duration<double, std::milli>(firstChunkAt - requestStart).count()
+                            : 0.0},
+                    {"total_ms", totalMs},
+                    {"rtf", audioSeconds > 0.0 ? totalMs / 1000.0 / audioSeconds : 0.0}};
+                std::cout << response.dump() << std::endl;
+                continue;
             }
 
             rt::audioUtils::AudioData audioOutput;
