@@ -302,8 +302,8 @@ int main(int argc, char** argv)
             bool const adaptiveChunks = item.value("adaptive_chunks",
                 std::getenv("EDGE_LLM_TTS_ADAPTIVE_CHUNKS") != nullptr
                     && std::string(std::getenv("EDGE_LLM_TTS_ADAPTIVE_CHUNKS")) != "0");
-            int32_t const maxChunkFrames = std::max(chunkFrames, item.value("max_chunk_frames", 100));
-            int32_t const chunkGrowthFrames = std::max(0, item.value("chunk_growth_frames", chunkFrames));
+            int32_t const maxChunkFrames = std::max(chunkFrames, item.value("max_chunk_frames", chunkFrames * 6));
+            int32_t const chunkGrowthFrames = std::max(0, item.value("chunk_growth_frames", chunkFrames * 2));
             std::string const chunkFormat = item.value("chunk_format", "wav");
             std::string const chunkTransport = item.value("chunk_transport", "file");
             std::string outputFile = item.value("output_file", "");
