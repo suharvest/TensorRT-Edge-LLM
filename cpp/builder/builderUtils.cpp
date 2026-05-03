@@ -19,7 +19,10 @@
 #include "common/logger.h"
 
 #include <NvOnnxParser.h>
+#include <charconv>
+#include <cstdlib>
 #include <fstream>
+#include <limits>
 #include <sstream>
 #include <string>
 
@@ -265,6 +268,36 @@ std::unique_ptr<nvinfer1::IBuilderConfig> createBuilderConfig(nvinfer1::IBuilder
 #if (NV_TENSORRT_MAJOR >= 10 && NV_TENSORRT_MINOR >= 6) || NV_TENSORRT_MAJOR >= 11
     config->setFlag(nvinfer1::BuilderFlag::kMONITOR_MEMORY);
 #endif
+
+    if (char const* workspaceMb = std::getenv("EDGE_LLM_TRT_WORKSPACE_MB"))
+    {
+        std::string const workspaceMbStr(workspaceMb);
+        unsigned long long workspaceMiB{};
+        char const* begin = workspaceMbStr.data();
+        char const* end = begin + workspaceMbStr.size();
+        auto const result = std::from_chars(begin, end, workspaceMiB);
+
+        if (workspaceMbStr.empty() || result.ec != std::errc{} || result.ptr != end || workspaceMiB == 0)
+        {
+            LOG_WARNING("Ignoring invalid EDGE_LLM_TRT_WORKSPACE_MB=%s", workspaceMb);
+        }
+        else
+        {
+            constexpr unsigned long long kMaxWorkspaceMiB
+                = static_cast<unsigned long long>(std::numeric_limits<size_t>::max() >> 20);
+            if (workspaceMiB > kMaxWorkspaceMiB)
+            {
+                LOG_WARNING(
+                    "Clamping EDGE_LLM_TRT_WORKSPACE_MB=%llu to the maximum supported value %llu", workspaceMiB,
+                    kMaxWorkspaceMiB);
+                workspaceMiB = kMaxWorkspaceMiB;
+            }
+
+            auto const workspaceBytes = static_cast<size_t>(workspaceMiB) << 20;
+            config->setMemoryPoolLimit(nvinfer1::MemoryPoolType::kWORKSPACE, workspaceBytes);
+            LOG_INFO("Set TensorRT builder workspace memory pool limit to %llu MiB", workspaceMiB);
+        }
+    }
 
     return config;
 }
