@@ -299,6 +299,11 @@ int main(int argc, char** argv)
                         && std::string(std::getenv("EDGE_LLM_TTS_ASYNC_CODE2WAV")) != "0");
             int32_t const firstChunkFrames = std::max(1, item.value("first_chunk_frames", 5));
             int32_t const chunkFrames = std::max(1, item.value("chunk_frames", 25));
+            bool const adaptiveChunks = item.value("adaptive_chunks",
+                std::getenv("EDGE_LLM_TTS_ADAPTIVE_CHUNKS") != nullptr
+                    && std::string(std::getenv("EDGE_LLM_TTS_ADAPTIVE_CHUNKS")) != "0");
+            int32_t const maxChunkFrames = std::max(chunkFrames, item.value("max_chunk_frames", 100));
+            int32_t const chunkGrowthFrames = std::max(0, item.value("chunk_growth_frames", chunkFrames));
             std::string const chunkFormat = item.value("chunk_format", "wav");
             std::string const chunkTransport = item.value("chunk_transport", "file");
             std::string outputFile = item.value("output_file", "");
@@ -330,6 +335,7 @@ int main(int argc, char** argv)
             std::vector<std::vector<int32_t>> streamedFrames;
             int32_t lastEmittedFrames = 0;
             int32_t nextChunkAt = firstChunkFrames;
+            int32_t currentChunkFrames = chunkFrames;
             int32_t chunkIndex = 0;
             int64_t streamedSamples = 0;
             double streamedCode2WavMs = 0.0;
@@ -378,6 +384,7 @@ int main(int argc, char** argv)
                     {"samples", samples.size()},
                     {"sample_rate", code2wavRunner->getConfig().sampleRate},
                     {"is_final", job.isFinal},
+                    {"adaptive_chunks", adaptiveChunks},
                     {"code2wav_ms", code2wavMs},
                     {"elapsed_ms", std::chrono::duration<double, std::milli>(chunkEnd - requestStart).count()}};
                 if (chunkFormat == "wav")
@@ -486,8 +493,12 @@ int main(int argc, char** argv)
                 job.isFinal = isFinal;
 
                 lastEmittedFrames = totalFrames;
-                nextChunkAt = totalFrames + chunkFrames;
                 ++chunkIndex;
+                if (adaptiveChunks && chunkIndex > 1)
+                {
+                    currentChunkFrames = std::min(maxChunkFrames, currentChunkFrames + chunkGrowthFrames);
+                }
+                nextChunkAt = totalFrames + currentChunkFrames;
 
                 if (asyncCode2Wav)
                 {
