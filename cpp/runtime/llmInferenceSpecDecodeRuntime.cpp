@@ -59,6 +59,33 @@ std::tuple<std::string, std::string> keySystemPromptWithLoraWeights(
 namespace rt
 {
 
+void LLMInferenceSpecDecodeRuntime::remapHostIdsForEmbedding(int32_t* tokenIds, int64_t tokenCount,
+    std::optional<int32_t> imageTokenId, std::optional<int32_t> audioTokenId) const
+{
+    if (!mUseReducedEmbedding)
+    {
+        return;
+    }
+
+    for (int64_t i = 0; i < tokenCount; ++i)
+    {
+        int32_t const tokenId = tokenIds[i];
+        if ((imageTokenId.has_value() && tokenId == *imageTokenId)
+            || (audioTokenId.has_value() && tokenId == *audioTokenId) || tokenId >= mBaseEngineConfig.vocabSize)
+        {
+            continue;
+        }
+
+        check::check(tokenId >= 0 && tokenId < static_cast<int32_t>(mBaseVocabReverseMappingHost.size()),
+            format::fmtstr("Token ID %d is outside full vocab size %d for reduced embedding lookup", tokenId,
+                static_cast<int32_t>(mBaseVocabReverseMappingHost.size())));
+        int32_t const reducedId = mBaseVocabReverseMappingHost[tokenId];
+        check::check(reducedId >= 0,
+            format::fmtstr("Token ID %d is missing from vocab_map.safetensors for reduced embedding lookup", tokenId));
+        tokenIds[i] = reducedId;
+    }
+}
+
 void SpecDecodeInferenceContext::initialize(int32_t _activeBatchSize, int32_t _maxGenerateLength,
     rt::OptionalInputTensor const& _visualEmbeddings, rt::OptionalInputTensors const& _deepstackFeatures,
     std::string const& _loraWeightsName, cudaStream_t _stream)
@@ -237,6 +264,9 @@ void LLMInferenceSpecDecodeRuntime::initializeCommon(std::string const& engineDi
     {
         mIdsInput = rt::Tensor({mMaxRuntimeBatchSize, mBaseEngineConfig.maxSupportedInputLength}, rt::DeviceType::kGPU,
             DataType::kINT32, "LLMInferenceSpecDecodeRuntime::mIdsInput");
+        mEmbeddingIdsInput
+            = rt::Tensor({mMaxRuntimeBatchSize, mBaseEngineConfig.maxSupportedInputLength}, rt::DeviceType::kGPU,
+                DataType::kINT32, "LLMInferenceSpecDecodeRuntime::mEmbeddingIdsInput");
         mInputsEmbeds = rt::Tensor(
             {mMaxRuntimeBatchSize, mBaseEngineConfig.maxSupportedInputLength, mBaseEngineConfig.hiddenSize},
             rt::DeviceType::kGPU, DataType::kHALF, "LLMInferenceSpecDecodeRuntime::mInputsEmbeds");
@@ -388,7 +418,38 @@ void LLMInferenceSpecDecodeRuntime::initializeCommon(std::string const& engineDi
         check::check(vocabMapTensors[0].getShape()[0] == mBaseEngineConfig.reducedVocabSize,
             "vocab_map tensor length should match base model reduced vocab size");
         mBaseVocabMappingTable = std::move(vocabMapTensors[0]);
+
+        mBaseVocabReverseMappingHost.assign(mBaseEngineConfig.vocabSize, -1);
+        std::vector<int32_t> vocabMapHost(mBaseEngineConfig.reducedVocabSize);
+        CUDA_CHECK(cudaMemcpyAsync(vocabMapHost.data(), mBaseVocabMappingTable.rawPointer(),
+            vocabMapHost.size() * sizeof(int32_t), cudaMemcpyDeviceToHost, stream));
+        CUDA_CHECK(cudaStreamSynchronize(stream));
+        for (int32_t reducedId = 0; reducedId < static_cast<int32_t>(vocabMapHost.size()); ++reducedId)
+        {
+            int32_t const fullId = vocabMapHost[reducedId];
+            check::check(fullId >= 0 && fullId < mBaseEngineConfig.vocabSize,
+                format::fmtstr("vocab_map contains invalid full token ID %d", fullId));
+            mBaseVocabReverseMappingHost[fullId] = reducedId;
+        }
         LOG_INFO("Base model vocabulary mapping table successfully loaded.");
+    }
+
+    if (mBaseEngineConfig.reducedVocabSize > 0
+        && mEmbedding.table.getShape()[0] == mBaseEngineConfig.reducedVocabSize)
+    {
+        mUseReducedEmbedding = true;
+        check::check(!hasDraft,
+            "Reduced embedding lookup is currently supported for vanilla base-model decoding only, not Eagle draft "
+            "decoding.");
+        LOG_INFO("Reduced embedding lookup enabled: embedding rows=%d, full vocab=%d",
+            mBaseEngineConfig.reducedVocabSize, mBaseEngineConfig.vocabSize);
+    }
+    else
+    {
+        check::check(mEmbedding.table.getShape()[0] == mBaseEngineConfig.vocabSize,
+            format::fmtstr("Embedding row count %ld must match vocab_size %d or reduced_vocab_size %d",
+                static_cast<long>(mEmbedding.table.getShape()[0]), mBaseEngineConfig.vocabSize,
+                mBaseEngineConfig.reducedVocabSize));
     }
 
     mTokenizer = std::make_unique<tokenizer::Tokenizer>();
@@ -1050,13 +1111,25 @@ bool LLMInferenceSpecDecodeRuntime::runBaseModelPrefill(SpecDecodeInferenceConte
         CUDA_CHECK(cudaMemcpy(mMultimodalIndices.rawPointer(), multimodalIndicesCPU.rawPointer(), indicesSizeBytes,
             cudaMemcpyHostToDevice));
 
-        kernel::embeddingLookupMultimodal(mIdsInput, mEmbedding.table, mEmbedding.scalesAsOptional(),
+        rt::Tensor& embeddingIds = mUseReducedEmbedding ? mEmbeddingIdsInput : mIdsInput;
+        if (mUseReducedEmbedding)
+        {
+            check::check(mEmbeddingIdsInput.reshape({activeBatchSize, inputIdsLength}), "Tensor reshape failed");
+            remapHostIdsForEmbedding(hostPackedTokenIdsData, activeBatchSize * inputIdsLength, imageTokenId,
+                audioTokenId);
+            CUDA_CHECK(cudaMemcpyAsync(mEmbeddingIdsInput.rawPointer(), hostPackedTokenIdsData,
+                activeBatchSize * inputIdsLength * sizeof(int32_t), cudaMemcpyHostToDevice, context.stream));
+        }
+
+        kernel::embeddingLookupMultimodal(embeddingIds, mEmbedding.table, mEmbedding.scalesAsOptional(),
             std::optional{std::ref(mMultimodalIndices)}, imageTokenId, context.visualEmbeddings, audioTokenId,
             context.audioEmbeddings, mInputsEmbeds, context.stream);
     }
     else if (useIncrementalVisualID)
     {
         // Vision-only legacy path (``tokenId >= vocabSize`` remapping).
+        check::check(!mUseReducedEmbedding,
+            "Reduced embedding lookup does not support legacy incremental visual token IDs.");
         rt::Tensor const& imageEmbedsTensor = context.visualEmbeddings.value().get();
         kernel::embeddingLookupWithImageInsertion(mIdsInput, mEmbedding.table, mEmbedding.scalesAsOptional(),
             imageEmbedsTensor, mInputsEmbeds, context.stream);
@@ -1064,8 +1137,17 @@ bool LLMInferenceSpecDecodeRuntime::runBaseModelPrefill(SpecDecodeInferenceConte
     else
     {
         // Standard embedding lookup
+        rt::Tensor& embeddingIds = mUseReducedEmbedding ? mEmbeddingIdsInput : mIdsInput;
+        if (mUseReducedEmbedding)
+        {
+            check::check(mEmbeddingIdsInput.reshape({activeBatchSize, inputIdsLength}), "Tensor reshape failed");
+            remapHostIdsForEmbedding(hostPackedTokenIdsData, activeBatchSize * inputIdsLength, std::nullopt,
+                std::nullopt);
+            CUDA_CHECK(cudaMemcpyAsync(mEmbeddingIdsInput.rawPointer(), hostPackedTokenIdsData,
+                activeBatchSize * inputIdsLength * sizeof(int32_t), cudaMemcpyHostToDevice, context.stream));
+        }
         kernel::embeddingLookup(
-            mIdsInput, mEmbedding.table, mEmbedding.scalesAsOptional(), mInputsEmbeds, context.stream);
+            embeddingIds, mEmbedding.table, mEmbedding.scalesAsOptional(), mInputsEmbeds, context.stream);
     }
 
     // Process deepstack features
@@ -1581,8 +1663,16 @@ bool LLMInferenceSpecDecodeRuntime::runVanillaDecoding(SpecDecodeInferenceContex
 
     check::check(mInputsEmbeds.reshape({activeBatchSize, 1, mBaseEngineConfig.hiddenSize}), "Tensor reshape failed");
     {
+        rt::Tensor& embeddingIds = mUseReducedEmbedding ? mEmbeddingIdsInput : mIdsInput;
+        if (mUseReducedEmbedding)
+        {
+            check::check(mEmbeddingIdsInput.reshape({activeBatchSize, 1}), "Tensor reshape failed");
+            remapHostIdsForEmbedding(hostPackedTokenIdsData, activeBatchSize, std::nullopt, std::nullopt);
+            CUDA_CHECK(cudaMemcpyAsync(mEmbeddingIdsInput.rawPointer(), hostPackedTokenIdsData,
+                activeBatchSize * sizeof(int32_t), cudaMemcpyHostToDevice, context.stream));
+        }
         kernel::embeddingLookup(
-            mIdsInput, mEmbedding.table, mEmbedding.scalesAsOptional(), mInputsEmbeds, context.stream);
+            embeddingIds, mEmbedding.table, mEmbedding.scalesAsOptional(), mInputsEmbeds, context.stream);
     }
 
     check::check(mLogitsOutput.reshape({activeBatchSize, mBaseEngineConfig.outputVocabSize}), "Tensor reshape failed");

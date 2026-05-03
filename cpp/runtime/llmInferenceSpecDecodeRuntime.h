@@ -258,6 +258,7 @@ private:
     // [1] I/O Tensors to work with base and eagle draft engine.
     EmbeddingData mEmbedding;                 //!< Embedding table [vocabSize, hiddenSize] and optional FP8 scales
     rt::Tensor mIdsInput;                     //!< Input token IDs (used for embedding lookup)
+    rt::Tensor mEmbeddingIdsInput;            //!< Input token IDs remapped for reduced embedding lookup
     rt::Tensor mInputsEmbeds;                 //!< Input embeddings (after embedding lookup)
     std::vector<rt::Tensor> mDeepstackEmbeds; //!< Deepstack embeddings for Qwen3-VL (one per feature)
     rt::Tensor mContextLengthsInput;
@@ -275,6 +276,8 @@ private:
     rt::Tensor mSamplingIndices;
     rt::Tensor mSamplingScores;
     rt::Tensor mBaseVocabMappingTable; // Vocab mapping table for base model reduced vocab (empty if not used)
+    std::vector<int32_t> mBaseVocabReverseMappingHost; //!< Full-vocab ID to reduced-vocab ID map
+    bool mUseReducedEmbedding{false};                  //!< True when embedding rows are in reduced vocab ID space
 
     // [3] Data structures used during Draft tree constructions (only allocated when draft model present).
     // Data tables that store the data structure that can completely describe a multi-layer draft tree.
@@ -329,6 +332,10 @@ private:
     //! and clears stale multimodal request state.
     bool multiModalRuntimePreprocess(
         LLMGenerationRequest const& request, SpecDecodeInferenceContext& context, cudaStream_t stream);
+
+    //! @brief Remap host token IDs from full vocab ID space to reduced embedding ID space when needed.
+    void remapHostIdsForEmbedding(int32_t* tokenIds, int64_t tokenCount, std::optional<int32_t> imageTokenId,
+        std::optional<int32_t> audioTokenId) const;
 
     // Consume the base model hidden states and input token of the sequence. Produce the draft hidden states and logits
     // for the last token of the sequence.
