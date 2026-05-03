@@ -19,6 +19,7 @@
 #include "common/logger.h"
 
 #include <NvOnnxParser.h>
+#include <cstdlib>
 #include <fstream>
 #include <sstream>
 #include <string>
@@ -265,6 +266,20 @@ std::unique_ptr<nvinfer1::IBuilderConfig> createBuilderConfig(nvinfer1::IBuilder
 #if (NV_TENSORRT_MAJOR >= 10 && NV_TENSORRT_MINOR >= 6) || NV_TENSORRT_MAJOR >= 11
     config->setFlag(nvinfer1::BuilderFlag::kMONITOR_MEMORY);
 #endif
+
+    if (char const* workspaceMb = std::getenv("EDGE_LLM_TRT_WORKSPACE_MB"))
+    {
+        try
+        {
+            auto const workspaceBytes = static_cast<size_t>(std::stoull(workspaceMb)) << 20;
+            config->setMemoryPoolLimit(nvinfer1::MemoryPoolType::kWORKSPACE, workspaceBytes);
+            LOG_INFO("Set TensorRT builder workspace memory pool limit to %s MiB", workspaceMb);
+        }
+        catch (std::exception const& e)
+        {
+            LOG_WARNING("Ignoring invalid EDGE_LLM_TRT_WORKSPACE_MB=%s: %s", workspaceMb, e.what());
+        }
+    }
 
     return config;
 }
