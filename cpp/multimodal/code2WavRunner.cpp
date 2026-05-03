@@ -414,26 +414,59 @@ bool Code2WavRunner::generateWaveformChunk(std::vector<std::vector<int32_t>> con
     int64_t skipContextFrames, std::vector<float>& outputSamples, cudaStream_t stream)
 {
     outputSamples.clear();
+    if (codes.empty() || codes[0].empty())
+    {
+        LOG_ERROR("Empty codes provided");
+        return false;
+    }
 
-    rt::audioUtils::AudioData audio;
-    if (!generateWaveform(codes, audio, stream))
+    int64_t const seqLen = math::cast<int64_t>(codes[0].size());
+    int64_t const maxCodeLen = mInputCodesDevice.getShape()[2];
+    int64_t const skipSamples = std::max<int64_t>(0, skipContextFrames) * mConfig.upsampleRate;
+
+    if (seqLen > maxCodeLen)
+    {
+        rt::audioUtils::AudioData audio;
+        if (!generateWaveform(codes, audio, stream))
+        {
+            return false;
+        }
+        if (!audio.waveform || audio.waveform->isEmpty())
+        {
+            return true;
+        }
+        int64_t const totalSamples = audio.waveform->getShape()[1];
+        if (skipSamples >= totalSamples)
+        {
+            return true;
+        }
+        float const* data = static_cast<float const*>(audio.waveform->rawPointer());
+        outputSamples.assign(data + skipSamples, data + totalSamples);
+        return true;
+    }
+
+    if (!prepareCodes(codes, stream))
     {
         return false;
     }
-    if (!audio.waveform || audio.waveform->isEmpty())
+    if (!infer(stream))
     {
-        return true;
+        return false;
     }
 
-    int64_t const skipSamples = std::max<int64_t>(0, skipContextFrames) * mConfig.upsampleRate;
-    int64_t const totalSamples = audio.waveform->getShape()[1];
+    int64_t const totalSamples = seqLen * mConfig.upsampleRate;
     if (skipSamples >= totalSamples)
     {
+        CUDA_CHECK(cudaStreamSynchronize(stream));
         return true;
     }
 
-    float const* data = static_cast<float const*>(audio.waveform->rawPointer());
-    outputSamples.assign(data + skipSamples, data + totalSamples);
+    int64_t const validSamples = totalSamples - skipSamples;
+    outputSamples.resize(static_cast<size_t>(validSamples));
+    CUDA_CHECK(cudaMemcpyAsync(outputSamples.data(),
+        static_cast<char*>(mOutputWaveform.rawPointer()) + skipSamples * sizeof(float),
+        math::cast<size_t>(validSamples) * sizeof(float), cudaMemcpyDeviceToHost, stream));
+    CUDA_CHECK(cudaStreamSynchronize(stream));
     return true;
 }
 

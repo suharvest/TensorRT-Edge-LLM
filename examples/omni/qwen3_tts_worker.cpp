@@ -14,16 +14,22 @@
 #include <algorithm>
 #include <chrono>
 #include <cmath>
+#include <condition_variable>
 #include <cstdint>
 #include <cstdlib>
 #include <cstring>
+#include <deque>
+#include <exception>
 #include <filesystem>
+#include <functional>
 #include <fstream>
 #include <getopt.h>
 #include <iostream>
 #include <memory>
+#include <mutex>
 #include <nlohmann/json.hpp>
 #include <string>
+#include <thread>
 #include <vector>
 
 using namespace trt_edgellm;
@@ -38,6 +44,31 @@ struct Args
     std::string code2wavEngineDir;
     std::string tokenizerDir;
     bool debug{false};
+};
+
+struct ChunkJob
+{
+    std::vector<std::vector<int32_t>> windowCodes;
+    int32_t skipContextFrames{0};
+    int32_t totalFrames{0};
+    int32_t chunkIndex{0};
+    bool isFinal{false};
+};
+
+struct ScopeExit
+{
+    std::function<void()> fn;
+    ~ScopeExit()
+    {
+        if (fn)
+        {
+            fn();
+        }
+    }
+    void dismiss()
+    {
+        fn = nullptr;
+    }
 };
 
 enum OptionId : int
@@ -221,6 +252,8 @@ int main(int argc, char** argv)
 
     cudaStream_t stream;
     CUDA_CHECK(cudaStreamCreate(&stream));
+    cudaStream_t code2wavStream;
+    CUDA_CHECK(cudaStreamCreate(&code2wavStream));
 
     std::filesystem::path const codePredictorDir
         = std::filesystem::path(args.talkerEngineDir).parent_path() / "code_predictor";
@@ -260,6 +293,10 @@ int main(int argc, char** argv)
             std::string const id = item.value("id", "");
             bool const streamOutput = item.value("stream", false);
             bool const streamOnly = item.value("stream_only", false);
+            bool const asyncCode2Wav = streamOnly
+                && item.value("async_code2wav",
+                    std::getenv("EDGE_LLM_TTS_ASYNC_CODE2WAV") != nullptr
+                        && std::string(std::getenv("EDGE_LLM_TTS_ASYNC_CODE2WAV")) != "0");
             int32_t const firstChunkFrames = std::max(1, item.value("first_chunk_frames", 5));
             int32_t const chunkFrames = std::max(1, item.value("chunk_frames", 25));
             std::string const chunkFormat = item.value("chunk_format", "wav");
@@ -297,26 +334,24 @@ int main(int argc, char** argv)
             int64_t streamedSamples = 0;
             double streamedCode2WavMs = 0.0;
             std::chrono::steady_clock::time_point firstChunkAt{};
-            auto emitChunk = [&](bool isFinal) {
-                int32_t const totalFrames = static_cast<int32_t>(streamedFrames.size());
-                if (totalFrames <= lastEmittedFrames)
-                {
-                    return;
-                }
+
+            std::deque<ChunkJob> chunkJobs;
+            std::mutex chunkMutex;
+            std::condition_variable chunkCv;
+            bool chunkJobsClosed = false;
+            std::exception_ptr chunkException;
+            std::thread chunkThread;
+
+            auto processChunk = [&](ChunkJob const& job) {
                 if (!code2wavRunner)
                 {
-                    code2wavRunner = std::make_unique<Code2WavRunner>(args.code2wavEngineDir, stream);
+                    code2wavRunner = std::make_unique<Code2WavRunner>(args.code2wavEngineDir, code2wavStream);
                 }
-
-                int32_t const leftContext = code2wavRunner->getConfig().leftContextSize;
-                int32_t const windowStart = std::max(0, lastEmittedFrames - leftContext);
-                int32_t const skipContextFrames = lastEmittedFrames - windowStart;
-                auto windowCodes = transposeFrameWindow(
-                    streamedFrames, static_cast<size_t>(windowStart), static_cast<size_t>(totalFrames));
 
                 std::vector<float> samples;
                 auto const chunkStart = std::chrono::steady_clock::now();
-                if (!code2wavRunner->generateWaveformChunk(windowCodes, skipContextFrames, samples, stream))
+                cudaStream_t const chunkStream = asyncCode2Wav ? code2wavStream : stream;
+                if (!code2wavRunner->generateWaveformChunk(job.windowCodes, job.skipContextFrames, samples, chunkStream))
                 {
                     throw std::runtime_error("Code2Wav streaming chunk failed");
                 }
@@ -326,7 +361,7 @@ int main(int argc, char** argv)
                     return;
                 }
 
-                if (chunkIndex == 0)
+                if (job.chunkIndex == 0)
                 {
                     firstChunkAt = chunkEnd;
                 }
@@ -336,19 +371,19 @@ int main(int argc, char** argv)
                 Json chunk = Json{{"id", id},
                     {"event", "chunk"},
                     {"ok", true},
-                    {"chunk_index", chunkIndex},
+                    {"chunk_index", job.chunkIndex},
                     {"chunk_format", chunkFormat},
                     {"chunk_transport", chunkTransport},
-                    {"frames", totalFrames},
+                    {"frames", job.totalFrames},
                     {"samples", samples.size()},
                     {"sample_rate", code2wavRunner->getConfig().sampleRate},
-                    {"is_final", isFinal},
+                    {"is_final", job.isFinal},
                     {"code2wav_ms", code2wavMs},
                     {"elapsed_ms", std::chrono::duration<double, std::milli>(chunkEnd - requestStart).count()}};
                 if (chunkFormat == "wav")
                 {
                     std::filesystem::path chunkPath(outputFile);
-                    chunkPath.replace_filename(chunkPath.stem().string() + ".chunk" + std::to_string(chunkIndex)
+                    chunkPath.replace_filename(chunkPath.stem().string() + ".chunk" + std::to_string(job.chunkIndex)
                         + chunkPath.extension().string());
                     if (!saveFloatSamplesToWav(chunkPath.string(), samples, code2wavRunner->getConfig().sampleRate))
                     {
@@ -367,8 +402,8 @@ int main(int argc, char** argv)
                     else
                     {
                         std::filesystem::path chunkPath(outputFile);
-                        chunkPath.replace_filename(chunkPath.stem().string() + ".chunk" + std::to_string(chunkIndex)
-                            + ".pcm");
+                        chunkPath.replace_filename(chunkPath.stem().string() + ".chunk"
+                            + std::to_string(job.chunkIndex) + ".pcm");
                         if (!savePcm16(chunkPath.string(), pcm))
                         {
                             throw std::runtime_error("Failed to save chunk PCM: " + chunkPath.string());
@@ -377,16 +412,100 @@ int main(int argc, char** argv)
                     }
                 }
                 std::cout << chunk.dump() << std::endl;
+            };
+
+            if (asyncCode2Wav)
+            {
+                chunkThread = std::thread([&]() {
+                    try
+                    {
+                        while (true)
+                        {
+                            ChunkJob job;
+                            {
+                                std::unique_lock<std::mutex> lock(chunkMutex);
+                                chunkCv.wait(lock, [&]() { return chunkJobsClosed || !chunkJobs.empty(); });
+                                if (chunkJobs.empty())
+                                {
+                                    if (chunkJobsClosed)
+                                    {
+                                        break;
+                                    }
+                                    continue;
+                                }
+                                job = std::move(chunkJobs.front());
+                                chunkJobs.pop_front();
+                            }
+                            processChunk(job);
+                        }
+                    }
+                    catch (...)
+                    {
+                        std::lock_guard<std::mutex> lock(chunkMutex);
+                        chunkException = std::current_exception();
+                    }
+                });
+            }
+            ScopeExit chunkThreadGuard{[&]() {
+                if (asyncCode2Wav)
+                {
+                    {
+                        std::lock_guard<std::mutex> lock(chunkMutex);
+                        chunkJobsClosed = true;
+                    }
+                    chunkCv.notify_one();
+                    if (chunkThread.joinable())
+                    {
+                        chunkThread.join();
+                    }
+                }
+            }};
+
+            auto submitChunk = [&](bool isFinal) {
+                int32_t const totalFrames = static_cast<int32_t>(streamedFrames.size());
+                if (totalFrames <= lastEmittedFrames)
+                {
+                    return;
+                }
+                if (!code2wavRunner)
+                {
+                    code2wavRunner = std::make_unique<Code2WavRunner>(args.code2wavEngineDir, stream);
+                }
+
+                int32_t const leftContext = code2wavRunner->getConfig().leftContextSize;
+                int32_t const windowStart = std::max(0, lastEmittedFrames - leftContext);
+                int32_t const skipContextFrames = lastEmittedFrames - windowStart;
+                auto windowCodes = transposeFrameWindow(
+                    streamedFrames, static_cast<size_t>(windowStart), static_cast<size_t>(totalFrames));
+
+                ChunkJob job;
+                job.windowCodes = std::move(windowCodes);
+                job.skipContextFrames = skipContextFrames;
+                job.totalFrames = totalFrames;
+                job.chunkIndex = chunkIndex;
+                job.isFinal = isFinal;
+
                 lastEmittedFrames = totalFrames;
                 nextChunkAt = totalFrames + chunkFrames;
                 ++chunkIndex;
+
+                if (asyncCode2Wav)
+                {
+                    {
+                        std::lock_guard<std::mutex> lock(chunkMutex);
+                        chunkJobs.push_back(std::move(job));
+                    }
+                    chunkCv.notify_one();
+                    return;
+                }
+                processChunk(job);
             };
 
             auto frameCallback = [&](std::vector<int32_t> const& frameCodes, int32_t totalFrames) {
                 streamedFrames.push_back(frameCodes);
                 if (streamOutput && totalFrames >= nextChunkAt)
                 {
-                    emitChunk(false);
+                    submitChunk(false);
                 }
             };
 
@@ -399,7 +518,24 @@ int main(int argc, char** argv)
             }
             if (streamOutput)
             {
-                emitChunk(true);
+                submitChunk(true);
+            }
+            if (asyncCode2Wav)
+            {
+                {
+                    std::lock_guard<std::mutex> lock(chunkMutex);
+                    chunkJobsClosed = true;
+                }
+                chunkCv.notify_one();
+                if (chunkThread.joinable())
+                {
+                    chunkThread.join();
+                }
+                chunkThreadGuard.dismiss();
+                if (chunkException)
+                {
+                    std::rethrow_exception(chunkException);
+                }
             }
 
             if (streamOnly)
@@ -483,6 +619,7 @@ int main(int argc, char** argv)
         std::cout << response.dump() << std::endl;
     }
 
+    CUDA_CHECK(cudaStreamDestroy(code2wavStream));
     CUDA_CHECK(cudaStreamDestroy(stream));
     return EXIT_SUCCESS;
 }
