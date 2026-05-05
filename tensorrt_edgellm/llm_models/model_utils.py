@@ -550,6 +550,35 @@ def _is_qwen3_asr_model(model_dir: str) -> bool:
         model_dir) == "qwen3_asr" or "Qwen3-ASR" in model_dir
 
 
+def _load_safetensors_checkpoint(model_dir: str) -> dict:
+    model_path = os.path.join(model_dir, "model.safetensors")
+    if os.path.exists(model_path):
+        from safetensors.torch import load_file as load_safetensors_file
+        return load_safetensors_file(model_path)
+
+    index_path = os.path.join(model_dir, "model.safetensors.index.json")
+    if not os.path.exists(index_path):
+        raise FileNotFoundError(
+            f"No model.safetensors or model.safetensors.index.json found in {model_dir}"
+        )
+
+    with open(index_path, "r", encoding="utf-8") as f:
+        index = json.load(f)
+    weight_map = index.get("weight_map", {})
+    if not weight_map:
+        raise RuntimeError(f"Invalid safetensors index without weight_map: {index_path}")
+
+    state_dict = {}
+    for shard_name in sorted(set(weight_map.values())):
+        shard_path = os.path.join(model_dir, shard_name)
+        if not os.path.exists(shard_path):
+            raise FileNotFoundError(f"Missing safetensors shard: {shard_path}")
+        with safe_open(shard_path, framework="pt", device="cpu") as f:
+            for key in f.keys():
+                state_dict[key] = f.get_tensor(key)
+    return state_dict
+
+
 def _is_alpamayo_1_model(model_dir: str) -> bool:
     """Check if the model is an Alpamayo 1 model."""
     cfg, _ = PretrainedConfig.get_config_dict(model_dir)
@@ -772,7 +801,6 @@ def load_hf_model(
     elif _is_qwen3_tts_model(model_dir):
         from qwen_tts.core.models import (Qwen3TTSConfig,
                                           Qwen3TTSForConditionalGeneration)
-        from safetensors.torch import load_file as load_safetensors_file
         from transformers import AutoConfig, AutoModel
         AutoConfig.register("qwen3_tts", Qwen3TTSConfig)
         AutoModel.register(Qwen3TTSConfig, Qwen3TTSForConditionalGeneration)
@@ -782,7 +810,7 @@ def load_hf_model(
         # leave nested CodePredictor weights at their random initialization.
         config = Qwen3TTSConfig.from_pretrained(model_dir)
         model = Qwen3TTSForConditionalGeneration(config)
-        state_dict = load_safetensors_file(os.path.join(model_dir, "model.safetensors"))
+        state_dict = _load_safetensors_checkpoint(model_dir)
         missing_keys, unexpected_keys = model.load_state_dict(state_dict, strict=False)
         if missing_keys or unexpected_keys:
             raise RuntimeError(

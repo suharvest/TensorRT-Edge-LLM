@@ -109,7 +109,7 @@ bool AudioBuilder::build()
 
     // Parse ONNX model
     std::string onnxPath = (mOnnxDir / "model.onnx").string();
-    auto parser = parseOnnxModel(network.get(), onnxPath);
+    auto parser = parseOnnxModel(builder.get(), network, onnxPath);
     if (!parser)
     {
         LOG_ERROR("Failed to parse ONNX model from %s", onnxPath.c_str());

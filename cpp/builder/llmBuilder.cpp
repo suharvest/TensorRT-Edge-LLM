@@ -74,7 +74,7 @@ bool LLMBuilder::build()
     }
 
     // Parse ONNX model
-    auto parser = parseOnnxModel(network.get(), onnxFilePath);
+    auto parser = parseOnnxModel(builder.get(), network, onnxFilePath);
     if (!parser)
     {
         return false;

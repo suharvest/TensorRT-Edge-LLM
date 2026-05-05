@@ -271,12 +271,12 @@ std::unique_ptr<nvinfer1::IBuilderConfig> createBuilderConfig(nvinfer1::IBuilder
     return config;
 }
 
-std::unique_ptr<nvonnxparser::IParser> parseOnnxModel(
-    nvinfer1::INetworkDefinition* network, std::string const& onnxFilePath)
+std::unique_ptr<nvonnxparser::IParser> parseOnnxModel(nvinfer1::IBuilder* builder,
+    std::unique_ptr<nvinfer1::INetworkDefinition>& network, std::string const& onnxFilePath)
 {
-    if (!network)
+    if (!builder || !network)
     {
-        LOG_ERROR("Network is nullptr");
+        LOG_ERROR("Builder or network is nullptr");
         return nullptr;
     }
 
@@ -290,7 +290,7 @@ std::unique_ptr<nvonnxparser::IParser> parseOnnxModel(
 
     // parseFromFile() must be the primary path because external-data ONNX
     // models resolve weight files relative to the model path.
-    if (parser->parseFromFile(onnxFilePath.c_str(), static_cast<int32_t>(nvinfer1::ILogger::Severity::kWARNING)))
+    if (parser->parseFromFile(onnxFilePath.c_str(), static_cast<int32_t>(gLogger.getLevel())))
     {
         LOG_DEBUG("Successfully parsed ONNX model: %s", onnxFilePath.c_str());
         return parser;
@@ -310,6 +310,13 @@ std::unique_ptr<nvonnxparser::IParser> parseOnnxModel(
     }
     std::vector<char> modelData((std::istreambuf_iterator<char>(onnxFile)), std::istreambuf_iterator<char>());
 
+    auto const stronglyTyped = 1U << static_cast<uint32_t>(nvinfer1::NetworkDefinitionCreationFlag::kSTRONGLY_TYPED);
+    network.reset(builder->createNetworkV2(stronglyTyped));
+    if (!network)
+    {
+        LOG_ERROR("Failed to create fallback TensorRT network definition");
+        return nullptr;
+    }
     auto fallbackParser = std::unique_ptr<nvonnxparser::IParser>(nvonnxparser::createParser(*network, gLogger));
     if (!fallbackParser)
     {
