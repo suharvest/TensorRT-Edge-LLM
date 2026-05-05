@@ -58,7 +58,7 @@ bool VisualBuilder::build()
 
     // Parse ONNX model
     std::string const onnxPath = (mOnnxDir / "model.onnx").string();
-    auto parser = parseOnnxModel(network.get(), onnxPath);
+    auto parser = parseOnnxModel(builder.get(), network, onnxPath);
     if (!parser)
     {
         return false;

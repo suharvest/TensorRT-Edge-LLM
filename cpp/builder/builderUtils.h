@@ -89,11 +89,13 @@ std::pair<std::unique_ptr<nvinfer1::IBuilder>, std::unique_ptr<nvinfer1::INetwor
 std::unique_ptr<nvinfer1::IBuilderConfig> createBuilderConfig(nvinfer1::IBuilder* builder);
 
 //! Parse ONNX model and create parser.
+//! @param builder TensorRT builder object used to recreate the network for fallback parsing
 //! @param network TensorRT network definition to populate
 //! @param onnxFilePath Path to ONNX model file
 //! @return ONNX parser object, or nullptr on failure
 std::unique_ptr<nvonnxparser::IParser> parseOnnxModel(
-    nvinfer1::INetworkDefinition* network, std::string const& onnxFilePath);
+    nvinfer1::IBuilder* builder, std::unique_ptr<nvinfer1::INetworkDefinition>& network,
+    std::string const& onnxFilePath);
 
 //! Build and serialize TensorRT engine to file.
 //! @param builder TensorRT builder object

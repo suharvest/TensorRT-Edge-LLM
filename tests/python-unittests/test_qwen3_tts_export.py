@@ -102,6 +102,36 @@ def test_qwen3_tts_loader_uses_checkpoint_for_code_predictor(monkeypatch, tmp_pa
     assert torch.equal(actual_weight, expected_weight)
 
 
+def test_qwen3_tts_loader_uses_sharded_checkpoint_for_code_predictor(monkeypatch, tmp_path):
+    from tensorrt_edgellm.llm_models import model_utils
+
+    _install_fake_qwen_tts(monkeypatch)
+    monkeypatch.setattr(model_utils.AutoTokenizer, "from_pretrained", lambda *args, **kwargs: _DummyTokenizer())
+    monkeypatch.setattr(model_utils.AutoProcessor, "from_pretrained", lambda *args, **kwargs: None)
+    monkeypatch.setattr(model_utils, "_is_qwen3_tts_model", lambda model_dir: True)
+
+    model_dir = tmp_path / "qwen3_tts"
+    model_dir.mkdir()
+    (model_dir / "config.json").write_text(json.dumps({"model_type": "qwen3_tts"}), encoding="utf-8")
+
+    expected_weight = torch.tensor([[5.0, 6.0], [7.0, 8.0]], dtype=torch.float16)
+    shard_name = "model-00001-of-00001.safetensors"
+    save_file({"talker.code_predictor.lm_head.0.weight": expected_weight}, model_dir / shard_name)
+    (model_dir / "model.safetensors.index.json").write_text(
+        json.dumps({
+            "metadata": {"total_size": expected_weight.numel() * expected_weight.element_size()},
+            "weight_map": {"talker.code_predictor.lm_head.0.weight": shard_name},
+        }),
+        encoding="utf-8",
+    )
+
+    model, _, _ = model_utils.load_hf_model(str(model_dir), dtype="fp16", device="cpu")
+
+    actual_weight = model.talker.code_predictor.lm_head[0].weight.detach()
+    assert actual_weight.dtype == torch.float16
+    assert torch.equal(actual_weight, expected_weight)
+
+
 def test_qwen3_tts_loader_rejects_incomplete_checkpoint(monkeypatch, tmp_path):
     from tensorrt_edgellm.llm_models import model_utils
 
