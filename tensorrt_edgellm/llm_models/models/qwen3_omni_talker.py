@@ -327,7 +327,10 @@ class Qwen3OmniCodePredictorPatch(nn.Module):
     def _from_pretrained_tts(cls, code_predictor_model):
         """Create from Qwen3TTSTalkerCodePredictorModelForConditionalGeneration."""
         code_predictor_model.model.embed_tokens = code_predictor_model.model.codec_embedding
-        # TODO: Verify if TTS CodePredictor needs MLP WAR for FP16 overflow
+        # Qwen3-TTS CodePredictor receives Talker hidden states with a wide
+        # activation range, same as Qwen3-Omni. Keep the gated MLP product in
+        # FP32 during ONNX export to avoid FP16 overflow in TensorRT.
+        apply_code_predictor_mlp_war(code_predictor_model.model, start_layer=0)
         return cls(
             model=code_predictor_model.model,
             lm_heads=code_predictor_model.lm_head,

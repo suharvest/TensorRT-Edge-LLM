@@ -772,17 +772,23 @@ def load_hf_model(
     elif _is_qwen3_tts_model(model_dir):
         from qwen_tts.core.models import (Qwen3TTSConfig,
                                           Qwen3TTSForConditionalGeneration)
-        from transformers import AutoConfig, AutoModel, PreTrainedModel
+        from safetensors.torch import load_file as load_safetensors_file
+        from transformers import AutoConfig, AutoModel
         AutoConfig.register("qwen3_tts", Qwen3TTSConfig)
         AutoModel.register(Qwen3TTSConfig, Qwen3TTSForConditionalGeneration)
-        # Use PreTrainedModel.from_pretrained to skip speech_tokenizer loading
-        # (Qwen3TTSForConditionalGeneration.from_pretrained tries to load
-        # speech_tokenizer/feature_extractor which we don't need for LLM export)
-        model = PreTrainedModel.from_pretrained.__func__(
-            Qwen3TTSForConditionalGeneration,
-            model_dir,
-            torch_dtype=torch_dtype)
-        model = model.to(device)
+        # Build only the HF module graph needed for LLM export and load the
+        # checkpoint directly. qwen_tts.from_pretrained also initializes audio
+        # helpers we do not need here, and the PreTrainedModel shortcut can
+        # leave nested CodePredictor weights at their random initialization.
+        config = Qwen3TTSConfig.from_pretrained(model_dir)
+        model = Qwen3TTSForConditionalGeneration(config)
+        state_dict = load_safetensors_file(os.path.join(model_dir, "model.safetensors"))
+        missing_keys, unexpected_keys = model.load_state_dict(state_dict, strict=False)
+        if missing_keys or unexpected_keys:
+            raise RuntimeError(
+                "Failed to load Qwen3-TTS checkpoint cleanly: "
+                f"missing={missing_keys[:8]}, unexpected={unexpected_keys[:8]}")
+        model = model.to(torch_dtype).to(device)
     elif _is_gptq_omni_model(model_dir):
         # GPTQ Omni: optimum cannot handle nested thinker/talker block structure,
         # so we load via GPTQModel.load() with explicit layers_node_user paths.

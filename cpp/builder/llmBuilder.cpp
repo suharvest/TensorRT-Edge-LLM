@@ -92,6 +92,7 @@ bool LLMBuilder::build()
     {
         return false;
     }
+    config->setFlag(nvinfer1::BuilderFlag::kFP16);
 
     if (mBuilderConfig.profilingDetailed)
     {
