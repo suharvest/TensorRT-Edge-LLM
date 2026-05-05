@@ -17,6 +17,20 @@
 
 #pragma once
 
+#include <cstdint>
+#include <cuda.h>
+#include <cuda_fp16.h>
+#include <cuda_runtime.h>
+
+#if defined(TRT_EDGELLM_CUDA_LIBRARY_T_COMPAT) && CUDA_VERSION < 12800
+typedef CUlibrary cudaLibrary_t;
+static inline cudaError_t cudaLibraryUnload(cudaLibrary_t lib)
+{
+    CUresult const result = cuLibraryUnload(lib);
+    return static_cast<cudaError_t>(result);
+}
+#endif
+
 #if defined(__GNUC__)
 #pragma GCC diagnostic push
 #pragma GCC diagnostic ignored "-Wunused-parameter"
@@ -26,9 +40,6 @@
 #pragma GCC diagnostic pop
 #endif
 
-#include <cstdint>
-#include <cuda_fp16.h>
-#include <cuda_runtime.h>
 #include <mutex>
 
 namespace trt_edgellm
