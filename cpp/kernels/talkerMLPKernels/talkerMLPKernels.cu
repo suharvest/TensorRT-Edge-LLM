@@ -25,6 +25,8 @@
 #include "common/cudaUtils.h"
 #include "common/logger.h"
 
+#include <cublas_v2.h>
+#include <cuda_runtime.h>
 #include <cuda_fp16.h>
 
 namespace trt_edgellm
@@ -34,6 +36,96 @@ namespace kernel
 
 namespace
 {
+
+class CudaDeviceGuard
+{
+public:
+    explicit CudaDeviceGuard(void const* devicePtr)
+    {
+        check::check(devicePtr != nullptr, "cuBLAS fallback device pointer must not be null");
+
+        cudaPointerAttributes attributes{};
+        CUDA_CHECK(cudaPointerGetAttributes(&attributes, devicePtr));
+        check::check(attributes.type == cudaMemoryTypeDevice, "cuBLAS fallback tensors must be CUDA device memory");
+        mDevice = attributes.device;
+        check::check(mDevice >= 0, "Failed to determine cuBLAS fallback tensor device");
+
+        CUDA_CHECK(cudaGetDevice(&mPreviousDevice));
+        if (mPreviousDevice != mDevice)
+        {
+            CUDA_CHECK(cudaSetDevice(mDevice));
+            mRestore = true;
+        }
+    }
+
+    ~CudaDeviceGuard()
+    {
+        if (mRestore)
+        {
+            auto const status = cudaSetDevice(mPreviousDevice);
+            if (status != cudaSuccess)
+            {
+                LOG_WARNING("Failed to restore CUDA device %d: %s", mPreviousDevice, cudaGetErrorString(status));
+            }
+        }
+    }
+
+    CudaDeviceGuard(CudaDeviceGuard const&) = delete;
+    CudaDeviceGuard& operator=(CudaDeviceGuard const&) = delete;
+    CudaDeviceGuard(CudaDeviceGuard&&) = delete;
+    CudaDeviceGuard& operator=(CudaDeviceGuard&&) = delete;
+
+private:
+    int32_t mPreviousDevice{-1};
+    int32_t mDevice{-1};
+    bool mRestore{false};
+};
+
+class CublasHandle
+{
+public:
+    CublasHandle(cudaStream_t stream, void const* devicePtr)
+        : mDeviceGuard(devicePtr)
+    {
+        auto status = cublasCreate(&mHandle);
+        check::check(status == CUBLAS_STATUS_SUCCESS, "Failed to create cuBLAS handle");
+
+        // The caller must pass a stream that belongs to the same device as the tensors.
+        status = cublasSetStream(mHandle, stream);
+        if (status != CUBLAS_STATUS_SUCCESS)
+        {
+            static_cast<void>(cublasDestroy(mHandle));
+            mHandle = nullptr;
+        }
+        check::check(status == CUBLAS_STATUS_SUCCESS, "Failed to set cuBLAS stream");
+    }
+
+    ~CublasHandle()
+    {
+        if (mHandle != nullptr)
+        {
+            auto const status = cublasDestroy(mHandle);
+            if (status != CUBLAS_STATUS_SUCCESS)
+            {
+                LOG_WARNING("Failed to destroy cuBLAS handle: %d", static_cast<int32_t>(status));
+            }
+        }
+    }
+
+    CublasHandle(CublasHandle const&) = delete;
+    CublasHandle& operator=(CublasHandle const&) = delete;
+    CublasHandle(CublasHandle&&) = delete;
+    CublasHandle& operator=(CublasHandle&&) = delete;
+
+    cublasHandle_t get() const
+    {
+        return mHandle;
+    }
+
+private:
+    CudaDeviceGuard mDeviceGuard;
+    cublasHandle_t mHandle{nullptr};
+};
 
 //! \brief SiLU activation for FP16
 //! \param x Input value
@@ -338,8 +430,39 @@ void invokeTalkerMLP(rt::Tensor const& input, rt::Tensor const& fc1Weight, rt::T
         return;
     }
 #else
-    LOG_ERROR("CuTe DSL GEMM not compiled. Rebuild with -DENABLE_CUTE_DSL=gemm (or ALL).");
-    return;
+    CublasHandle handle(stream, input.rawPointer());
+    half const alpha = __float2half(1.0F);
+    half const beta = __float2half(0.0F);
+
+    // FC1: workspace = input @ fc1Weight^T
+    auto status = cublasGemmEx(handle.get(), CUBLAS_OP_T, CUBLAS_OP_N, hiddenDim, numTokens, inputDim, &alpha,
+        fc1Weight.rawPointer(), CUDA_R_16F, inputDim, input.rawPointer(), CUDA_R_16F, inputDim, &beta,
+        workspace.rawPointer(), CUDA_R_16F, hiddenDim, CUBLAS_COMPUTE_16F, CUBLAS_GEMM_DEFAULT);
+    if (status != CUBLAS_STATUS_SUCCESS)
+    {
+        LOG_ERROR("FC1 cuBLAS GEMM failed with status %d", static_cast<int32_t>(status));
+        return;
+    }
+
+    biasAndSiLUKernelVectorized<<<numTokens, 256, 0, stream>>>(static_cast<half*>(workspace.rawPointer()),
+        static_cast<half const*>(fc1Bias.rawPointer()), numTokens, hiddenDim);
+    CUDA_CHECK(cudaPeekAtLastError());
+
+    // FC2: output = workspace @ fc2Weight^T
+    status = cublasGemmEx(handle.get(), CUBLAS_OP_T, CUBLAS_OP_N, outputDim, numTokens, hiddenDim, &alpha,
+        fc2Weight.rawPointer(), CUDA_R_16F, hiddenDim, workspace.rawPointer(), CUDA_R_16F, hiddenDim, &beta,
+        output.rawPointer(), CUDA_R_16F, outputDim, CUBLAS_COMPUTE_16F, CUBLAS_GEMM_DEFAULT);
+    if (status != CUBLAS_STATUS_SUCCESS)
+    {
+        LOG_ERROR("FC2 cuBLAS GEMM failed with status %d", static_cast<int32_t>(status));
+        return;
+    }
+
+    dim3 const block(128);
+    dim3 const grid((outputDim / 8 + block.x - 1) / block.x, numTokens);
+    addBiasKernelVectorized<<<grid, block, 0, stream>>>(static_cast<half*>(output.rawPointer()),
+        static_cast<half const*>(fc2Bias.rawPointer()), numTokens, outputDim);
+    CUDA_CHECK(cudaPeekAtLastError());
 #endif
 }
 
@@ -382,8 +505,24 @@ void invokeLinearLayer(
         return;
     }
 #else
-    LOG_ERROR("CuTe DSL GEMM not compiled. Rebuild with -DENABLE_CUTE_DSL=gemm (or ALL).");
-    return;
+    CublasHandle handle(stream, input.rawPointer());
+    half const alpha = __float2half(1.0F);
+    half const beta = __float2half(0.0F);
+
+    auto const status = cublasGemmEx(handle.get(), CUBLAS_OP_T, CUBLAS_OP_N, outputDim, numTokens, inputDim, &alpha,
+        weight.rawPointer(), CUDA_R_16F, inputDim, input.rawPointer(), CUDA_R_16F, inputDim, &beta,
+        output.rawPointer(), CUDA_R_16F, outputDim, CUBLAS_COMPUTE_16F, CUBLAS_GEMM_DEFAULT);
+    if (status != CUBLAS_STATUS_SUCCESS)
+    {
+        LOG_ERROR("Linear layer cuBLAS GEMM failed with status %d", static_cast<int32_t>(status));
+        return;
+    }
+
+    dim3 const block(128);
+    dim3 const grid((outputDim / 8 + block.x - 1) / block.x, numTokens);
+    addBiasKernelVectorized<<<grid, block, 0, stream>>>(static_cast<half*>(output.rawPointer()),
+        static_cast<half const*>(bias.rawPointer()), numTokens, outputDim);
+    CUDA_CHECK(cudaPeekAtLastError());
 #endif
 }
 
