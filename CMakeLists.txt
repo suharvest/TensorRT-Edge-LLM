@@ -61,7 +61,8 @@ endif()
 set_ifndef(CUDA_CTK_VERSION 12.8)
 set_ifndef(CUDA_DIR /usr/local/cuda-${CUDA_CTK_VERSION})
 
-if(NOT DEFINED AARCH64_BUILD)
+# Preserve explicit CUDA architecture selections, including native Jetson SM87 builds.
+if(NOT CMAKE_CUDA_ARCHITECTURES AND NOT DEFINED AARCH64_BUILD)
   set(CMAKE_CUDA_ARCHITECTURES 80;86;89)
   if(CUDA_CTK_VERSION VERSION_GREATER_EQUAL 12.8)
     list(APPEND CMAKE_CUDA_ARCHITECTURES 100a 120)
