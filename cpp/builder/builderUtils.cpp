@@ -20,8 +20,10 @@
 
 #include <NvOnnxParser.h>
 #include <fstream>
+#include <iterator>
 #include <sstream>
 #include <string>
+#include <vector>
 
 namespace trt_edgellm
 {
@@ -286,15 +288,46 @@ std::unique_ptr<nvonnxparser::IParser> parseOnnxModel(
         return nullptr;
     }
 
-    // Parse ONNX model
-    if (!parser->parseFromFile(onnxFilePath.c_str(), static_cast<int>(gLogger.getLevel())))
+    // parseFromFile() must be the primary path because external-data ONNX
+    // models resolve weight files relative to the model path.
+    if (parser->parseFromFile(onnxFilePath.c_str(), static_cast<int32_t>(nvinfer1::ILogger::Severity::kWARNING)))
+    {
+        LOG_DEBUG("Successfully parsed ONNX model: %s", onnxFilePath.c_str());
+        return parser;
+    }
+
+    LOG_WARNING("parseFromFile() failed for ONNX file: %s; trying in-memory parser fallback", onnxFilePath.c_str());
+    for (int32_t i = 0; i < parser->getNbErrors(); ++i)
+    {
+        LOG_WARNING("ONNX parseFromFile error %d: %s", i, parser->getError(i)->desc());
+    }
+
+    std::ifstream onnxFile(onnxFilePath, std::ios::binary);
+    if (!onnxFile)
+    {
+        LOG_ERROR("Failed to open ONNX file: %s", onnxFilePath.c_str());
+        return nullptr;
+    }
+    std::vector<char> modelData((std::istreambuf_iterator<char>(onnxFile)), std::istreambuf_iterator<char>());
+
+    auto fallbackParser = std::unique_ptr<nvonnxparser::IParser>(nvonnxparser::createParser(*network, gLogger));
+    if (!fallbackParser)
+    {
+        LOG_ERROR("Failed to create fallback ONNX parser");
+        return nullptr;
+    }
+    if (!fallbackParser->parse(modelData.data(), modelData.size()))
     {
         LOG_ERROR("Failed to parse ONNX file: %s", onnxFilePath.c_str());
+        for (int32_t i = 0; i < fallbackParser->getNbErrors(); ++i)
+        {
+            LOG_ERROR("ONNX parser error %d: %s", i, fallbackParser->getError(i)->desc());
+        }
         return nullptr;
     }
 
     LOG_DEBUG("Successfully parsed ONNX model: %s", onnxFilePath.c_str());
-    return parser;
+    return fallbackParser;
 }
 
 bool buildAndSerializeEngine(nvinfer1::IBuilder* builder, nvinfer1::INetworkDefinition* network,
