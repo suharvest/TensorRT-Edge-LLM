@@ -655,6 +655,11 @@ public:
 
     ~Qwen3TTSCodePredictorEngine() = default;
 
+    void resetSampling()
+    {
+        mRng.seed(makeQwen3TTSSamplingSeed(0x5157454E));
+    }
+
     bool generate(std::vector<float> const& hidden, std::vector<float> const& primaryEmbedding, int32_t activeGroups,
         int32_t topK, float topP, float temperature, std::vector<int32_t>& residualCodes)
     {
@@ -2582,8 +2587,8 @@ bool Qwen3OmniTTSRuntime::prepareTalkerInput(std::vector<int32_t> const& textTok
     return true;
 }
 
-bool Qwen3OmniTTSRuntime::handleAudioGeneration(
-    TalkerGenerationRequest const& request, TalkerGenerationResponse& response, cudaStream_t stream)
+bool Qwen3OmniTTSRuntime::handleAudioGeneration(TalkerGenerationRequest const& request,
+    TalkerGenerationResponse& response, cudaStream_t stream, FrameCallback const& frameCallback)
 {
     NVTX_SCOPED_RANGE(nvtx_range, "TalkerRunner::handleAudioGeneration", nvtx_colors::PURPLE);
     LOG_INFO("Starting audio generation for request with %zu messages", request.messages.size());
@@ -2688,6 +2693,10 @@ bool Qwen3OmniTTSRuntime::handleAudioGeneration(
     std::vector<std::vector<int32_t>> rvqCodes;
     std::vector<int32_t> primaryHistory;
     std::mt19937 talkerRng(makeQwen3TTSSamplingSeed(0x54545352));
+    if (mQwen3TTSCodePredictorEngine)
+    {
+        mQwen3TTSCodePredictorEngine->resetSampling();
+    }
 
     // Prepare Talker input: validate hidden states, project via MLP, reshape buffers
     int64_t seqLen = 0;
@@ -2814,6 +2823,10 @@ bool Qwen3OmniTTSRuntime::handleAudioGeneration(
 
             // Store RVQ codes for this frame
             rvqCodes.push_back(frameCodes);
+            if (frameCallback)
+            {
+                frameCallback(rvqCodes.back(), numFrames + 1);
+            }
 
             // Compute residual connection using pre-allocated buffer
             // Non-streaming: always add tts_pad_embed as addend

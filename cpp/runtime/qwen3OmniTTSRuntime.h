@@ -22,6 +22,7 @@
 #include "runtime/llmEngineRunner.h"
 #include "runtime/llmRuntimeUtils.h"
 #include "tokenizer/tokenizer.h"
+#include <functional>
 #include <memory>
 #include <string>
 #include <unordered_map>
@@ -71,6 +72,8 @@ constexpr int32_t kQwen3TTSActiveCodePredictorGroups = 15; //!< Residual groups 
 class Qwen3OmniTTSRuntime
 {
 public:
+    using FrameCallback = std::function<void(std::vector<int32_t> const& frameCodes, int32_t totalFrames)>;
+
     /*!
      * @brief Construct and fully initialize the TTS runtime
      * @param talkerEngineDir Directory containing talker engine, MLP weights, embedding table, etc.
@@ -152,8 +155,8 @@ public:
      * @param stream CUDA stream for execution
      * @return True if generation succeeded, false otherwise
      */
-    bool handleAudioGeneration(
-        TalkerGenerationRequest const& request, TalkerGenerationResponse& response, cudaStream_t stream);
+    bool handleAudioGeneration(TalkerGenerationRequest const& request, TalkerGenerationResponse& response,
+        cudaStream_t stream, FrameCallback const& frameCallback = {});
 
     /*!
      * @brief Get performance metrics for Talker pipeline
