@@ -22,6 +22,7 @@
 #include "runtime/llmEngineRunner.h"
 #include "runtime/llmRuntimeUtils.h"
 #include "tokenizer/tokenizer.h"
+#include <filesystem>
 #include <functional>
 #include <memory>
 #include <string>
@@ -74,6 +75,26 @@ class Qwen3OmniTTSRuntime
 public:
     using FrameCallback = std::function<void(std::vector<int32_t> const& frameCodes, int32_t totalFrames)>;
 
+    enum class CodePredictorBackend
+    {
+        kAuto,
+        kGeneric,
+        kQwen3TTSNative,
+    };
+
+    enum class TextProjectionMode
+    {
+        kAuto,
+        kDevice,
+        kHostFP32,
+    };
+
+    struct RuntimeOptions
+    {
+        CodePredictorBackend codePredictorBackend{CodePredictorBackend::kAuto};
+        TextProjectionMode textProjectionMode{TextProjectionMode::kAuto};
+    };
+
     /*!
      * @brief Construct and fully initialize the TTS runtime
      * @param talkerEngineDir Directory containing talker engine, MLP weights, embedding table, etc.
@@ -84,6 +105,9 @@ public:
      */
     Qwen3OmniTTSRuntime(std::string const& talkerEngineDir, std::string const& codePredictorEngineDir,
         std::string const& tokenizerDir, cudaStream_t stream);
+
+    Qwen3OmniTTSRuntime(std::string const& talkerEngineDir, std::string const& codePredictorEngineDir,
+        std::string const& tokenizerDir, cudaStream_t stream, RuntimeOptions const& options);
 
     //! @brief Destructor
     ~Qwen3OmniTTSRuntime();
@@ -275,11 +299,13 @@ private:
     std::unordered_map<std::string, int32_t> mSpeakerIdMap; //!< Speaker name to ID mapping
 
     std::unique_ptr<tokenizer::Tokenizer> mTokenizer;      //!< Tokenizer for text-to-token-ID conversion
+    RuntimeOptions mRuntimeOptions{};
     std::unique_ptr<LLMEngineRunner> mTalkerLLMRunner;     //!< Talker LLM engine runner
     std::unique_ptr<LLMEngineRunner> mCodePredictorRunner; //!< CodePredictor engine runner
     std::unique_ptr<Qwen3TTSCodePredictorEngine>
         mQwen3TTSCodePredictorEngine; //!< Optional Qwen3-TTS native CodePredictor engine
     bool mUseQwen3TTSCodePredictorEngine{false}; //!< Whether the Qwen3-TTS native CodePredictor engine is enabled
+    std::filesystem::path mQwen3TTSCodePredictorEnginePath;
     std::unique_ptr<Qwen3TTSTalkerEngine> mQwen3TTSTalkerEngine; //!< Explicit-KV Qwen3-TTS Talker engine
     bool mUseHostTextProjection{false};
 

@@ -23,6 +23,7 @@
 #include <iostream>
 #include <memory>
 #include <nlohmann/json.hpp>
+#include <stdexcept>
 #include <string>
 #include <vector>
 
@@ -36,6 +37,8 @@ struct Args
 {
     std::string talkerEngineDir;
     std::string codePredictorEngineDir;
+    std::string codePredictorBackend{"auto"};
+    std::string qwen3TtsTextProjection{"auto"};
     std::string code2wavEngineDir;
     std::string tokenizerDir;
     bool debug{false};
@@ -46,6 +49,8 @@ enum OptionId : int
     HELP = 1000,
     TALKER_ENGINE_DIR,
     CODE_PREDICTOR_ENGINE_DIR,
+    CODE_PREDICTOR_BACKEND,
+    QWEN3_TTS_TEXT_PROJECTION,
     CODE2WAV_ENGINE_DIR,
     TOKENIZER_DIR,
     DEBUG,
@@ -54,7 +59,9 @@ enum OptionId : int
 void printUsage(char const* programName)
 {
     std::cerr << "Usage: " << programName << " --talkerEngineDir=<path> --code2wavEngineDir=<path>"
-              << " [--codePredictorEngineDir=<path>] [--tokenizerDir=<path>] [--debug]\n\n"
+              << " [--codePredictorEngineDir=<path>] [--codePredictorBackend=<auto|qwen3_tts_native|generic>]"
+              << " [--qwen3TtsTextProjection=<auto|host_fp32|device>]"
+              << " [--tokenizerDir=<path>] [--debug]\n\n"
               << "Reads JSON lines from stdin and writes JSON events to stdout.\n"
               << "Streaming requests set stream=true and stream_only=true.\n";
 }
@@ -64,6 +71,8 @@ bool parseArgs(Args& args, int argc, char** argv)
     static struct option options[] = {{"help", no_argument, 0, HELP},
         {"talkerEngineDir", required_argument, 0, TALKER_ENGINE_DIR},
         {"codePredictorEngineDir", required_argument, 0, CODE_PREDICTOR_ENGINE_DIR},
+        {"codePredictorBackend", required_argument, 0, CODE_PREDICTOR_BACKEND},
+        {"qwen3TtsTextProjection", required_argument, 0, QWEN3_TTS_TEXT_PROJECTION},
         {"code2wavEngineDir", required_argument, 0, CODE2WAV_ENGINE_DIR},
         {"tokenizerDir", required_argument, 0, TOKENIZER_DIR}, {"debug", no_argument, 0, DEBUG}, {0, 0, 0, 0}};
 
@@ -75,6 +84,8 @@ bool parseArgs(Args& args, int argc, char** argv)
         case HELP: printUsage(argv[0]); std::exit(EXIT_SUCCESS);
         case TALKER_ENGINE_DIR: args.talkerEngineDir = optarg; break;
         case CODE_PREDICTOR_ENGINE_DIR: args.codePredictorEngineDir = optarg; break;
+        case CODE_PREDICTOR_BACKEND: args.codePredictorBackend = optarg; break;
+        case QWEN3_TTS_TEXT_PROJECTION: args.qwen3TtsTextProjection = optarg; break;
         case CODE2WAV_ENGINE_DIR: args.code2wavEngineDir = optarg; break;
         case TOKENIZER_DIR: args.tokenizerDir = optarg; break;
         case DEBUG: args.debug = true; break;
@@ -87,6 +98,47 @@ bool parseArgs(Args& args, int argc, char** argv)
         args.codePredictorEngineDir = (std::filesystem::path(args.talkerEngineDir).parent_path() / "code_predictor").string();
     }
     return !args.talkerEngineDir.empty() && !args.codePredictorEngineDir.empty() && !args.code2wavEngineDir.empty();
+}
+
+bool parseCodePredictorBackend(
+    std::string const& value, Qwen3OmniTTSRuntime::CodePredictorBackend& backend)
+{
+    if (value == "auto")
+    {
+        backend = Qwen3OmniTTSRuntime::CodePredictorBackend::kAuto;
+        return true;
+    }
+    if (value == "qwen3_tts_native" || value == "native")
+    {
+        backend = Qwen3OmniTTSRuntime::CodePredictorBackend::kQwen3TTSNative;
+        return true;
+    }
+    if (value == "generic" || value == "generic_llm_runner")
+    {
+        backend = Qwen3OmniTTSRuntime::CodePredictorBackend::kGeneric;
+        return true;
+    }
+    return false;
+}
+
+bool parseTextProjectionMode(std::string const& value, Qwen3OmniTTSRuntime::TextProjectionMode& mode)
+{
+    if (value == "auto")
+    {
+        mode = Qwen3OmniTTSRuntime::TextProjectionMode::kAuto;
+        return true;
+    }
+    if (value == "host_fp32")
+    {
+        mode = Qwen3OmniTTSRuntime::TextProjectionMode::kHostFP32;
+        return true;
+    }
+    if (value == "device")
+    {
+        mode = Qwen3OmniTTSRuntime::TextProjectionMode::kDevice;
+        return true;
+    }
+    return false;
 }
 
 std::vector<std::vector<int32_t>> transposeFrameWindow(
@@ -235,8 +287,17 @@ int main(int argc, char** argv)
     auto const initStart = std::chrono::steady_clock::now();
     try
     {
+        Qwen3OmniTTSRuntime::RuntimeOptions runtimeOptions;
+        if (!parseCodePredictorBackend(args.codePredictorBackend, runtimeOptions.codePredictorBackend))
+        {
+            throw std::runtime_error("Invalid --codePredictorBackend: " + args.codePredictorBackend);
+        }
+        if (!parseTextProjectionMode(args.qwen3TtsTextProjection, runtimeOptions.textProjectionMode))
+        {
+            throw std::runtime_error("Invalid --qwen3TtsTextProjection: " + args.qwen3TtsTextProjection);
+        }
         ttsRuntime = std::make_unique<Qwen3OmniTTSRuntime>(
-            args.talkerEngineDir, args.codePredictorEngineDir, args.tokenizerDir, stream);
+            args.talkerEngineDir, args.codePredictorEngineDir, args.tokenizerDir, stream, runtimeOptions);
         code2wavRunner = std::make_unique<Code2WavRunner>(args.code2wavEngineDir, stream);
         if (std::getenv("EDGE_LLM_TTS_CUDA_GRAPH") == nullptr
             || std::string(std::getenv("EDGE_LLM_TTS_CUDA_GRAPH")) != "0")

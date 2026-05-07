@@ -1425,15 +1425,38 @@ private:
 
 Qwen3OmniTTSRuntime::Qwen3OmniTTSRuntime(std::string const& talkerEngineDir, std::string const& codePredictorEngineDir,
     std::string const& tokenizerDir, cudaStream_t stream)
-    : mStream(stream)
+    : Qwen3OmniTTSRuntime(talkerEngineDir, codePredictorEngineDir, tokenizerDir, stream, RuntimeOptions{})
+{
+}
+
+Qwen3OmniTTSRuntime::Qwen3OmniTTSRuntime(std::string const& talkerEngineDir, std::string const& codePredictorEngineDir,
+    std::string const& tokenizerDir, cudaStream_t stream, RuntimeOptions const& options)
+    : mRuntimeOptions(options)
+    , mStream(stream)
 {
     NVTX_SCOPED_RANGE(nvtx_range, "TalkerRunner::init", nvtx_colors::YELLOW);
     LOG_INFO("Initializing Qwen3-Omni Talker runner");
     LOG_INFO("  Talker: %s", talkerEngineDir.c_str());
     LOG_INFO("  CodePredictor: %s", codePredictorEngineDir.c_str());
-    std::filesystem::path const qwen3TTSCodePredictorEnginePath
-        = getQwen3TTSCodePredictorEnginePath(codePredictorEngineDir);
-    mUseQwen3TTSCodePredictorEngine = !qwen3TTSCodePredictorEnginePath.empty();
+    mQwen3TTSCodePredictorEnginePath = getQwen3TTSCodePredictorEnginePath(codePredictorEngineDir);
+    switch (mRuntimeOptions.codePredictorBackend)
+    {
+    case CodePredictorBackend::kAuto:
+        mUseQwen3TTSCodePredictorEngine = !mQwen3TTSCodePredictorEnginePath.empty();
+        break;
+    case CodePredictorBackend::kGeneric: mUseQwen3TTSCodePredictorEngine = false; break;
+    case CodePredictorBackend::kQwen3TTSNative:
+        if (mQwen3TTSCodePredictorEnginePath.empty())
+        {
+            throw std::runtime_error("Qwen3-TTS native CodePredictor backend requested, but qwen3_tts_cp.engine was "
+                                     "not found in: "
+                + codePredictorEngineDir);
+        }
+        mUseQwen3TTSCodePredictorEngine = true;
+        break;
+    }
+    LOG_INFO("  CodePredictor backend: %s",
+        mUseQwen3TTSCodePredictorEngine ? "qwen3_tts_native" : "generic_llm_runner");
 
     // Load tokenizer
     std::filesystem::path const tokenizerPath = tokenizerDir.empty()
@@ -1485,7 +1508,7 @@ Qwen3OmniTTSRuntime::Qwen3OmniTTSRuntime(std::string const& talkerEngineDir, std
     {
         std::filesystem::path const qwen3TTSCodePredictorEmbeddingPath
             = std::filesystem::path(codePredictorEngineDir) / "cp_embed_fp32.bin";
-        mQwen3TTSCodePredictorEngine = std::make_unique<Qwen3TTSCodePredictorEngine>(qwen3TTSCodePredictorEnginePath,
+        mQwen3TTSCodePredictorEngine = std::make_unique<Qwen3TTSCodePredictorEngine>(mQwen3TTSCodePredictorEnginePath,
             qwen3TTSCodePredictorEmbeddingPath, mCodePredictorEmbeddingTables, mTalkerConfig.codePredictorHiddenSize,
             mTalkerConfig.codebookSize, mCodePredictorConfig.numDecoderLayers, mCodePredictorConfig.numKVHeads,
             mCodePredictorConfig.headDim, talker_constants::kNumRvqLayers, stream);
@@ -1564,13 +1587,21 @@ bool Qwen3OmniTTSRuntime::initializeEngineRunners(
                 std::filesystem::path(directTalkerPath), directConfig, 200, mStream);
             mTalkerHiddenStatesDataType = mQwen3TTSTalkerEngine->hiddenStatesDataType();
             mResidualEmbedDataType = nvinfer1::DataType::kFLOAT;
-            mUseHostTextProjection = std::getenv("QWEN3_TTS_HOST_TEXT_PROJECTION") != nullptr;
+            switch (mRuntimeOptions.textProjectionMode)
+            {
+            case TextProjectionMode::kAuto:
+                mUseHostTextProjection = std::getenv("QWEN3_TTS_HOST_TEXT_PROJECTION") != nullptr;
+                break;
+            case TextProjectionMode::kDevice: mUseHostTextProjection = false; break;
+            case TextProjectionMode::kHostFP32: mUseHostTextProjection = true; break;
+            }
             if (mUseHostTextProjection)
             {
                 mTalkerInputEmbedsDataType = nvinfer1::DataType::kFLOAT;
             }
             mTalkerLLMConfig.maxKVCacheCapacity = mQwen3TTSTalkerEngine->maxSeqLen();
             LOG_INFO("Talker execution will use explicit-KV Qwen3-TTS engine override.");
+            LOG_INFO("Text projection mode: %s", mUseHostTextProjection ? "host_fp32" : "device");
         }
     }
     catch (std::exception const& e)
