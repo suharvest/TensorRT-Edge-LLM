@@ -17,6 +17,8 @@
 
 #pragma once
 
+#include "kernels/cuteDslRuntimeCompat.h"
+
 #include "cutedsl_all.h"
 
 #include <climits>
