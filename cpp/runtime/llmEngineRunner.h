@@ -246,6 +246,9 @@ public:
     //! Key to uniquely identify a captured CUDA graph for the base model verification step
     using BaseGraphKey = std::tuple<int64_t, uintptr_t, uintptr_t, uintptr_t, std::string>;
 
+    //! @brief Get the dtype of an engine tensor by name
+    nvinfer1::DataType getTensorDataType(std::string const& name) const;
+
 private:
     std::unique_ptr<nvinfer1::IRuntime> mRuntime;                      //!< TensorRT runtime
     std::unique_ptr<nvinfer1::ICudaEngine> mEngine;                    //!< TensorRT engine

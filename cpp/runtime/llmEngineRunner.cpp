@@ -446,6 +446,11 @@ nvinfer1::DataType LLMEngineRunner::getConvStateType() const
     return mEngine->getTensorDataType(name.c_str());
 }
 
+nvinfer1::DataType LLMEngineRunner::getTensorDataType(std::string const& name) const
+{
+    return mEngine->getTensorDataType(name.c_str());
+}
+
 bool LLMEngineRunner::validateKVCacheType() const
 {
     // Sanity check: ensure KV-cache precision (dtype) is consistent across all layers (and both past/present).
