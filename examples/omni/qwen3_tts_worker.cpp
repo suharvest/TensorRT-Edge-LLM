@@ -36,6 +36,8 @@ namespace
 struct Args
 {
     std::string talkerEngineDir;
+    std::string qwen3TtsTalkerBackend{"auto"};
+    std::string qwen3TtsTalkerEngine;
     std::string codePredictorEngineDir;
     std::string codePredictorBackend{"auto"};
     std::string qwen3TtsTextProjection{"auto"};
@@ -48,6 +50,8 @@ enum OptionId : int
 {
     HELP = 1000,
     TALKER_ENGINE_DIR,
+    QWEN3_TTS_TALKER_BACKEND,
+    QWEN3_TTS_TALKER_ENGINE,
     CODE_PREDICTOR_ENGINE_DIR,
     CODE_PREDICTOR_BACKEND,
     QWEN3_TTS_TEXT_PROJECTION,
@@ -59,6 +63,8 @@ enum OptionId : int
 void printUsage(char const* programName)
 {
     std::cerr << "Usage: " << programName << " --talkerEngineDir=<path> --code2wavEngineDir=<path>"
+              << " [--qwen3TtsTalkerBackend=<auto|qwen3_tts_explicit_kv|generic>]"
+              << " [--qwen3TtsTalkerEngine=<path>]"
               << " [--codePredictorEngineDir=<path>] [--codePredictorBackend=<auto|qwen3_tts_native|generic>]"
               << " [--qwen3TtsTextProjection=<auto|host_fp32|device>]"
               << " [--tokenizerDir=<path>] [--debug]\n\n"
@@ -70,6 +76,8 @@ bool parseArgs(Args& args, int argc, char** argv)
 {
     static struct option options[] = {{"help", no_argument, 0, HELP},
         {"talkerEngineDir", required_argument, 0, TALKER_ENGINE_DIR},
+        {"qwen3TtsTalkerBackend", required_argument, 0, QWEN3_TTS_TALKER_BACKEND},
+        {"qwen3TtsTalkerEngine", required_argument, 0, QWEN3_TTS_TALKER_ENGINE},
         {"codePredictorEngineDir", required_argument, 0, CODE_PREDICTOR_ENGINE_DIR},
         {"codePredictorBackend", required_argument, 0, CODE_PREDICTOR_BACKEND},
         {"qwen3TtsTextProjection", required_argument, 0, QWEN3_TTS_TEXT_PROJECTION},
@@ -83,6 +91,8 @@ bool parseArgs(Args& args, int argc, char** argv)
         {
         case HELP: printUsage(argv[0]); std::exit(EXIT_SUCCESS);
         case TALKER_ENGINE_DIR: args.talkerEngineDir = optarg; break;
+        case QWEN3_TTS_TALKER_BACKEND: args.qwen3TtsTalkerBackend = optarg; break;
+        case QWEN3_TTS_TALKER_ENGINE: args.qwen3TtsTalkerEngine = optarg; break;
         case CODE_PREDICTOR_ENGINE_DIR: args.codePredictorEngineDir = optarg; break;
         case CODE_PREDICTOR_BACKEND: args.codePredictorBackend = optarg; break;
         case QWEN3_TTS_TEXT_PROJECTION: args.qwen3TtsTextProjection = optarg; break;
@@ -116,6 +126,26 @@ bool parseCodePredictorBackend(
     if (value == "generic" || value == "generic_llm_runner")
     {
         backend = Qwen3OmniTTSRuntime::CodePredictorBackend::kGeneric;
+        return true;
+    }
+    return false;
+}
+
+bool parseTalkerBackend(std::string const& value, Qwen3OmniTTSRuntime::TalkerBackend& backend)
+{
+    if (value == "auto")
+    {
+        backend = Qwen3OmniTTSRuntime::TalkerBackend::kAuto;
+        return true;
+    }
+    if (value == "qwen3_tts_explicit_kv" || value == "explicit_kv" || value == "direct")
+    {
+        backend = Qwen3OmniTTSRuntime::TalkerBackend::kQwen3TTSExplicitKV;
+        return true;
+    }
+    if (value == "generic" || value == "generic_llm_runner" || value == "official")
+    {
+        backend = Qwen3OmniTTSRuntime::TalkerBackend::kGeneric;
         return true;
     }
     return false;
@@ -288,6 +318,11 @@ int main(int argc, char** argv)
     try
     {
         Qwen3OmniTTSRuntime::RuntimeOptions runtimeOptions;
+        if (!parseTalkerBackend(args.qwen3TtsTalkerBackend, runtimeOptions.talkerBackend))
+        {
+            throw std::runtime_error("Invalid --qwen3TtsTalkerBackend: " + args.qwen3TtsTalkerBackend);
+        }
+        runtimeOptions.qwen3TtsTalkerEnginePath = args.qwen3TtsTalkerEngine;
         if (!parseCodePredictorBackend(args.codePredictorBackend, runtimeOptions.codePredictorBackend))
         {
             throw std::runtime_error("Invalid --codePredictorBackend: " + args.codePredictorBackend);
