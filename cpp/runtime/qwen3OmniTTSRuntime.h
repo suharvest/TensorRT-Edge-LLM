@@ -47,6 +47,7 @@ constexpr int32_t kAssistantTrailingSuffix
 constexpr int32_t kNonStreamingPrefixRows = 8;     //!< Fixed prefix rows in non-streaming prefill (rows 0-7)
 constexpr int32_t kCodePredictorPrefillSeqLen = 2; //!< CodePredictor prefill sequence length
 constexpr int32_t kCodecEmbeddingCount = 6;        //!< Number of codec embeddings to add
+constexpr int32_t kQwen3TTSActiveCodePredictorGroups = 15; //!< Residual groups used by native Qwen3-TTS CP engine
 } // namespace talker_constants
 
 /*!
@@ -102,9 +103,14 @@ public:
         int32_t talkerTopK{0};          //!< Talker top-K (0 = default 50)
         float talkerTopP{0};            //!< Talker top-P (0 = default 1.0)
         float repetitionPenalty{1.05f}; //!< Repetition penalty applied to seen codec tokens (1.0 = disabled)
+        float codecEosLogitOffset{0};   //!< Added to codec EOS logit before EOS bias onset
+        float predictorTemperature{0};  //!< CodePredictor temperature (0 = talker temperature)
+        int32_t predictorTopK{0};        //!< CodePredictor top-K (0 = talker top-K)
+        float predictorTopP{0};          //!< CodePredictor top-P (0 = talker top-P)
 
         // Speaker selection (optional, defaults to config default)
         std::string speakerName{""}; //!< Speaker name (e.g., "f245", "m02") - empty means use default
+        std::string language{""};    //!< Language hint (e.g., "chinese", "english")
         int32_t speakerId{-1};       //!< Speaker ID - if >= 0, overrides speakerName
 
         // Input: conversation messages for this request (runtime tokenizes internally)
@@ -173,6 +179,9 @@ public:
     int32_t getSpeakerIdByName(std::string const& speakerName) const;
 
 private:
+    class Qwen3TTSCodePredictorEngine;
+    class Qwen3TTSTalkerEngine;
+
     // ========== Internal Methods ==========
 
     void initializeTTSEmbeddings(cudaStream_t stream);
@@ -180,10 +189,16 @@ private:
     bool executeTalkerPrefillStep(
         rt::Tensor const& inputEmbeds, rt::Tensor& outputLogits, rt::Tensor& outputHiddenStates, cudaStream_t stream);
 
+    bool executeTalkerDecodingStep(
+        rt::Tensor const& inputEmbeds, rt::Tensor& outputLogits, rt::Tensor& outputHiddenStates, cudaStream_t stream);
+
     bool runCodePredictorGenerationForFrame(int32_t codecToken, rt::Tensor const& talkerHiddenState,
         SamplingParams const& samplingParams, std::vector<int32_t>& outputCodes, cudaStream_t stream);
 
-    bool computeResidualConnection(std::vector<int32_t> const& codes, rt::Tensor& outputResidual, cudaStream_t stream);
+    bool computeResidualConnection(
+        std::vector<int32_t> const& codes, rt::Tensor& outputResidual, int32_t frameIdx, cudaStream_t stream);
+    bool computeResidualConnectionHost(
+        std::vector<int32_t> const& codes, rt::Tensor& outputResidual, int32_t frameIdx, cudaStream_t stream);
 
     bool extractTalkerLastHidden(
         rt::Tensor const& talkerHiddenStates, rt::Tensor& outputLastHidden, cudaStream_t stream);
@@ -210,6 +225,7 @@ private:
 
         // Codec special tokens (from talker vocab, used directly)
         int32_t codecNothinkId{};  //!< Codec no-think control token (2155)
+        int32_t codecThinkId{};    //!< Codec think control token (2154)
         int32_t codecThinkBosId{}; //!< Codec think begin-of-sequence (2156)
         int32_t codecThinkEosId{}; //!< Codec think end-of-sequence (2157)
         int32_t codecPadId{};      //!< Codec padding token (2148)
@@ -218,6 +234,7 @@ private:
 
         // Speaker configuration (read from config)
         int32_t defaultSpeakerId{}; //!< Default speaker ID (e.g., 2301 for f245)
+        std::unordered_map<std::string, int32_t> languageIdMap;
     };
 
     // ========== Configuration and Initialization ==========
@@ -236,6 +253,7 @@ private:
      * @return True on success, false on failure
      */
     bool initializeEngineRunners(std::string const& talkerEngineDir, std::string const& codePredictorEngineDir);
+    bool loadCodePredictorConfig(std::string const& codePredictorEngineDir);
 
     /*!
      * @brief Load CodePredictor lm_head weights and small_to_mtp_projection
@@ -256,6 +274,11 @@ private:
     std::unique_ptr<tokenizer::Tokenizer> mTokenizer;      //!< Tokenizer for text-to-token-ID conversion
     std::unique_ptr<LLMEngineRunner> mTalkerLLMRunner;     //!< Talker LLM engine runner
     std::unique_ptr<LLMEngineRunner> mCodePredictorRunner; //!< CodePredictor engine runner
+    std::unique_ptr<Qwen3TTSCodePredictorEngine>
+        mQwen3TTSCodePredictorEngine; //!< Optional Qwen3-TTS native CodePredictor engine
+    bool mUseQwen3TTSCodePredictorEngine{false}; //!< Whether the Qwen3-TTS native CodePredictor engine is enabled
+    std::unique_ptr<Qwen3TTSTalkerEngine> mQwen3TTSTalkerEngine; //!< Explicit-KV Qwen3-TTS Talker engine
+    bool mUseHostTextProjection{false};
 
     LLMEngineRunnerConfig mTalkerLLMConfig;     //!< Talker LLM configuration
     LLMEngineRunnerConfig mCodePredictorConfig; //!< CodePredictor configuration
@@ -290,6 +313,8 @@ private:
     rt::Tensor mTtsPadEmbed; //!< TTS pad embedding [talkerHiddenSize] FP16
     rt::Tensor mTtsBosEmbed; //!< TTS bos embedding [talkerHiddenSize] FP16
     rt::Tensor mTtsEosEmbed; //!< TTS eos embedding [talkerHiddenSize] FP16
+
+    int32_t mTrailingTextLen{0}; //!< Number of text tokens used as residual addends after prefill
 
     // Workspace tensors
     rt::Tensor mThinkerEmbedBuffer; //!< Pre-allocated text embedding output [maxSeqLen, thinkerHiddenSize] FP16
@@ -335,8 +360,21 @@ private:
     rt::Tensor mTalkerHiddenStatesBuffer;        //!< Buffer for Talker hidden states (all layers)
     rt::Tensor mCodePredictorHiddenStatesBuffer; //!< Buffer for CodePredictor hidden states (all layers)
     rt::Tensor mTalkerLastHidden; //!< Buffer for extracted Talker last hidden state [1, talkerHiddenSize]
+    nvinfer1::DataType mTalkerInputEmbedsDataType{nvinfer1::DataType::kHALF};
+    nvinfer1::DataType mResidualEmbedDataType{nvinfer1::DataType::kHALF};
+    nvinfer1::DataType mTalkerHiddenStatesDataType{nvinfer1::DataType::kHALF};
     rt::Tensor
         mCodecHiddensBuffer; //!< Buffer for codec hiddens [1, 16, talkerHiddenSize] (Talker's space, for residual)
+    std::vector<float> mHostTalkerEmbeddingTable;
+    std::vector<float> mHostCodePredictorEmbeddingTables;
+    std::vector<float> mHostTextFC1Weight;
+    std::vector<float> mHostTextFC1Bias;
+    std::vector<float> mHostTextFC2Weight;
+    std::vector<float> mHostTextFC2Bias;
+    std::vector<float> mHostProjectedBuffer;
+    std::vector<float> mHostTtsPadEmbed;
+    std::vector<float> mHostTtsBosEmbed;
+    std::vector<float> mHostTtsEosEmbed;
 
     cudaStream_t mStream{nullptr};                 //!< CUDA stream for operations
     metrics::MultimodalMetrics mMultimodalMetrics; //!< Performance metrics for Talker pipeline
@@ -344,17 +382,20 @@ private:
     /*!
      * @brief Perform MLP projection from thinker embed to talker input space (non-streaming)
      *
-     * Builds the complete non-streaming prefill buffer: 8 fixed prefix rows +
-     * N text token rows + 2 suffix rows. Total outputSeqLen = seqLen + 2.
+     * Builds the Qwen3-TTS Talker prefill buffer. The exported model expects a
+     * fixed 9-row prefill: the first raw text token is in the prefill and the
+     * remaining text tokens are injected during residual feedback.
      *
      * @param thinkerEmbed Embedded token sequence [seqLen, thinkerHiddenSize]
-     * @param speakerId Speaker ID for codec embedding
-     * @param output Projected talker input embeddings [seqLen+2, talkerHiddenSize]
-     * @param outputSeqLen seqLen + 2
+     * @param languageId Codec language token ID
+     * @param output Projected talker input embeddings [9, talkerHiddenSize]
+     * @param outputSeqLen fixed prefill length
      * @param stream CUDA stream
      * @return True on success, false on failure
      */
-    bool projectToTalkerInput(rt::Tensor const& thinkerEmbed, int32_t speakerId, rt::Tensor& output,
+    bool projectToTalkerInput(rt::Tensor const& thinkerEmbed, int32_t languageId, rt::Tensor& output,
+        int64_t& outputSeqLen, cudaStream_t stream);
+    bool projectToTalkerInputHost(rt::Tensor const& thinkerEmbed, int32_t languageId, rt::Tensor& output,
         int64_t& outputSeqLen, cudaStream_t stream);
 
     //! Embed token IDs, run MLP projection, and reshape buffers ready for Talker prefill.
