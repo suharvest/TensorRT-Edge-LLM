@@ -75,6 +75,13 @@ class Qwen3OmniTTSRuntime
 public:
     using FrameCallback = std::function<void(std::vector<int32_t> const& frameCodes, int32_t totalFrames)>;
 
+    enum class TalkerBackend
+    {
+        kAuto,
+        kGeneric,
+        kQwen3TTSExplicitKV,
+    };
+
     enum class CodePredictorBackend
     {
         kAuto,
@@ -91,6 +98,8 @@ public:
 
     struct RuntimeOptions
     {
+        TalkerBackend talkerBackend{TalkerBackend::kAuto};
+        std::string qwen3TtsTalkerEnginePath;
         CodePredictorBackend codePredictorBackend{CodePredictorBackend::kAuto};
         TextProjectionMode textProjectionMode{TextProjectionMode::kAuto};
     };

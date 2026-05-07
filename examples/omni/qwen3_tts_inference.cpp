@@ -180,7 +180,9 @@ enum Qwen3TTSOptionId : int
     BATCH_SIZE = 912,
     TOKENIZER_DIR = 915,
     CODE_PREDICTOR_BACKEND = 916,
-    QWEN3_TTS_TEXT_PROJECTION = 917
+    QWEN3_TTS_TEXT_PROJECTION = 917,
+    QWEN3_TTS_TALKER_BACKEND = 918,
+    QWEN3_TTS_TALKER_ENGINE = 919
 };
 
 struct Qwen3TTSInferenceArgs
@@ -188,6 +190,8 @@ struct Qwen3TTSInferenceArgs
     bool help{false};
     std::string talkerEngineDir{""};
     std::string codePredictorEngineDir{""};
+    std::string qwen3TtsTalkerBackend{"auto"};
+    std::string qwen3TtsTalkerEngine{""};
     std::string codePredictorBackend{"auto"};
     std::string qwen3TtsTextProjection{"auto"};
     std::string code2wavEngineDir{""};
@@ -209,6 +213,9 @@ void printUsage(char const* programName)
               << "  --help                       Display this help message\n"
               << "  --inputFile=<path>           Path to input JSON file (text messages only)\n"
               << "  --talkerEngineDir=<path>     Path to Talker engine directory\n"
+              << "  --qwen3TtsTalkerBackend=<auto|qwen3_tts_explicit_kv|generic>\n"
+              << "                               Talker runtime backend (default: auto)\n"
+              << "  --qwen3TtsTalkerEngine=<path> Path to Qwen3-TTS explicit-KV Talker engine\n"
               << "  --codePredictorEngineDir=<path> Path to CodePredictor engine directory\n"
               << "                               Defaults to --talkerEngineDir/../code_predictor\n"
               << "  --codePredictorBackend=<auto|qwen3_tts_native|generic>\n"
@@ -235,6 +242,8 @@ bool parseArgs(Qwen3TTSInferenceArgs& args, int argc, char* argv[])
     static struct option inferenceOptions[] = {{"help", no_argument, 0, Qwen3TTSOptionId::HELP},
         {"inputFile", required_argument, 0, Qwen3TTSOptionId::INPUT_FILE},
         {"talkerEngineDir", required_argument, 0, Qwen3TTSOptionId::TALKER_ENGINE_DIR},
+        {"qwen3TtsTalkerBackend", required_argument, 0, Qwen3TTSOptionId::QWEN3_TTS_TALKER_BACKEND},
+        {"qwen3TtsTalkerEngine", required_argument, 0, Qwen3TTSOptionId::QWEN3_TTS_TALKER_ENGINE},
         {"codePredictorEngineDir", required_argument, 0, Qwen3TTSOptionId::CODE_PREDICTOR_ENGINE_DIR},
         {"codePredictorBackend", required_argument, 0, Qwen3TTSOptionId::CODE_PREDICTOR_BACKEND},
         {"qwen3TtsTextProjection", required_argument, 0, Qwen3TTSOptionId::QWEN3_TTS_TEXT_PROJECTION},
@@ -256,6 +265,8 @@ bool parseArgs(Qwen3TTSInferenceArgs& args, int argc, char* argv[])
         case Qwen3TTSOptionId::HELP: args.help = true; return true;
         case Qwen3TTSOptionId::INPUT_FILE: args.inputFile = optarg; break;
         case Qwen3TTSOptionId::TALKER_ENGINE_DIR: args.talkerEngineDir = optarg; break;
+        case Qwen3TTSOptionId::QWEN3_TTS_TALKER_BACKEND: args.qwen3TtsTalkerBackend = optarg; break;
+        case Qwen3TTSOptionId::QWEN3_TTS_TALKER_ENGINE: args.qwen3TtsTalkerEngine = optarg; break;
         case Qwen3TTSOptionId::CODE_PREDICTOR_ENGINE_DIR: args.codePredictorEngineDir = optarg; break;
         case Qwen3TTSOptionId::CODE_PREDICTOR_BACKEND: args.codePredictorBackend = optarg; break;
         case Qwen3TTSOptionId::QWEN3_TTS_TEXT_PROJECTION: args.qwen3TtsTextProjection = optarg; break;
@@ -325,6 +336,26 @@ bool parseCodePredictorBackend(
     return false;
 }
 
+bool parseTalkerBackend(std::string const& value, rt::Qwen3OmniTTSRuntime::TalkerBackend& backend)
+{
+    if (value == "auto")
+    {
+        backend = rt::Qwen3OmniTTSRuntime::TalkerBackend::kAuto;
+        return true;
+    }
+    if (value == "qwen3_tts_explicit_kv" || value == "explicit_kv" || value == "direct")
+    {
+        backend = rt::Qwen3OmniTTSRuntime::TalkerBackend::kQwen3TTSExplicitKV;
+        return true;
+    }
+    if (value == "generic" || value == "generic_llm_runner" || value == "official")
+    {
+        backend = rt::Qwen3OmniTTSRuntime::TalkerBackend::kGeneric;
+        return true;
+    }
+    return false;
+}
+
 bool parseTextProjectionMode(std::string const& value, rt::Qwen3OmniTTSRuntime::TextProjectionMode& mode)
 {
     if (value == "auto")
@@ -382,6 +413,11 @@ int main(int argc, char** argv)
             ? std::filesystem::path(args.talkerEngineDir).parent_path() / "code_predictor"
             : std::filesystem::path(args.codePredictorEngineDir);
         rt::Qwen3OmniTTSRuntime::RuntimeOptions runtimeOptions;
+        if (!parseTalkerBackend(args.qwen3TtsTalkerBackend, runtimeOptions.talkerBackend))
+        {
+            throw std::runtime_error("Invalid --qwen3TtsTalkerBackend: " + args.qwen3TtsTalkerBackend);
+        }
+        runtimeOptions.qwen3TtsTalkerEnginePath = args.qwen3TtsTalkerEngine;
         if (!parseCodePredictorBackend(args.codePredictorBackend, runtimeOptions.codePredictorBackend))
         {
             throw std::runtime_error("Invalid --codePredictorBackend: " + args.codePredictorBackend);

@@ -1579,12 +1579,40 @@ bool Qwen3OmniTTSRuntime::initializeEngineRunners(
                         ? "FP16"
                         : (talkerKVType == nvinfer1::DataType::kFP8 ? "FP8" : "UNKNOWN")));
 
-        if (char const* directTalkerPath = std::getenv("QWEN3_TTS_DIRECT_TALKER_ENGINE"))
+        std::string explicitTalkerPath = mRuntimeOptions.qwen3TtsTalkerEnginePath;
+        if (explicitTalkerPath.empty())
+        {
+            if (char const* envPath = std::getenv("QWEN3_TTS_DIRECT_TALKER_ENGINE"))
+            {
+                explicitTalkerPath = envPath;
+            }
+        }
+        bool useExplicitTalker = false;
+        switch (mRuntimeOptions.talkerBackend)
+        {
+        case TalkerBackend::kAuto:
+            useExplicitTalker = !explicitTalkerPath.empty();
+            break;
+        case TalkerBackend::kGeneric:
+            useExplicitTalker = false;
+            break;
+        case TalkerBackend::kQwen3TTSExplicitKV:
+            if (explicitTalkerPath.empty())
+            {
+                throw std::runtime_error(
+                    "Qwen3-TTS explicit-KV Talker backend requested, but no direct Talker engine path was provided");
+            }
+            useExplicitTalker = true;
+            break;
+        }
+        LOG_INFO("Talker backend: %s", useExplicitTalker ? "qwen3_tts_explicit_kv" : "generic_llm_runner");
+
+        if (useExplicitTalker)
         {
             LLMEngineRunnerConfig directConfig = mTalkerLLMConfig;
             directConfig.outputVocabSize = directConfig.outputVocabSize > 0 ? directConfig.outputVocabSize : directConfig.vocabSize;
             mQwen3TTSTalkerEngine = std::make_unique<Qwen3TTSTalkerEngine>(
-                std::filesystem::path(directTalkerPath), directConfig, 200, mStream);
+                std::filesystem::path(explicitTalkerPath), directConfig, 200, mStream);
             mTalkerHiddenStatesDataType = mQwen3TTSTalkerEngine->hiddenStatesDataType();
             mResidualEmbedDataType = nvinfer1::DataType::kFLOAT;
             switch (mRuntimeOptions.textProjectionMode)
