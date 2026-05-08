@@ -423,6 +423,8 @@ int main(int argc, char** argv)
             int32_t chunkIndex = 0;
             int64_t streamedSamples = 0;
             double streamedCode2WavMs = 0.0;
+            int64_t code2wavInputFrames = 0;
+            int64_t code2wavContextFrames = 0;
             std::chrono::steady_clock::time_point firstChunkAt{};
 
             auto writeChunk = [&](int32_t outputChunkIndex, bool isFinal, int32_t totalFrames,
@@ -490,6 +492,8 @@ int main(int argc, char** argv)
                 streamedSamples += static_cast<int64_t>(pcm.size());
                 double const code2wavMs = std::chrono::duration<double, std::milli>(chunkEnd - chunkStart).count();
                 streamedCode2WavMs += code2wavMs;
+                code2wavInputFrames += static_cast<int64_t>(windowCodes.empty() ? 0 : windowCodes[0].size());
+                code2wavContextFrames += static_cast<int64_t>(std::max(0, skipContextFrames));
 
                 writeChunk(chunkIndex, isFinal, totalFrames, pcm, code2wavMs, chunkEnd,
                     code2wavRunner->getConfig().sampleRate);
@@ -585,6 +589,9 @@ int main(int argc, char** argv)
                                 }
                                 streamedSamples += static_cast<int64_t>(pcm.size());
                                 streamedCode2WavMs += code2wavMs;
+                                code2wavInputFrames
+                                    += static_cast<int64_t>(windowCodes.empty() ? 0 : windowCodes[0].size());
+                                code2wavContextFrames += static_cast<int64_t>(std::max(0, skipContextFrames));
                                 lastEmittedFrames = emitUntil;
                                 nextChunkAt = emitUntil + chunkFrames;
                                 ++chunkIndex;
@@ -657,6 +664,13 @@ int main(int argc, char** argv)
                     {"samples", streamedSamples},
                     {"sample_rate", sampleRate},
                     {"audio_s", audioSeconds},
+                    {"async_code2wav", asyncCode2Wav},
+                    {"chunk_count", chunkIndex},
+                    {"code2wav_input_frames", code2wavInputFrames},
+                    {"code2wav_context_frames", code2wavContextFrames},
+                    {"code2wav_context_ratio",
+                        code2wavInputFrames > 0 ? static_cast<double>(code2wavContextFrames) / code2wavInputFrames
+                                                : 0.0},
                     {"generation_ms", std::chrono::duration<double, std::milli>(genEnd - genStart).count()},
                     {"code2wav_ms", streamedCode2WavMs},
                     {"first_chunk_ms",
