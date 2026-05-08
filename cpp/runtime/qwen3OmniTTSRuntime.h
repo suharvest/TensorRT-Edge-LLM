@@ -102,6 +102,7 @@ public:
         std::string qwen3TtsTalkerEnginePath;
         CodePredictorBackend codePredictorBackend{CodePredictorBackend::kAuto};
         TextProjectionMode textProjectionMode{TextProjectionMode::kAuto};
+        bool qwen3TtsPromptKvCache{false};
     };
 
     /*!

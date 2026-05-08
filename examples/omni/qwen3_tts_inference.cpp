@@ -182,7 +182,8 @@ enum Qwen3TTSOptionId : int
     CODE_PREDICTOR_BACKEND = 916,
     QWEN3_TTS_TEXT_PROJECTION = 917,
     QWEN3_TTS_TALKER_BACKEND = 918,
-    QWEN3_TTS_TALKER_ENGINE = 919
+    QWEN3_TTS_TALKER_ENGINE = 919,
+    QWEN3_TTS_PROMPT_KV_CACHE = 920
 };
 
 struct Qwen3TTSInferenceArgs
@@ -194,6 +195,7 @@ struct Qwen3TTSInferenceArgs
     std::string qwen3TtsTalkerEngine{""};
     std::string codePredictorBackend{"auto"};
     std::string qwen3TtsTextProjection{"auto"};
+    bool qwen3TtsPromptKvCache{false};
     std::string code2wavEngineDir{""};
     std::string tokenizerDir{""};
     std::string inputFile;
@@ -222,6 +224,8 @@ void printUsage(char const* programName)
               << "                               CodePredictor runtime backend (default: auto)\n"
               << "  --qwen3TtsTextProjection=<auto|host_fp32|device>\n"
               << "                               Qwen3-TTS text projection precision path (default: auto)\n"
+              << "  --qwen3TtsPromptKvCache=<0|1>\n"
+              << "                               Reuse identical Qwen3-TTS prompt KV inside the runtime (default: 0)\n"
               << "  --code2wavEngineDir=<path>   Path to Code2Wav engine directory\n"
               << "  --tokenizerDir=<path>        Path to tokenizer directory\n"
               << "                               Defaults to --talkerEngineDir/../\n"
@@ -247,6 +251,7 @@ bool parseArgs(Qwen3TTSInferenceArgs& args, int argc, char* argv[])
         {"codePredictorEngineDir", required_argument, 0, Qwen3TTSOptionId::CODE_PREDICTOR_ENGINE_DIR},
         {"codePredictorBackend", required_argument, 0, Qwen3TTSOptionId::CODE_PREDICTOR_BACKEND},
         {"qwen3TtsTextProjection", required_argument, 0, Qwen3TTSOptionId::QWEN3_TTS_TEXT_PROJECTION},
+        {"qwen3TtsPromptKvCache", required_argument, 0, Qwen3TTSOptionId::QWEN3_TTS_PROMPT_KV_CACHE},
         {"code2wavEngineDir", required_argument, 0, Qwen3TTSOptionId::CODE2WAV_ENGINE_DIR},
         {"tokenizerDir", required_argument, 0, Qwen3TTSOptionId::TOKENIZER_DIR},
         {"outputFile", required_argument, 0, Qwen3TTSOptionId::OUTPUT_FILE},
@@ -270,6 +275,10 @@ bool parseArgs(Qwen3TTSInferenceArgs& args, int argc, char* argv[])
         case Qwen3TTSOptionId::CODE_PREDICTOR_ENGINE_DIR: args.codePredictorEngineDir = optarg; break;
         case Qwen3TTSOptionId::CODE_PREDICTOR_BACKEND: args.codePredictorBackend = optarg; break;
         case Qwen3TTSOptionId::QWEN3_TTS_TEXT_PROJECTION: args.qwen3TtsTextProjection = optarg; break;
+        case Qwen3TTSOptionId::QWEN3_TTS_PROMPT_KV_CACHE:
+            args.qwen3TtsPromptKvCache = std::string(optarg) == "1" || std::string(optarg) == "true"
+                || std::string(optarg) == "yes" || std::string(optarg) == "on";
+            break;
         case Qwen3TTSOptionId::CODE2WAV_ENGINE_DIR: args.code2wavEngineDir = optarg; break;
         case Qwen3TTSOptionId::TOKENIZER_DIR: args.tokenizerDir = optarg; break;
         case Qwen3TTSOptionId::OUTPUT_FILE: args.outputFile = optarg; break;
@@ -426,6 +435,7 @@ int main(int argc, char** argv)
         {
             throw std::runtime_error("Invalid --qwen3TtsTextProjection: " + args.qwen3TtsTextProjection);
         }
+        runtimeOptions.qwen3TtsPromptKvCache = args.qwen3TtsPromptKvCache;
         ttsRuntime = std::make_unique<rt::Qwen3OmniTTSRuntime>(
             args.talkerEngineDir, codePredictorDir.string(), args.tokenizerDir, stream, runtimeOptions);
         LOG_INFO("TTS runtime initialized");

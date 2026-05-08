@@ -1216,6 +1216,32 @@ public:
         return true;
     }
 
+    bool prefillWithPromptCache(std::vector<float> const& inputEmbeds, int32_t seqLen,
+        rt::Tensor& outputLogits, rt::Tensor& outputHiddenStates)
+    {
+        if (seqLen <= 0 || seqLen > mMaxSeqLen)
+        {
+            return prefill(inputEmbeds, seqLen, outputLogits, outputHiddenStates);
+        }
+
+        uint64_t const promptKey = hashPrompt(inputEmbeds, seqLen);
+        if (!mPromptCacheValid || mPromptCacheKey != promptKey || mPromptCacheLen != seqLen)
+        {
+            LOG_INFO("Qwen3-TTS Talker prompt KV cache miss: seqLen=%d", seqLen);
+            if (!prefill(inputEmbeds, seqLen, outputLogits, outputHiddenStates))
+            {
+                return false;
+            }
+            storePromptCache(seqLen, promptKey, outputLogits, outputHiddenStates);
+        }
+        else
+        {
+            LOG_INFO("Qwen3-TTS Talker prompt KV cache hit: seqLen=%d", seqLen);
+            restorePromptCache(outputLogits, outputHiddenStates);
+        }
+        return true;
+    }
+
     bool decode(std::vector<float> const& inputEmbed, rt::Tensor& outputLogits, rt::Tensor& outputHiddenStates)
     {
         if (mSeqLen <= 0 || mSeqLen >= mMaxSeqLen)
@@ -1351,6 +1377,89 @@ private:
         }
     }
 
+    size_t kvBytesForSeqLen(int32_t seqLen) const
+    {
+        return static_cast<size_t>(mConfig.numKVHeads) * static_cast<size_t>(seqLen) * mConfig.headDim * mKVElementSize;
+    }
+
+    static uint64_t fnv1a(uint64_t hash, void const* data, size_t bytes)
+    {
+        auto const* ptr = static_cast<uint8_t const*>(data);
+        for (size_t i = 0; i < bytes; ++i)
+        {
+            hash ^= ptr[i];
+            hash *= 1099511628211ULL;
+        }
+        return hash;
+    }
+
+    uint64_t hashPrompt(std::vector<float> const& inputEmbeds, int32_t seqLen) const
+    {
+        uint64_t hash = 1469598103934665603ULL;
+        hash = fnv1a(hash, &seqLen, sizeof(seqLen));
+        hash = fnv1a(hash, &mConfig.hiddenSize, sizeof(mConfig.hiddenSize));
+        size_t const promptFloats = static_cast<size_t>(seqLen) * mConfig.hiddenSize;
+        return fnv1a(hash, inputEmbeds.data(), promptFloats * sizeof(float));
+    }
+
+    void ensurePromptBuffers(int32_t seqLen)
+    {
+        size_t const kvBytes = kvBytesForSeqLen(seqLen);
+        size_t const logitsBytes = static_cast<size_t>(mConfig.vocabSize) * sizeof(float);
+        size_t const hiddenBytes = static_cast<size_t>(seqLen) * mConfig.hiddenSize * sizeof(float);
+        if (mPromptKVBytes == kvBytes && mPromptHiddenBytes == hiddenBytes && mPromptKVs.size() == mKVB.size())
+        {
+            return;
+        }
+        mPromptKVBytes = kvBytes;
+        mPromptHiddenBytes = hiddenBytes;
+        mPromptKVs.clear();
+        mPromptKVs.resize(mKVB.size());
+        for (auto& buffer : mPromptKVs)
+        {
+            buffer.allocate(kvBytes);
+        }
+        mPromptLogits.allocate(logitsBytes);
+        mPromptHidden.allocate(hiddenBytes);
+    }
+
+    void storePromptCache(
+        int32_t seqLen, uint64_t promptKey, rt::Tensor const& outputLogits, rt::Tensor const& outputHiddenStates)
+    {
+        ensurePromptBuffers(seqLen);
+        for (size_t i = 0; i < mKVB.size(); ++i)
+        {
+            CUDA_CHECK(cudaMemcpyAsync(
+                mPromptKVs[i].get(), mKVB[i].get(), mPromptKVBytes, cudaMemcpyDeviceToDevice, mStream));
+        }
+        CUDA_CHECK(cudaMemcpyAsync(mPromptLogits.get(), outputLogits.rawPointer(),
+            static_cast<size_t>(mConfig.vocabSize) * sizeof(float), cudaMemcpyDeviceToDevice, mStream));
+        CUDA_CHECK(cudaMemcpyAsync(
+            mPromptHidden.get(), outputHiddenStates.rawPointer(), mPromptHiddenBytes, cudaMemcpyDeviceToDevice, mStream));
+        CUDA_CHECK(cudaStreamSynchronize(mStream));
+        mPromptCacheLen = seqLen;
+        mPromptCacheKey = promptKey;
+        mPromptCacheValid = true;
+    }
+
+    void restorePromptCache(rt::Tensor& outputLogits, rt::Tensor& outputHiddenStates)
+    {
+        check::check(mPromptCacheValid, "restorePromptCache called without a valid prompt cache");
+        for (size_t i = 0; i < mKVB.size(); ++i)
+        {
+            CUDA_CHECK(cudaMemcpyAsync(
+                mKVB[i].get(), mPromptKVs[i].get(), mPromptKVBytes, cudaMemcpyDeviceToDevice, mStream));
+        }
+        CUDA_CHECK(cudaMemcpyAsync(outputLogits.rawPointer(), mPromptLogits.get(),
+            static_cast<size_t>(mConfig.vocabSize) * sizeof(float), cudaMemcpyDeviceToDevice, mStream));
+        check::check(outputHiddenStates.reshape({1, mPromptCacheLen, mConfig.hiddenSize}), "Tensor reshape failed");
+        CUDA_CHECK(cudaMemcpyAsync(
+            outputHiddenStates.rawPointer(), mPromptHidden.get(), mPromptHiddenBytes, cudaMemcpyDeviceToDevice, mStream));
+        CUDA_CHECK(cudaStreamSynchronize(mStream));
+        mSeqLen = mPromptCacheLen;
+        mParity = 1;
+    }
+
     void resetProfiles()
     {
         if (mHasDualProfiles)
@@ -1417,6 +1526,14 @@ private:
     DeviceBuffer mDeviceDummyKV;
     std::vector<DeviceBuffer> mKVA;
     std::vector<DeviceBuffer> mKVB;
+    std::vector<DeviceBuffer> mPromptKVs;
+    DeviceBuffer mPromptLogits;
+    DeviceBuffer mPromptHidden;
+    size_t mPromptKVBytes{0};
+    size_t mPromptHiddenBytes{0};
+    bool mPromptCacheValid{false};
+    int32_t mPromptCacheLen{0};
+    uint64_t mPromptCacheKey{0};
     std::vector<std::string> mPastKeyNames;
     std::vector<std::string> mPastValueNames;
     std::vector<std::string> mNewPastKeyNames;
@@ -1630,6 +1747,7 @@ bool Qwen3OmniTTSRuntime::initializeEngineRunners(
             mTalkerLLMConfig.maxKVCacheCapacity = mQwen3TTSTalkerEngine->maxSeqLen();
             LOG_INFO("Talker execution will use explicit-KV Qwen3-TTS engine override.");
             LOG_INFO("Text projection mode: %s", mUseHostTextProjection ? "host_fp32" : "device");
+            LOG_INFO("Qwen3-TTS prompt KV cache: %s", mRuntimeOptions.qwen3TtsPromptKvCache ? "enabled" : "disabled");
         }
     }
     catch (std::exception const& e)
@@ -2372,6 +2490,11 @@ bool Qwen3OmniTTSRuntime::executeTalkerPrefillStep(
             return false;
         }
         std::vector<float> hostInput = copyTensorToHostFloat(inputEmbeds, seqLen * hiddenSize, stream);
+        if (mRuntimeOptions.qwen3TtsPromptKvCache)
+        {
+            return mQwen3TTSTalkerEngine->prefillWithPromptCache(
+                hostInput, static_cast<int32_t>(seqLen), outputLogits, outputHiddenStates);
+        }
         return mQwen3TTSTalkerEngine->prefill(hostInput, static_cast<int32_t>(seqLen), outputLogits, outputHiddenStates);
     }
 
@@ -2774,8 +2897,8 @@ bool Qwen3OmniTTSRuntime::handleAudioGeneration(TalkerGenerationRequest const& r
     {
         auto prefillLogits = copyTensorToHostFloat(mTalkerLogits, mTalkerConfig.talkerVocabSize, stream);
         dumpVector("talker_prefill_logits_f32.bin", prefillLogits);
-        auto prefillHidden = copyTensorToHostFloat(mTalkerHiddenStatesBuffer,
-            seqLen * static_cast<int64_t>(mTalkerConfig.talkerHiddenSize), stream);
+        auto prefillHidden = copyTensorToHostFloat(
+            mTalkerHiddenStatesBuffer, mTalkerHiddenStatesBuffer.getShape().volume(), stream);
         dumpVector("talker_prefill_hidden_f32.bin", prefillHidden);
     }
 
