@@ -13,6 +13,7 @@
 #include <algorithm>
 #include <chrono>
 #include <cmath>
+#include <condition_variable>
 #include <cstdint>
 #include <cstdlib>
 #include <cstring>
@@ -22,9 +23,11 @@
 #include <getopt.h>
 #include <iostream>
 #include <memory>
+#include <mutex>
 #include <nlohmann/json.hpp>
 #include <stdexcept>
 #include <string>
+#include <thread>
 #include <vector>
 
 using namespace trt_edgellm;
@@ -322,6 +325,16 @@ int main(int argc, char** argv)
 
     std::unique_ptr<Qwen3OmniTTSRuntime> ttsRuntime;
     std::unique_ptr<Code2WavRunner> code2wavRunner;
+    cudaStream_t asyncCode2WavStream{};
+    std::unique_ptr<Code2WavRunner> asyncCode2wavRunner;
+    auto getAsyncCode2WavRunner = [&]() -> Code2WavRunner& {
+        if (!asyncCode2wavRunner)
+        {
+            CUDA_CHECK(cudaStreamCreate(&asyncCode2WavStream));
+            asyncCode2wavRunner = std::make_unique<Code2WavRunner>(args.code2wavEngineDir, asyncCode2WavStream);
+        }
+        return *asyncCode2wavRunner;
+    };
     auto const initStart = std::chrono::steady_clock::now();
     try
     {
@@ -356,6 +369,10 @@ int main(int argc, char** argv)
     {
         std::cerr << e.what() << std::endl;
         CUDA_CHECK(cudaStreamDestroy(stream));
+        if (asyncCode2WavStream)
+        {
+            CUDA_CHECK(cudaStreamDestroy(asyncCode2WavStream));
+        }
         return EXIT_FAILURE;
     }
 
@@ -379,6 +396,7 @@ int main(int argc, char** argv)
             std::string const id = item.value("id", "");
             bool const streamOutput = item.value("stream", false);
             bool const streamOnly = item.value("stream_only", false);
+            bool const asyncCode2Wav = item.value("async_code2wav", false);
             int32_t const firstChunkFrames = std::max(1, item.value("first_chunk_frames", 25));
             int32_t const chunkFrames = std::max(1, item.value("chunk_frames", 25));
             std::string const chunkFormat = item.value("chunk_format", "pcm_s16le");
@@ -406,6 +424,40 @@ int main(int argc, char** argv)
             int64_t streamedSamples = 0;
             double streamedCode2WavMs = 0.0;
             std::chrono::steady_clock::time_point firstChunkAt{};
+
+            auto writeChunk = [&](int32_t outputChunkIndex, bool isFinal, int32_t totalFrames,
+                                  std::vector<int16_t> const& pcm, double code2wavMs,
+                                  std::chrono::steady_clock::time_point chunkEnd, int32_t sampleRate) {
+                Json chunk = Json{{"id", id},
+                    {"event", "chunk"},
+                    {"ok", true},
+                    {"chunk_index", outputChunkIndex},
+                    {"chunk_format", chunkFormat},
+                    {"chunk_transport", chunkTransport},
+                    {"frames", totalFrames},
+                    {"samples", pcm.size()},
+                    {"sample_rate", sampleRate},
+                    {"is_final", isFinal},
+                    {"code2wav_ms", code2wavMs},
+                    {"elapsed_ms", std::chrono::duration<double, std::milli>(chunkEnd - requestStart).count()}};
+                if (chunkTransport == "base64")
+                {
+                    chunk["audio_b64"] = base64Encode(
+                        reinterpret_cast<uint8_t const*>(pcm.data()), pcm.size() * sizeof(int16_t));
+                }
+                else
+                {
+                    std::filesystem::path chunkPath(outputFile);
+                    chunkPath.replace_filename(
+                        chunkPath.stem().string() + ".chunk" + std::to_string(outputChunkIndex) + ".pcm");
+                    if (!savePcm16(chunkPath.string(), pcm))
+                    {
+                        throw std::runtime_error("Failed to save chunk PCM: " + chunkPath.string());
+                    }
+                    chunk["chunk_file"] = chunkPath.string();
+                }
+                std::cout << chunk.dump() << std::endl;
+            };
 
             auto emitChunk = [&](bool isFinal) {
                 int32_t const totalFrames = static_cast<int32_t>(streamedFrames.size());
@@ -439,61 +491,156 @@ int main(int argc, char** argv)
                 double const code2wavMs = std::chrono::duration<double, std::milli>(chunkEnd - chunkStart).count();
                 streamedCode2WavMs += code2wavMs;
 
-                Json chunk = Json{{"id", id},
-                    {"event", "chunk"},
-                    {"ok", true},
-                    {"chunk_index", chunkIndex},
-                    {"chunk_format", chunkFormat},
-                    {"chunk_transport", chunkTransport},
-                    {"frames", totalFrames},
-                    {"samples", pcm.size()},
-                    {"sample_rate", code2wavRunner->getConfig().sampleRate},
-                    {"is_final", isFinal},
-                    {"code2wav_ms", code2wavMs},
-                    {"elapsed_ms", std::chrono::duration<double, std::milli>(chunkEnd - requestStart).count()}};
-                if (chunkTransport == "base64")
-                {
-                    chunk["audio_b64"] = base64Encode(
-                        reinterpret_cast<uint8_t const*>(pcm.data()), pcm.size() * sizeof(int16_t));
-                }
-                else
-                {
-                    std::filesystem::path chunkPath(outputFile);
-                    chunkPath.replace_filename(
-                        chunkPath.stem().string() + ".chunk" + std::to_string(chunkIndex) + ".pcm");
-                    if (!savePcm16(chunkPath.string(), pcm))
-                    {
-                        throw std::runtime_error("Failed to save chunk PCM: " + chunkPath.string());
-                    }
-                    chunk["chunk_file"] = chunkPath.string();
-                }
-                std::cout << chunk.dump() << std::endl;
+                writeChunk(chunkIndex, isFinal, totalFrames, pcm, code2wavMs, chunkEnd,
+                    code2wavRunner->getConfig().sampleRate);
 
                 lastEmittedFrames = totalFrames;
                 nextChunkAt = totalFrames + chunkFrames;
                 ++chunkIndex;
             };
 
-            auto frameCallback = [&](std::vector<int32_t> const& frameCodes, int32_t totalFrames) {
-                streamedFrames.push_back(frameCodes);
-                if (streamOutput && totalFrames >= nextChunkAt)
-                {
-                    emitChunk(false);
-                }
-            };
-
             auto const genStart = std::chrono::steady_clock::now();
-            bool const ok = streamOutput ? ttsRuntime->handleAudioGeneration(request, talkerResponse, stream, frameCallback)
-                                         : ttsRuntime->handleAudioGeneration(request, talkerResponse, stream);
-            auto const genEnd = std::chrono::steady_clock::now();
+            bool ok = false;
+            std::chrono::steady_clock::time_point genEnd{};
+            if (streamOutput && asyncCode2Wav)
+            {
+                Code2WavRunner& asyncRunner = getAsyncCode2WavRunner();
+                std::mutex streamMutex;
+                std::condition_variable streamCv;
+                bool generationDone = false;
+                std::exception_ptr asyncError;
+
+                std::thread code2wavThread([&]() {
+                    try
+                    {
+                        while (true)
+                        {
+                            int32_t totalFrames = 0;
+                            int32_t emitUntil = 0;
+                            int32_t outputChunkIndex = 0;
+                            int32_t skipContextFrames = 0;
+                            bool isFinal = false;
+                            std::vector<std::vector<int32_t>> windowCodes;
+
+                            {
+                                std::unique_lock<std::mutex> lock(streamMutex);
+                                streamCv.wait(lock, [&]() {
+                                    return generationDone
+                                        || static_cast<int32_t>(streamedFrames.size()) >= nextChunkAt || asyncError;
+                                });
+                                if (asyncError)
+                                {
+                                    return;
+                                }
+                                totalFrames = static_cast<int32_t>(streamedFrames.size());
+                                if (totalFrames <= lastEmittedFrames)
+                                {
+                                    if (generationDone)
+                                    {
+                                        return;
+                                    }
+                                    continue;
+                                }
+                                if (totalFrames >= nextChunkAt)
+                                {
+                                    emitUntil = nextChunkAt;
+                                }
+                                else if (generationDone)
+                                {
+                                    emitUntil = totalFrames;
+                                }
+                                else
+                                {
+                                    continue;
+                                }
+
+                                int32_t const leftContext = asyncRunner.getConfig().leftContextSize;
+                                int32_t const windowStart = std::max(0, lastEmittedFrames - leftContext);
+                                skipContextFrames = lastEmittedFrames - windowStart;
+                                outputChunkIndex = chunkIndex;
+                                isFinal = generationDone && emitUntil == totalFrames;
+                                windowCodes = transposeFrameWindow(
+                                    streamedFrames, static_cast<size_t>(windowStart), static_cast<size_t>(emitUntil));
+                            }
+
+                            auto const chunkStart = std::chrono::steady_clock::now();
+                            auto samples
+                                = synthesizeWindow(asyncRunner, windowCodes, skipContextFrames, asyncCode2WavStream);
+                            auto const chunkEnd = std::chrono::steady_clock::now();
+                            double const code2wavMs
+                                = std::chrono::duration<double, std::milli>(chunkEnd - chunkStart).count();
+                            auto pcm = floatSamplesToPcm16(samples);
+
+                            {
+                                std::lock_guard<std::mutex> lock(streamMutex);
+                                if (samples.empty())
+                                {
+                                    lastEmittedFrames = emitUntil;
+                                    nextChunkAt = emitUntil + chunkFrames;
+                                    continue;
+                                }
+                                if (chunkIndex == 0)
+                                {
+                                    firstChunkAt = chunkEnd;
+                                }
+                                streamedSamples += static_cast<int64_t>(pcm.size());
+                                streamedCode2WavMs += code2wavMs;
+                                lastEmittedFrames = emitUntil;
+                                nextChunkAt = emitUntil + chunkFrames;
+                                ++chunkIndex;
+                            }
+                            writeChunk(outputChunkIndex, isFinal, emitUntil, pcm, code2wavMs, chunkEnd,
+                                asyncRunner.getConfig().sampleRate);
+                        }
+                    }
+                    catch (...)
+                    {
+                        std::lock_guard<std::mutex> lock(streamMutex);
+                        asyncError = std::current_exception();
+                    }
+                });
+
+                auto asyncFrameCallback = [&](std::vector<int32_t> const& frameCodes, int32_t) {
+                    {
+                        std::lock_guard<std::mutex> lock(streamMutex);
+                        streamedFrames.push_back(frameCodes);
+                    }
+                    streamCv.notify_one();
+                };
+
+                ok = ttsRuntime->handleAudioGeneration(request, talkerResponse, stream, asyncFrameCallback);
+                genEnd = std::chrono::steady_clock::now();
+                {
+                    std::lock_guard<std::mutex> lock(streamMutex);
+                    generationDone = true;
+                }
+                streamCv.notify_one();
+                code2wavThread.join();
+                if (asyncError)
+                {
+                    std::rethrow_exception(asyncError);
+                }
+            }
+            else
+            {
+                auto frameCallback = [&](std::vector<int32_t> const& frameCodes, int32_t totalFrames) {
+                    streamedFrames.push_back(frameCodes);
+                    if (streamOutput && totalFrames >= nextChunkAt)
+                    {
+                        emitChunk(false);
+                    }
+                };
+                ok = streamOutput ? ttsRuntime->handleAudioGeneration(request, talkerResponse, stream, frameCallback)
+                                  : ttsRuntime->handleAudioGeneration(request, talkerResponse, stream);
+                genEnd = std::chrono::steady_clock::now();
+                if (streamOutput)
+                {
+                    emitChunk(true);
+                }
+            }
             if (!ok || talkerResponse.rvqCodes.empty())
             {
                 throw std::runtime_error("TTS generation failed");
-            }
-
-            if (streamOutput)
-            {
-                emitChunk(true);
             }
 
             if (streamOnly)
@@ -557,6 +704,11 @@ int main(int argc, char** argv)
         std::cout << response.dump() << std::endl;
     }
 
+    asyncCode2wavRunner.reset();
+    if (asyncCode2WavStream)
+    {
+        CUDA_CHECK(cudaStreamDestroy(asyncCode2WavStream));
+    }
     CUDA_CHECK(cudaStreamDestroy(stream));
     return EXIT_SUCCESS;
 }
