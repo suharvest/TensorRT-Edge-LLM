@@ -399,6 +399,9 @@ int main(int argc, char** argv)
             bool const asyncCode2Wav = item.value("async_code2wav", false);
             int32_t const firstChunkFrames = std::max(1, item.value("first_chunk_frames", 25));
             int32_t const chunkFrames = std::max(1, item.value("chunk_frames", 25));
+            bool const adaptiveChunks = item.value("adaptive_chunks", false);
+            int32_t const maxChunkFrames = std::max(chunkFrames, item.value("max_chunk_frames", chunkFrames));
+            int32_t const chunkGrowthFrames = std::max(0, item.value("chunk_growth_frames", 0));
             std::string const chunkFormat = item.value("chunk_format", "pcm_s16le");
             std::string const chunkTransport = item.value("chunk_transport", "base64");
             std::string outputFile = item.value("output_file", "/tmp/qwen3_tts_worker_" + id + ".wav");
@@ -420,12 +423,21 @@ int main(int argc, char** argv)
             std::vector<std::vector<int32_t>> streamedFrames;
             int32_t lastEmittedFrames = 0;
             int32_t nextChunkAt = firstChunkFrames;
+            int32_t currentChunkFrames = chunkFrames;
             int32_t chunkIndex = 0;
             int64_t streamedSamples = 0;
             double streamedCode2WavMs = 0.0;
             int64_t code2wavInputFrames = 0;
             int64_t code2wavContextFrames = 0;
             std::chrono::steady_clock::time_point firstChunkAt{};
+
+            auto scheduleNextChunk = [&]() {
+                nextChunkAt = lastEmittedFrames + currentChunkFrames;
+                if (adaptiveChunks && chunkGrowthFrames > 0)
+                {
+                    currentChunkFrames = std::min(maxChunkFrames, currentChunkFrames + chunkGrowthFrames);
+                }
+            };
 
             auto writeChunk = [&](int32_t outputChunkIndex, bool isFinal, int32_t totalFrames,
                                   std::vector<int16_t> const& pcm, double code2wavMs,
@@ -480,7 +492,7 @@ int main(int argc, char** argv)
                 if (samples.empty())
                 {
                     lastEmittedFrames = totalFrames;
-                    nextChunkAt = totalFrames + chunkFrames;
+                    scheduleNextChunk();
                     return;
                 }
                 if (chunkIndex == 0)
@@ -499,7 +511,7 @@ int main(int argc, char** argv)
                     code2wavRunner->getConfig().sampleRate);
 
                 lastEmittedFrames = totalFrames;
-                nextChunkAt = totalFrames + chunkFrames;
+                scheduleNextChunk();
                 ++chunkIndex;
             };
 
@@ -580,7 +592,7 @@ int main(int argc, char** argv)
                                 if (samples.empty())
                                 {
                                     lastEmittedFrames = emitUntil;
-                                    nextChunkAt = emitUntil + chunkFrames;
+                                    scheduleNextChunk();
                                     continue;
                                 }
                                 if (chunkIndex == 0)
@@ -593,7 +605,7 @@ int main(int argc, char** argv)
                                     += static_cast<int64_t>(windowCodes.empty() ? 0 : windowCodes[0].size());
                                 code2wavContextFrames += static_cast<int64_t>(std::max(0, skipContextFrames));
                                 lastEmittedFrames = emitUntil;
-                                nextChunkAt = emitUntil + chunkFrames;
+                                scheduleNextChunk();
                                 ++chunkIndex;
                             }
                             writeChunk(outputChunkIndex, isFinal, emitUntil, pcm, code2wavMs, chunkEnd,
@@ -665,6 +677,10 @@ int main(int argc, char** argv)
                     {"sample_rate", sampleRate},
                     {"audio_s", audioSeconds},
                     {"async_code2wav", asyncCode2Wav},
+                    {"adaptive_chunks", adaptiveChunks},
+                    {"chunk_frames", chunkFrames},
+                    {"chunk_growth_frames", chunkGrowthFrames},
+                    {"max_chunk_frames", maxChunkFrames},
                     {"chunk_count", chunkIndex},
                     {"code2wav_input_frames", code2wavInputFrames},
                     {"code2wav_context_frames", code2wavContextFrames},
