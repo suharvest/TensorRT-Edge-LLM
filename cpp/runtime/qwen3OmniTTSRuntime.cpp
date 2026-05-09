@@ -22,6 +22,7 @@
 #include "common/safetensorsUtils.h"
 #include "common/stringUtils.h"
 #include "kernels/embeddingKernels/embeddingKernels.h"
+#include "kernels/qwen3TtsCpKernels/qwen3TtsCpKernels.h"
 #include "kernels/talkerMLPKernels/talkerMLPKernels.h"
 #ifdef CUTE_DSL_GEMM_ENABLED
 #include "kernels/talkerMLPKernels/cuteDslGemmRunner.h"
@@ -709,6 +710,7 @@ public:
         mDevicePastLength.allocate(sizeof(int64_t));
         mDeviceDummyKV.allocate(16);
         mDeviceLogits.allocate(static_cast<size_t>(mNumGroups) * mCodebookSize * mLogitsElementSize);
+        mDeviceSelectedTokens.allocate(static_cast<size_t>(mNumGroups) * sizeof(int32_t));
         if (std::getenv("QWEN3_TTS_CP_DEVICE_EMBEDDINGS") != nullptr
             && std::string(std::getenv("QWEN3_TTS_CP_DEVICE_EMBEDDINGS")) != "0")
         {
@@ -719,6 +721,18 @@ public:
             mUseDeviceEmbeddingTable = true;
             LOG_INFO("Qwen3-TTS CP device embedding table enabled: %.1f MiB",
                 static_cast<double>(embeddingBytes) / (1024.0 * 1024.0));
+        }
+        bool const requestedGpuGreedy = std::getenv("QWEN3_TTS_CP_GPU_GREEDY") != nullptr
+            && std::string(std::getenv("QWEN3_TTS_CP_GPU_GREEDY")) != "0";
+        mUseGpuGreedy = requestedGpuGreedy && mGreedy && mUseDeviceEmbeddingTable && mLogitsElementSize == sizeof(float);
+        if (requestedGpuGreedy && !mUseGpuGreedy)
+        {
+            LOG_WARNING("Qwen3-TTS CP GPU greedy requested but disabled; requires QWEN3_TTS_GREEDY=1, "
+                        "QWEN3_TTS_CP_DEVICE_EMBEDDINGS=1, and FP32 logits.");
+        }
+        if (mUseGpuGreedy)
+        {
+            LOG_WARNING("Qwen3-TTS CP GPU greedy sampling enabled (experimental; requires codes parity quality gate)");
         }
 
         mSampleLogits.resize(static_cast<size_t>(mCodebookSize));
@@ -810,7 +824,14 @@ private:
             LOG_ERROR("Qwen3-TTS CodePredictor prefill failed");
             return false;
         }
-        residualCodes[0] = sampleDeviceLogits(0, topK, topP, temperature);
+        if (mUseGpuGreedy)
+        {
+            sampleDeviceLogitsGreedyToDevice(0);
+        }
+        else
+        {
+            residualCodes[0] = sampleDeviceLogits(0, topK, topP, temperature);
+        }
 
         nvinfer1::IExecutionContext* decode = mDecodeContext.get();
         decode->setInputShape("inputs_embeds", nvinfer1::Dims3{1, 1, mHiddenSize});
@@ -833,7 +854,13 @@ private:
         for (int32_t j = 1; j < groupsToGenerate; ++j)
         {
             auto const embedStart = Clock::now();
-            if (mUseDeviceEmbeddingTable)
+            if (mUseGpuGreedy)
+            {
+                kernel::qwen3TtsCpGatherEmbedding(static_cast<float const*>(mDeviceEmbeddingTable.get()), mCodebookSize,
+                    mHiddenSize, j - 1, static_cast<int32_t const*>(mDeviceSelectedTokens.get()),
+                    static_cast<float*>(mDeviceEmbeds.get()), mStream);
+            }
+            else if (mUseDeviceEmbeddingTable)
             {
                 CUDA_CHECK(cudaMemcpyAsync(mDeviceEmbeds.get(), embeddingDevice(j - 1, residualCodes[j - 1]), bytes,
                     cudaMemcpyDeviceToDevice, mStream));
@@ -869,8 +896,21 @@ private:
                 LOG_ERROR("Qwen3-TTS CodePredictor decode failed at group %d", j);
                 return false;
             }
-            residualCodes[j] = sampleDeviceLogits(j, topK, topP, temperature);
+            if (mUseGpuGreedy)
+            {
+                sampleDeviceLogitsGreedyToDevice(j);
+            }
+            else
+            {
+                residualCodes[j] = sampleDeviceLogits(j, topK, topP, temperature);
+            }
             std::swap(read, write);
+        }
+        if (mUseGpuGreedy && groupsToGenerate > 0)
+        {
+            CUDA_CHECK(cudaMemcpyAsync(residualCodes.data(), mDeviceSelectedTokens.get(),
+                static_cast<size_t>(groupsToGenerate) * sizeof(int32_t), cudaMemcpyDeviceToHost, mStream));
+            CUDA_CHECK(cudaStreamSynchronize(mStream));
         }
         if (mProfile)
         {
@@ -1079,12 +1119,19 @@ private:
         {
             mSampleVals[i] = {mSampleLogits[i], i};
         }
-        std::partial_sort(mSampleVals.begin(), mSampleVals.begin() + k, mSampleVals.end(),
-            [](auto const& a, auto const& b) { return a.first > b.first; });
         if (mGreedy)
         {
-            return mSampleVals[0].second;
+            auto const best = std::max_element(mSampleVals.begin(), mSampleVals.end(), [](auto const& a, auto const& b) {
+                if (a.first == b.first)
+                {
+                    return a.second > b.second;
+                }
+                return a.first < b.first;
+            });
+            return best->second;
         }
+        std::partial_sort(mSampleVals.begin(), mSampleVals.begin() + k, mSampleVals.end(),
+            [](auto const& a, auto const& b) { return a.first > b.first; });
         double const maxVal = mSampleVals[0].first;
         double sum = 0.0;
         float const temp = temperature > 1e-6f ? temperature : 0.9f;
@@ -1133,6 +1180,14 @@ private:
         profileAdd(mProfileSampleCpuMs, cpuStart);
         return token;
     }
+
+    void sampleDeviceLogitsGreedyToDevice(int32_t group)
+    {
+        size_t const offset = mLogitsName == "logits_all" ? static_cast<size_t>(group) * mCodebookSize : 0;
+        kernel::qwen3TtsCpArgmax(static_cast<float const*>(mDeviceLogits.get()) + offset, mCodebookSize, 0,
+            static_cast<int32_t*>(mDeviceSelectedTokens.get()) + group, mStream);
+    }
+
     int32_t mHiddenSize{};
     int32_t mCodebookSize{};
     int32_t mNumLayers{};
@@ -1157,6 +1212,7 @@ private:
     bool mUseDeviceEmbeddingTable{false};
     bool mDumpDebug{false};
     bool mGreedy{false};
+    bool mUseGpuGreedy{false};
     bool mProfile{false};
     int64_t mProfileFrames{0};
     int64_t mProfileGroups{0};
@@ -1175,6 +1231,7 @@ private:
     DeviceBuffer mDevicePastLength;
     DeviceBuffer mDeviceDummyKV;
     DeviceBuffer mDeviceLogits;
+    DeviceBuffer mDeviceSelectedTokens;
     DeviceBuffer mDeviceEmbeddingTable;
     std::vector<DeviceBuffer> mKVA;
     std::vector<DeviceBuffer> mKVB;
