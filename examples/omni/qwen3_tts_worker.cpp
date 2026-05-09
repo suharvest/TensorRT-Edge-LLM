@@ -182,6 +182,44 @@ bool parseTextProjectionMode(std::string const& value, Qwen3OmniTTSRuntime::Text
     return false;
 }
 
+long readProcValueKb(char const* path, char const* wantedKey)
+{
+    std::ifstream file(path);
+    std::string key;
+    long value = -1;
+    std::string unit;
+    while (file >> key >> value >> unit)
+    {
+        if (key == wantedKey)
+        {
+            return value;
+        }
+    }
+    return -1;
+}
+
+long kbToMb(long kb)
+{
+    return kb < 0 ? -1 : kb / 1024;
+}
+
+void logMemTag(char const* tag)
+{
+    long const memAvailableKb = readProcValueKb("/proc/meminfo", "MemAvailable:");
+    long const memFreeKb = readProcValueKb("/proc/meminfo", "MemFree:");
+    long const swapFreeKb = readProcValueKb("/proc/meminfo", "SwapFree:");
+    long const rssKb = readProcValueKb("/proc/self/status", "VmRSS:");
+    std::cerr << "[JV_MEM] tag=" << tag << " mem_available_mb=" << kbToMb(memAvailableKb)
+              << " mem_free_mb=" << kbToMb(memFreeKb) << " swap_free_mb=" << kbToMb(swapFreeKb)
+              << " rss_mb=" << kbToMb(rssKb) << std::endl;
+}
+
+bool envIsOne(char const* name)
+{
+    char const* value = std::getenv(name);
+    return value != nullptr && std::string(value) == "1";
+}
+
 std::vector<std::vector<int32_t>> transposeFrameWindow(
     std::vector<std::vector<int32_t>> const& frames, size_t begin, size_t end)
 {
@@ -318,20 +356,29 @@ int main(int argc, char** argv)
     }
 
     gLogger.setLevel(args.debug ? nvinfer1::ILogger::Severity::kVERBOSE : nvinfer1::ILogger::Severity::kWARNING);
+    logMemTag("worker_entry_before_plugin");
     auto pluginHandles = loadEdgellmPluginLib();
+    logMemTag("worker_after_plugin");
 
     cudaStream_t stream;
+    logMemTag("worker_before_cuda_stream");
     CUDA_CHECK(cudaStreamCreate(&stream));
+    logMemTag("worker_after_cuda_stream");
 
     std::unique_ptr<Qwen3OmniTTSRuntime> ttsRuntime;
     std::unique_ptr<Code2WavRunner> code2wavRunner;
     cudaStream_t asyncCode2WavStream{};
     std::unique_ptr<Code2WavRunner> asyncCode2wavRunner;
+    bool const lazyCode2Wav = envIsOne("EDGE_LLM_TTS_LAZY_CODE2WAV");
     auto getAsyncCode2WavRunner = [&]() -> Code2WavRunner& {
         if (!asyncCode2wavRunner)
         {
+            logMemTag("worker_before_async_code2wav_stream");
             CUDA_CHECK(cudaStreamCreate(&asyncCode2WavStream));
+            logMemTag("worker_after_async_code2wav_stream");
+            logMemTag("worker_before_async_code2wav");
             asyncCode2wavRunner = std::make_unique<Code2WavRunner>(args.code2wavEngineDir, asyncCode2WavStream);
+            logMemTag("worker_after_async_code2wav");
         }
         return *asyncCode2wavRunner;
     };
@@ -353,20 +400,38 @@ int main(int argc, char** argv)
             throw std::runtime_error("Invalid --qwen3TtsTextProjection: " + args.qwen3TtsTextProjection);
         }
         runtimeOptions.qwen3TtsPromptKvCache = args.qwen3TtsPromptKvCache;
+        logMemTag("worker_before_tts_runtime");
         ttsRuntime = std::make_unique<Qwen3OmniTTSRuntime>(
             args.talkerEngineDir, args.codePredictorEngineDir, args.tokenizerDir, stream, runtimeOptions);
-        code2wavRunner = std::make_unique<Code2WavRunner>(args.code2wavEngineDir, stream);
+        logMemTag("worker_after_tts_runtime");
+        if (lazyCode2Wav)
+        {
+            logMemTag("worker_skip_code2wav_lazy");
+        }
+        else
+        {
+            logMemTag("worker_before_code2wav");
+            code2wavRunner = std::make_unique<Code2WavRunner>(args.code2wavEngineDir, stream);
+            logMemTag("worker_after_code2wav");
+        }
         if (std::getenv("EDGE_LLM_TTS_CUDA_GRAPH") == nullptr
             || std::string(std::getenv("EDGE_LLM_TTS_CUDA_GRAPH")) != "0")
         {
+            logMemTag("worker_before_cuda_graph");
             if (!ttsRuntime->captureDecodingCUDAGraph(stream))
             {
                 LOG_WARNING("CUDA graph capture failed for TTS worker, proceeding without.");
             }
+            logMemTag("worker_after_cuda_graph");
+        }
+        else
+        {
+            logMemTag("worker_skip_cuda_graph");
         }
     }
     catch (std::exception const& e)
     {
+        logMemTag("worker_init_error");
         std::cerr << e.what() << std::endl;
         CUDA_CHECK(cudaStreamDestroy(stream));
         if (asyncCode2WavStream)
@@ -378,7 +443,9 @@ int main(int argc, char** argv)
 
     double const initMs
         = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - initStart).count();
+    logMemTag("worker_before_ready");
     std::cout << Json{{"event", "ready"}, {"init_ms", initMs}}.dump() << std::endl;
+    logMemTag("worker_after_ready");
 
     std::string line;
     while (std::getline(std::cin, line))
@@ -480,6 +547,12 @@ int main(int argc, char** argv)
                     return;
                 }
 
+                if (!code2wavRunner)
+                {
+                    logMemTag("worker_before_lazy_code2wav");
+                    code2wavRunner = std::make_unique<Code2WavRunner>(args.code2wavEngineDir, stream);
+                    logMemTag("worker_after_lazy_code2wav");
+                }
                 int32_t const leftContext = code2wavRunner->getConfig().leftContextSize;
                 int32_t const windowStart = std::max(0, lastEmittedFrames - leftContext);
                 int32_t const skipContextFrames = lastEmittedFrames - windowStart;
@@ -487,8 +560,10 @@ int main(int argc, char** argv)
                     streamedFrames, static_cast<size_t>(windowStart), static_cast<size_t>(totalFrames));
 
                 auto const chunkStart = std::chrono::steady_clock::now();
+                logMemTag(isFinal ? "worker_before_code2wav_final_chunk" : "worker_before_code2wav_chunk");
                 auto samples = synthesizeWindow(*code2wavRunner, windowCodes, skipContextFrames, stream);
                 auto const chunkEnd = std::chrono::steady_clock::now();
+                logMemTag(isFinal ? "worker_after_code2wav_final_chunk" : "worker_after_code2wav_chunk");
                 if (samples.empty())
                 {
                     lastEmittedFrames = totalFrames;
@@ -701,11 +776,19 @@ int main(int argc, char** argv)
 
             rt::audioUtils::AudioData audioOutput;
             auto const wavStart = std::chrono::steady_clock::now();
+            if (!code2wavRunner)
+            {
+                logMemTag("worker_before_lazy_code2wav");
+                code2wavRunner = std::make_unique<Code2WavRunner>(args.code2wavEngineDir, stream);
+                logMemTag("worker_after_lazy_code2wav");
+            }
+            logMemTag("worker_before_code2wav_full");
             if (!code2wavRunner->generateWaveform(transposeCodes(talkerResponse.rvqCodes), audioOutput, stream))
             {
                 throw std::runtime_error("Code2Wav failed");
             }
             auto const wavEnd = std::chrono::steady_clock::now();
+            logMemTag("worker_after_code2wav_full");
             if (!saveAudioToWav(outputFile, audioOutput))
             {
                 throw std::runtime_error("Failed to save WAV: " + outputFile);
