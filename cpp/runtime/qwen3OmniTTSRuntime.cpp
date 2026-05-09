@@ -39,6 +39,7 @@
 #include <filesystem>
 #include <fstream>
 #include <iterator>
+#include <limits>
 #include <nlohmann/json.hpp>
 #include <numeric>
 #include <random>
@@ -1066,6 +1067,7 @@ public:
         int32_t maxSeqLen, cudaStream_t stream)
         : mConfig(config)
         , mMaxSeqLen(maxSeqLen)
+        , mMaxKVSeqLen(maxSeqLen)
         , mStream(stream)
     {
         std::ifstream engineFile(enginePath, std::ios::binary);
@@ -1109,6 +1111,11 @@ public:
             {
                 mMaxSeqLen = std::min(mMaxSeqLen, static_cast<int32_t>(maxShape.d[1]));
             }
+            auto kvMaxShape = mEngine->getProfileShape("past_key_0", 1, nvinfer1::OptProfileSelector::kMAX);
+            if (kvMaxShape.nbDims >= 4 && kvMaxShape.d[2] > 0)
+            {
+                mMaxKVSeqLen = std::min(mMaxKVSeqLen, static_cast<int32_t>(kvMaxShape.d[2]));
+            }
             mPrefillContext.reset(mEngine->createExecutionContext());
             mDecodeContext.reset(mEngine->createExecutionContext());
             mPrefillContext->setOptimizationProfileAsync(0, mStream);
@@ -1123,6 +1130,11 @@ public:
             {
                 mMaxSeqLen = std::min(mMaxSeqLen, static_cast<int32_t>(maxShape.d[1]));
             }
+            auto kvMaxShape = mEngine->getProfileShape("past_key_0", 0, nvinfer1::OptProfileSelector::kMAX);
+            if (kvMaxShape.nbDims >= 4 && kvMaxShape.d[2] > 0)
+            {
+                mMaxKVSeqLen = std::min(mMaxKVSeqLen, static_cast<int32_t>(kvMaxShape.d[2]));
+            }
         }
 
         for (int32_t i = 0; i < mConfig.numDecoderLayers; ++i)
@@ -1134,12 +1146,18 @@ public:
         }
 
         allocateBuffers();
-        LOG_INFO("Qwen3-TTS explicit-KV Talker enabled: %s, maxSeq=%d", enginePath.string().c_str(), mMaxSeqLen);
+        LOG_INFO("Qwen3-TTS explicit-KV Talker enabled: %s, maxSeq=%d, maxKV=%d",
+            enginePath.string().c_str(), mMaxSeqLen, mMaxKVSeqLen);
     }
 
     int32_t maxSeqLen() const
     {
         return mMaxSeqLen;
+    }
+
+    int32_t maxKVSeqLen() const
+    {
+        return mMaxKVSeqLen;
     }
 
     nvinfer1::DataType hiddenStatesDataType() const
@@ -1150,8 +1168,34 @@ public:
     bool prefill(std::vector<float> const& inputEmbeds, int32_t seqLen, rt::Tensor& outputLogits,
         rt::Tensor& outputHiddenStates)
     {
-        if (seqLen <= 0 || seqLen > mMaxSeqLen)
+        if (seqLen <= 0)
         {
+            LOG_ERROR("Qwen3-TTS direct Talker prefill seqLen out of range: %d (max %d)", seqLen, mMaxSeqLen);
+            return false;
+        }
+        if (seqLen > mMaxSeqLen)
+        {
+            if (!mHasDualProfiles && mMaxSeqLen == 1)
+            {
+                LOG_INFO("Qwen3-TTS direct Talker using iterative prefill: seqLen=%d", seqLen);
+                size_t const hidden = static_cast<size_t>(mConfig.hiddenSize);
+                std::vector<float> step(inputEmbeds.begin(), inputEmbeds.begin() + hidden);
+                if (!prefill(step, 1, outputLogits, outputHiddenStates))
+                {
+                    return false;
+                }
+                for (int32_t pos = 1; pos < seqLen; ++pos)
+                {
+                    auto const begin = inputEmbeds.begin() + static_cast<size_t>(pos) * hidden;
+                    step.assign(begin, begin + hidden);
+                    if (!decode(step, outputLogits, outputHiddenStates))
+                    {
+                        LOG_ERROR("Qwen3-TTS direct Talker iterative prefill failed at token %d/%d", pos + 1, seqLen);
+                        return false;
+                    }
+                }
+                return true;
+            }
             LOG_ERROR("Qwen3-TTS direct Talker prefill seqLen out of range: %d (max %d)", seqLen, mMaxSeqLen);
             return false;
         }
@@ -1244,9 +1288,9 @@ public:
 
     bool decode(std::vector<float> const& inputEmbed, rt::Tensor& outputLogits, rt::Tensor& outputHiddenStates)
     {
-        if (mSeqLen <= 0 || mSeqLen >= mMaxSeqLen)
+        if (mSeqLen <= 0 || mSeqLen >= mMaxKVSeqLen)
         {
-            LOG_ERROR("Qwen3-TTS direct Talker decode seqLen out of range: %d (max %d)", mSeqLen, mMaxSeqLen);
+            LOG_ERROR("Qwen3-TTS direct Talker decode seqLen out of range: %d (maxKV %d)", mSeqLen, mMaxKVSeqLen);
             return false;
         }
 
@@ -1343,14 +1387,15 @@ private:
         size_t const embedBytes = static_cast<size_t>(mMaxSeqLen) * mConfig.hiddenSize * mInputElementSize;
         size_t const logitsBytes = static_cast<size_t>(mMaxSeqLen) * mConfig.vocabSize * mLogitsElementSize;
         size_t const hiddenBytes = static_cast<size_t>(mMaxSeqLen) * mConfig.hiddenSize * mHiddenElementSize;
-        size_t const kvBytes = static_cast<size_t>(mConfig.numKVHeads) * mMaxSeqLen * mConfig.headDim * mKVElementSize;
+        size_t const kvBytes = static_cast<size_t>(mConfig.numKVHeads) * mMaxKVSeqLen * mConfig.headDim * mKVElementSize;
+        size_t const maskLength = static_cast<size_t>(std::max(mMaxSeqLen, mMaxKVSeqLen + 1));
         mDeviceEmbeds.allocate(embedBytes);
         mDeviceLogits.allocate(logitsBytes);
         mDeviceHidden.allocate(hiddenBytes);
         mDevicePositionIds.allocate(static_cast<size_t>(mMaxSeqLen) * sizeof(int64_t));
-        mDeviceAttentionMask.allocate(static_cast<size_t>(mMaxSeqLen) * sizeof(int64_t));
+        mDeviceAttentionMask.allocate(maskLength * sizeof(int64_t));
         mDeviceDummyKV.allocate(16);
-        std::vector<int64_t> mask(static_cast<size_t>(mMaxSeqLen), 1);
+        std::vector<int64_t> mask(maskLength, 1);
         CUDA_CHECK(cudaMemcpyAsync(mDeviceAttentionMask.get(), mask.data(), mask.size() * sizeof(int64_t),
             cudaMemcpyHostToDevice, mStream));
 
@@ -1500,6 +1545,7 @@ private:
 
     LLMEngineRunnerConfig mConfig;
     int32_t mMaxSeqLen{};
+    int32_t mMaxKVSeqLen{};
     int32_t mSeqLen{0};
     int32_t mParity{0};
     cudaStream_t mStream{};
@@ -1744,7 +1790,7 @@ bool Qwen3OmniTTSRuntime::initializeEngineRunners(
             {
                 mTalkerInputEmbedsDataType = nvinfer1::DataType::kFLOAT;
             }
-            mTalkerLLMConfig.maxKVCacheCapacity = mQwen3TTSTalkerEngine->maxSeqLen();
+            mTalkerLLMConfig.maxKVCacheCapacity = mQwen3TTSTalkerEngine->maxKVSeqLen();
             LOG_INFO("Talker execution will use explicit-KV Qwen3-TTS engine override.");
             LOG_INFO("Text projection mode: %s", mUseHostTextProjection ? "host_fp32" : "device");
             LOG_INFO("Qwen3-TTS prompt KV cache: %s", mRuntimeOptions.qwen3TtsPromptKvCache ? "enabled" : "disabled");
@@ -2246,6 +2292,10 @@ bool Qwen3OmniTTSRuntime::loadTalkerWeights(std::string const& weightsDir, cudaS
     mTextEmbeddingTable = std::move(textEmbedTensors[0]);
     LOG_INFO("Text embedding table loaded: [%lld, %lld]", mTextEmbeddingTable.getShape()[0],
         mTextEmbeddingTable.getShape()[1]);
+    if (!loadTextTokenMap(std::filesystem::path(weightsDir)))
+    {
+        return false;
+    }
 
     // Load Talker embedding table
     std::filesystem::path const talkerEmbedPath = std::filesystem::path(weightsDir) / "embedding.safetensors";
@@ -2281,6 +2331,114 @@ bool Qwen3OmniTTSRuntime::loadTalkerWeights(std::string const& weightsDir, cudaS
     return true;
 }
 
+bool Qwen3OmniTTSRuntime::loadTextTokenMap(std::filesystem::path const& weightsDir)
+{
+    mUsePrunedTextEmbedding = false;
+    mTextTokenIdToPrunedRow.clear();
+
+    std::filesystem::path const tokenMapPath = weightsDir / "token_map.bin";
+    if (!std::filesystem::exists(tokenMapPath))
+    {
+        return true;
+    }
+
+    auto const textShape = mTextEmbeddingTable.getShape();
+    if (textShape.getNumDims() != 2)
+    {
+        LOG_ERROR("Cannot load token_map.bin before a 2D text embedding table is available");
+        return false;
+    }
+    int64_t const prunedRows = textShape[0];
+
+    std::ifstream file(tokenMapPath, std::ios::binary | std::ios::ate);
+    if (!file)
+    {
+        LOG_ERROR("Failed to open text token map: %s", tokenMapPath.string().c_str());
+        return false;
+    }
+    std::streamsize const bytes = file.tellg();
+    if (bytes <= 0 || bytes % static_cast<std::streamsize>(sizeof(int32_t)) != 0)
+    {
+        LOG_ERROR("Invalid token_map.bin size: %lld", static_cast<long long>(bytes));
+        return false;
+    }
+    int64_t const entries = bytes / static_cast<std::streamsize>(sizeof(int32_t));
+    if (entries != prunedRows)
+    {
+        LOG_ERROR("token_map.bin entries (%lld) do not match text embedding rows (%lld)", entries, prunedRows);
+        return false;
+    }
+
+    std::vector<int32_t> prunedRowToOrigToken(static_cast<size_t>(entries));
+    file.seekg(0, std::ios::beg);
+    file.read(reinterpret_cast<char*>(prunedRowToOrigToken.data()), bytes);
+    if (file.gcount() != bytes)
+    {
+        LOG_ERROR("Failed to read complete token_map.bin: %s", tokenMapPath.string().c_str());
+        return false;
+    }
+
+    int32_t maxOrigTokenId = 0;
+    for (int32_t origTokenId : prunedRowToOrigToken)
+    {
+        if (origTokenId < 0)
+        {
+            LOG_ERROR("token_map.bin contains negative token id: %d", origTokenId);
+            return false;
+        }
+        maxOrigTokenId = std::max(maxOrigTokenId, origTokenId);
+    }
+
+    mTextTokenIdToPrunedRow.assign(static_cast<size_t>(maxOrigTokenId) + 1, -1);
+    for (int32_t row = 0; row < static_cast<int32_t>(prunedRowToOrigToken.size()); ++row)
+    {
+        int32_t const origTokenId = prunedRowToOrigToken[static_cast<size_t>(row)];
+        int32_t& mappedRow = mTextTokenIdToPrunedRow[static_cast<size_t>(origTokenId)];
+        if (mappedRow >= 0)
+        {
+            LOG_ERROR("token_map.bin contains duplicate original token id: %d", origTokenId);
+            return false;
+        }
+        mappedRow = row;
+    }
+
+    mUsePrunedTextEmbedding = true;
+    LOG_INFO("Loaded pruned text token map: rows=%lld, max_orig_token_id=%d", entries, maxOrigTokenId);
+    return true;
+}
+
+int32_t Qwen3OmniTTSRuntime::mapTextTokenId(int32_t tokenId, char const* context) const
+{
+    if (!mUsePrunedTextEmbedding)
+    {
+        return tokenId;
+    }
+    if (tokenId < 0 || static_cast<size_t>(tokenId) >= mTextTokenIdToPrunedRow.size()
+        || mTextTokenIdToPrunedRow[static_cast<size_t>(tokenId)] < 0)
+    {
+        throw std::runtime_error(std::string("Pruned text embedding missing token id ")
+            + std::to_string(tokenId) + " while mapping " + (context ? context : "text token"));
+    }
+    return mTextTokenIdToPrunedRow[static_cast<size_t>(tokenId)];
+}
+
+std::vector<int32_t> Qwen3OmniTTSRuntime::mapTextTokenIds(
+    std::vector<int32_t> const& tokenIds, char const* context) const
+{
+    if (!mUsePrunedTextEmbedding)
+    {
+        return tokenIds;
+    }
+
+    std::vector<int32_t> mapped;
+    mapped.reserve(tokenIds.size());
+    for (int32_t tokenId : tokenIds)
+    {
+        mapped.push_back(mapTextTokenId(tokenId, context));
+    }
+    return mapped;
+}
+
 void Qwen3OmniTTSRuntime::initializeTTSEmbeddings(cudaStream_t stream)
 {
     NVTX_SCOPED_RANGE(nvtx_range, "TalkerRunner::initializeTTSEmbeddings", nvtx_colors::YELLOW);
@@ -2294,17 +2452,17 @@ void Qwen3OmniTTSRuntime::initializeTTSEmbeddings(cudaStream_t stream)
     int64_t const vocabSize = shape[0];
     int64_t const thinkerHiddenSize = shape[1];
 
-    if (mTalkerConfig.ttsPadTokenId >= vocabSize || mTalkerConfig.ttsBosTokenId >= vocabSize
-        || mTalkerConfig.ttsEosTokenId >= vocabSize)
+    constexpr int32_t kNumTtsTokens = 3;
+    std::vector<int32_t> const hostTtsIdsOrig
+        = {mTalkerConfig.ttsPadTokenId, mTalkerConfig.ttsBosTokenId, mTalkerConfig.ttsEosTokenId};
+    std::vector<int32_t> const hostTtsIds = mapTextTokenIds(hostTtsIdsOrig, "TTS special token");
+
+    if (hostTtsIds[0] >= vocabSize || hostTtsIds[1] >= vocabSize || hostTtsIds[2] >= vocabSize)
     {
         throw std::runtime_error("TTS token IDs out of vocab range: pad=" + std::to_string(mTalkerConfig.ttsPadTokenId)
             + ", bos=" + std::to_string(mTalkerConfig.ttsBosTokenId)
             + ", eos=" + std::to_string(mTalkerConfig.ttsEosTokenId) + ", vocabSize=" + std::to_string(vocabSize));
     }
-
-    constexpr int32_t kNumTtsTokens = 3;
-    std::vector<int32_t> const hostTtsIds
-        = {mTalkerConfig.ttsPadTokenId, mTalkerConfig.ttsBosTokenId, mTalkerConfig.ttsEosTokenId};
 
     rt::Tensor ttsIds({1, kNumTtsTokens}, rt::DeviceType::kGPU, nvinfer1::DataType::kINT32);
     rt::Tensor ttsRaw({1, kNumTtsTokens, thinkerHiddenSize}, rt::DeviceType::kGPU, nvinfer1::DataType::kHALF);
@@ -2736,8 +2894,9 @@ bool Qwen3OmniTTSRuntime::prepareTalkerInput(std::vector<int32_t> const& textTok
         return false;
     }
     int64_t const thinkerHiddenSize = mTextEmbeddingTable.getShape()[1];
+    std::vector<int32_t> const mappedTextTokenIds = mapTextTokenIds(textTokenIds, "text token");
     check::check(mGpuTokenIdsBuffer.reshape({1, seqLen}), "Tensor reshape failed");
-    CUDA_CHECK(cudaMemcpyAsync(mGpuTokenIdsBuffer.rawPointer(), textTokenIds.data(), seqLen * sizeof(int32_t),
+    CUDA_CHECK(cudaMemcpyAsync(mGpuTokenIdsBuffer.rawPointer(), mappedTextTokenIds.data(), seqLen * sizeof(int32_t),
         cudaMemcpyHostToDevice, stream));
     check::check(mThinkerEmbedBuffer.reshape({1, seqLen, thinkerHiddenSize}), "Tensor reshape failed");
     kernel::embeddingLookup(mGpuTokenIdsBuffer, mTextEmbeddingTable, std::nullopt, mThinkerEmbedBuffer, stream);

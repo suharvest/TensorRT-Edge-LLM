@@ -339,6 +339,9 @@ private:
 
     // ========== Embedding Tables ==========
     rt::Tensor mTextEmbeddingTable; //!< Text embedding table [thinkerVocabSize, thinkerHiddenSize] (for standalone TTS)
+    std::vector<int32_t>
+        mTextTokenIdToPrunedRow; //!< Optional original thinker token ID -> pruned text embedding row mapping
+    bool mUsePrunedTextEmbedding{false};
     rt::Tensor mTalkerEmbeddingTable; //!< Talker LLM embedding table [vocabSize, hiddenSize]
     std::vector<rt::Tensor>
         mCodePredictorEmbeddingTables; //!< CodePredictor embedding tables (15 layers) [codebookSize, hiddenSize]
@@ -486,6 +489,9 @@ private:
      * @return True on success, false on failure
      */
     bool loadTalkerWeights(std::string const& weightsDir, cudaStream_t stream);
+    bool loadTextTokenMap(std::filesystem::path const& weightsDir);
+    int32_t mapTextTokenId(int32_t tokenId, char const* context) const;
+    std::vector<int32_t> mapTextTokenIds(std::vector<int32_t> const& tokenIds, char const* context) const;
 };
 
 } // namespace rt
