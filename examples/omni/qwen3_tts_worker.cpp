@@ -8,6 +8,7 @@
 #include "common/logger.h"
 #include "common/trtUtils.h"
 #include "multimodal/code2WavRunner.h"
+#include "multimodal/statefulCode2WavRunner.h"
 #include "runtime/llmRuntimeUtils.h"
 #include "runtime/qwen3OmniTTSRuntime.h"
 #include <algorithm>
@@ -362,6 +363,18 @@ std::vector<float> synthesizeWindow(
     }
     return std::vector<float>(samples.begin() + skipSamples, samples.end());
 }
+
+std::vector<float> synthesizeStatefulChunk(
+    StatefulCode2WavRunner& code2wavRunner, std::vector<std::vector<int32_t>> const& chunkCodes, bool isFinal,
+    cudaStream_t stream)
+{
+    rt::audioUtils::AudioData audioOutput;
+    if (!code2wavRunner.generateChunk(chunkCodes, isFinal, audioOutput, stream))
+    {
+        throw std::runtime_error("Stateful Code2Wav chunk generation failed");
+    }
+    return audioToFloatSamples(audioOutput);
+}
 } // namespace
 
 int main(int argc, char** argv)
@@ -385,9 +398,14 @@ int main(int argc, char** argv)
 
     std::unique_ptr<Qwen3OmniTTSRuntime> ttsRuntime;
     std::unique_ptr<Code2WavRunner> code2wavRunner;
+    std::unique_ptr<StatefulCode2WavRunner> statefulCode2wavRunner;
     cudaStream_t asyncCode2WavStream{};
     std::unique_ptr<Code2WavRunner> asyncCode2wavRunner;
     bool const lazyCode2Wav = envIsOne("EDGE_LLM_TTS_LAZY_CODE2WAV");
+    bool const statefulCode2Wav = envIsOne("EDGE_LLM_TTS_STATEFUL_CODE2WAV");
+    std::string const statefulCode2WavEngineDir = std::getenv("EDGE_LLM_TTS_STATEFUL_CODE2WAV_ENGINE_DIR") != nullptr
+        ? std::string(std::getenv("EDGE_LLM_TTS_STATEFUL_CODE2WAV_ENGINE_DIR"))
+        : args.code2wavEngineDir;
     int32_t const code2WavContextFrameCap = envIntOr("EDGE_LLM_TTS_CODE2WAV_CONTEXT_FRAMES", -1);
     auto getAsyncCode2WavRunner = [&]() -> Code2WavRunner& {
         if (!asyncCode2wavRunner)
@@ -423,7 +441,13 @@ int main(int argc, char** argv)
         ttsRuntime = std::make_unique<Qwen3OmniTTSRuntime>(
             args.talkerEngineDir, args.codePredictorEngineDir, args.tokenizerDir, stream, runtimeOptions);
         logMemTag("worker_after_tts_runtime");
-        if (lazyCode2Wav)
+        if (statefulCode2Wav)
+        {
+            logMemTag("worker_before_stateful_code2wav");
+            statefulCode2wavRunner = std::make_unique<StatefulCode2WavRunner>(statefulCode2WavEngineDir, stream);
+            logMemTag("worker_after_stateful_code2wav");
+        }
+        else if (lazyCode2Wav)
         {
             logMemTag("worker_skip_code2wav_lazy");
         }
@@ -503,6 +527,14 @@ int main(int argc, char** argv)
             {
                 throw std::runtime_error("Unsupported chunk_transport: " + chunkTransport);
             }
+            if (statefulCode2Wav && asyncCode2Wav)
+            {
+                throw std::runtime_error("Stateful Code2Wav does not support async_code2wav yet");
+            }
+            if (statefulCode2Wav && !streamOutput)
+            {
+                throw std::runtime_error("Stateful Code2Wav currently requires stream=true");
+            }
 
             auto request = buildRequest(item);
             Qwen3OmniTTSRuntime::TalkerGenerationResponse talkerResponse;
@@ -566,6 +598,50 @@ int main(int argc, char** argv)
                     return;
                 }
 
+                if (statefulCode2Wav)
+                {
+                    if (!statefulCode2wavRunner)
+                    {
+                        logMemTag("worker_before_stateful_code2wav");
+                        statefulCode2wavRunner
+                            = std::make_unique<StatefulCode2WavRunner>(statefulCode2WavEngineDir, stream);
+                        logMemTag("worker_after_stateful_code2wav");
+                    }
+                    auto const chunkCodes = transposeFrameWindow(
+                        streamedFrames, static_cast<size_t>(lastEmittedFrames), static_cast<size_t>(totalFrames));
+                    auto const chunkStart = std::chrono::steady_clock::now();
+                    logMemTag(isFinal ? "worker_before_stateful_code2wav_final_chunk"
+                                      : "worker_before_stateful_code2wav_chunk");
+                    auto samples = synthesizeStatefulChunk(*statefulCode2wavRunner, chunkCodes, isFinal, stream);
+                    auto const chunkEnd = std::chrono::steady_clock::now();
+                    logMemTag(isFinal ? "worker_after_stateful_code2wav_final_chunk"
+                                      : "worker_after_stateful_code2wav_chunk");
+                    if (samples.empty())
+                    {
+                        lastEmittedFrames = totalFrames;
+                        scheduleNextChunk();
+                        return;
+                    }
+                    if (chunkIndex == 0)
+                    {
+                        firstChunkAt = chunkEnd;
+                    }
+
+                    auto pcm = floatSamplesToPcm16(samples);
+                    streamedSamples += static_cast<int64_t>(pcm.size());
+                    double const code2wavMs = std::chrono::duration<double, std::milli>(chunkEnd - chunkStart).count();
+                    streamedCode2WavMs += code2wavMs;
+                    code2wavInputFrames += static_cast<int64_t>(chunkCodes.empty() ? 0 : chunkCodes[0].size());
+
+                    writeChunk(chunkIndex, isFinal, totalFrames, pcm, code2wavMs, chunkEnd,
+                        statefulCode2wavRunner->getConfig().sampleRate);
+
+                    lastEmittedFrames = totalFrames;
+                    scheduleNextChunk();
+                    ++chunkIndex;
+                    return;
+                }
+
                 if (!code2wavRunner)
                 {
                     logMemTag("worker_before_lazy_code2wav");
@@ -615,6 +691,10 @@ int main(int argc, char** argv)
             auto const genStart = std::chrono::steady_clock::now();
             bool ok = false;
             std::chrono::steady_clock::time_point genEnd{};
+            if (statefulCode2Wav && statefulCode2wavRunner)
+            {
+                statefulCode2wavRunner->reset(stream);
+            }
             if (streamOutput && asyncCode2Wav)
             {
                 Code2WavRunner& asyncRunner = getAsyncCode2WavRunner();
@@ -765,7 +845,8 @@ int main(int argc, char** argv)
             if (streamOnly)
             {
                 auto const doneAt = std::chrono::steady_clock::now();
-                int32_t const sampleRate = code2wavRunner->getConfig().sampleRate;
+                int32_t const sampleRate
+                    = statefulCode2Wav ? statefulCode2wavRunner->getConfig().sampleRate : code2wavRunner->getConfig().sampleRate;
                 double const audioSeconds = static_cast<double>(streamedSamples) / sampleRate;
                 double const totalMs = std::chrono::duration<double, std::milli>(doneAt - requestStart).count();
                 response = Json{{"id", id},
@@ -777,11 +858,15 @@ int main(int argc, char** argv)
                     {"sample_rate", sampleRate},
                     {"audio_s", audioSeconds},
                     {"async_code2wav", asyncCode2Wav},
+                    {"stateful_code2wav", statefulCode2Wav},
                     {"adaptive_chunks", adaptiveChunks},
                     {"chunk_frames", chunkFrames},
                     {"chunk_growth_frames", chunkGrowthFrames},
                     {"max_chunk_frames", maxChunkFrames},
                     {"chunk_count", chunkIndex},
+                    {"audio_complete", true},
+                    {"final_chunk_index", chunkIndex > 0 ? chunkIndex - 1 : -1},
+                    {"last_chunk_was_final", chunkIndex > 0 && lastEmittedFrames == talkerResponse.numFrames},
                     {"code2wav_input_frames", code2wavInputFrames},
                     {"code2wav_context_frames", code2wavContextFrames},
                     {"code2wav_context_ratio",
