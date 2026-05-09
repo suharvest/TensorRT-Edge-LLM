@@ -689,6 +689,7 @@ public:
         mLogitsAreBf16 = mEngine->getTensorDataType(mLogitsName.c_str()) == nvinfer1::DataType::kBF16;
         mDumpDebug = std::getenv("QWEN3_TTS_DUMP_CP") != nullptr;
         mGreedy = std::getenv("QWEN3_TTS_GREEDY") != nullptr;
+        mProfile = std::getenv("QWEN3_TTS_CP_PROFILE") != nullptr;
 
         mPastKeyNames.reserve(mNumLayers);
         mPastValueNames.reserve(mNumLayers);
@@ -771,10 +772,13 @@ private:
     bool generatePreparedInputs(
         int32_t activeGroups, int32_t topK, float topP, float temperature, std::vector<int32_t>& residualCodes)
     {
+        auto const frameStart = Clock::now();
+        size_t const bytes = static_cast<size_t>(mHiddenSize) * sizeof(float);
         int64_t const prefillCachePositions[2] = {0, 1};
         CUDA_CHECK(cudaMemcpyAsync(mDeviceCachePosition.get(), prefillCachePositions, sizeof(prefillCachePositions),
             cudaMemcpyHostToDevice, mStream));
 
+        auto const prefillSetupStart = Clock::now();
         nvinfer1::IExecutionContext* prefill = mPrefillContext.get();
         setScalar(mDeviceGenStep.get(), 0);
         setScalar(mDevicePastLength.get(), 0);
@@ -800,6 +804,7 @@ private:
             prefill->setTensorAddress(mNewPastValueNames[i].c_str(), mKVB[2 * i + 1].get());
         }
         prefill->setTensorAddress(mLogitsName.c_str(), mDeviceLogits.get());
+        profileAdd(mProfilePrefillSetupMs, prefillSetupStart);
         if (!prefill->enqueueV3(mStream))
         {
             LOG_ERROR("Qwen3-TTS CodePredictor prefill failed");
@@ -827,6 +832,7 @@ private:
         int32_t const groupsToGenerate = std::min(activeGroups, mNumGroups);
         for (int32_t j = 1; j < groupsToGenerate; ++j)
         {
+            auto const embedStart = Clock::now();
             if (mUseDeviceEmbeddingTable)
             {
                 CUDA_CHECK(cudaMemcpyAsync(mDeviceEmbeds.get(), embeddingDevice(j - 1, residualCodes[j - 1]), bytes,
@@ -837,6 +843,13 @@ private:
                 CUDA_CHECK(cudaMemcpyAsync(mDeviceEmbeds.get(), embedding(j - 1, residualCodes[j - 1]), bytes,
                     cudaMemcpyHostToDevice, mStream));
             }
+            profileAdd(mProfileEmbedCopyMs, embedStart);
+            if (mProfile)
+            {
+                ++mProfileDecodeGroups;
+            }
+
+            auto const decodeSetupStart = Clock::now();
             int64_t const actualPast = j + 1;
             setScalar(mDeviceGenStep.get(), j);
             setScalar(mDevicePastLength.get(), actualPast);
@@ -850,6 +863,7 @@ private:
                 decode->setTensorAddress(mNewPastKeyNames[i].c_str(), (*write)[2 * i].get());
                 decode->setTensorAddress(mNewPastValueNames[i].c_str(), (*write)[2 * i + 1].get());
             }
+            profileAdd(mProfileDecodeSetupMs, decodeSetupStart);
             if (!decode->enqueueV3(mStream))
             {
                 LOG_ERROR("Qwen3-TTS CodePredictor decode failed at group %d", j);
@@ -857,6 +871,16 @@ private:
             }
             residualCodes[j] = sampleDeviceLogits(j, topK, topP, temperature);
             std::swap(read, write);
+        }
+        if (mProfile)
+        {
+            ++mProfileFrames;
+            mProfileGroups += groupsToGenerate;
+            mProfileFrameTotalMs += elapsedMs(frameStart);
+            if (mProfileFrames % 25 == 0)
+            {
+                logProfile();
+            }
         }
         return true;
     }
@@ -982,8 +1006,37 @@ private:
         CUDA_CHECK(cudaMemcpyAsync(devicePtr, &value, sizeof(int64_t), cudaMemcpyHostToDevice, mStream));
     }
 
+    using Clock = std::chrono::steady_clock;
+
+    static double elapsedMs(Clock::time_point start)
+    {
+        return std::chrono::duration<double, std::milli>(Clock::now() - start).count();
+    }
+
+    void profileAdd(double& target, Clock::time_point start)
+    {
+        if (mProfile)
+        {
+            target += elapsedMs(start);
+        }
+    }
+
+    void logProfile() const
+    {
+        double const frames = static_cast<double>(std::max<int64_t>(1, mProfileFrames));
+        double const groups = static_cast<double>(std::max<int64_t>(1, mProfileGroups));
+        double const decodeGroups = static_cast<double>(std::max<int64_t>(1, mProfileDecodeGroups));
+        LOG_WARNING("Qwen3-TTS CP profile frames=%lld groups=%lld frame_ms=%.3f prefill_setup_ms=%.3f "
+                    "decode_setup_ms/group=%.3f embed_copy_ms/group=%.3f sample_wait_ms/group=%.3f "
+                    "sample_cpu_ms/group=%.3f",
+            static_cast<long long>(mProfileFrames), static_cast<long long>(mProfileGroups),
+            mProfileFrameTotalMs / frames, mProfilePrefillSetupMs / frames, mProfileDecodeSetupMs / decodeGroups,
+            mProfileEmbedCopyMs / decodeGroups, mProfileSampleWaitMs / groups, mProfileSampleCpuMs / groups);
+    }
+
     int32_t sampleDeviceLogits(int32_t group, int32_t topK, float topP, float temperature)
     {
+        auto const waitStart = Clock::now();
         size_t const offset = mLogitsName == "logits_all" ? static_cast<size_t>(group) * mCodebookSize : 0;
         if (mLogitsElementSize == sizeof(float))
         {
@@ -1004,6 +1057,9 @@ private:
             }
         }
         CUDA_CHECK(cudaStreamSynchronize(mStream));
+        profileAdd(mProfileSampleWaitMs, waitStart);
+
+        auto const cpuStart = Clock::now();
         static bool dumpedFirstCpGroup0Logits = false;
         if (mDumpDebug && group == 0 && !dumpedFirstCpGroup0Logits)
         {
@@ -1073,7 +1129,9 @@ private:
             }
         }
         std::discrete_distribution<int32_t> dist(mSampleProbs.begin(), mSampleProbs.begin() + k);
-        return mSampleVals[dist(mRng)].second;
+        int32_t const token = mSampleVals[dist(mRng)].second;
+        profileAdd(mProfileSampleCpuMs, cpuStart);
+        return token;
     }
     int32_t mHiddenSize{};
     int32_t mCodebookSize{};
@@ -1099,6 +1157,16 @@ private:
     bool mUseDeviceEmbeddingTable{false};
     bool mDumpDebug{false};
     bool mGreedy{false};
+    bool mProfile{false};
+    int64_t mProfileFrames{0};
+    int64_t mProfileGroups{0};
+    int64_t mProfileDecodeGroups{0};
+    double mProfileFrameTotalMs{0.0};
+    double mProfilePrefillSetupMs{0.0};
+    double mProfileDecodeSetupMs{0.0};
+    double mProfileEmbedCopyMs{0.0};
+    double mProfileSampleWaitMs{0.0};
+    double mProfileSampleCpuMs{0.0};
     size_t mKVElementSize{4};
     size_t mLogitsElementSize{4};
     DeviceBuffer mDeviceEmbeds;
@@ -2679,7 +2747,7 @@ bool Qwen3OmniTTSRuntime::projectToTalkerInput(
         mTalkerConfig.codecThinkId, mTalkerConfig.codecThinkBosId,
         langId, mTalkerConfig.codecThinkEosId,
         mTalkerConfig.codecPadId, mTalkerConfig.codecBosId,
-        output, stream);
+        static_cast<int32_t>(N), output, stream);
 
     return true;
 }
@@ -3670,11 +3738,8 @@ bool Qwen3OmniTTSRuntime::computeResidualConnection(
         addend = mTtsPadEmbed.dataPointer<__half>();
     }
 
-    int32_t const activeGroups = mQwen3TTSCodePredictorEngine
-        ? getQwen3TTSActiveCodePredictorGroups()
-        : talker_constants::kNumRvqLayers;
     kernel::invokeResidualConnection(mCodecHiddensBuffer, mTalkerEmbeddingTable, mCodePredictorEmbeddingTables[14],
-        codes[0], codes[15], activeGroups, addend, outputResidual, stream);
+        codes[0], codes[15], addend, outputResidual, stream);
 
     return true;
 }
