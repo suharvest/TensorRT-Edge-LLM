@@ -687,6 +687,8 @@ public:
         mKVElementSize = trtElementSize(mEngine->getTensorDataType("new_past_key_0"));
         mLogitsElementSize = trtElementSize(mEngine->getTensorDataType(mLogitsName.c_str()));
         mLogitsAreBf16 = mEngine->getTensorDataType(mLogitsName.c_str()) == nvinfer1::DataType::kBF16;
+        mDumpDebug = std::getenv("QWEN3_TTS_DUMP_CP") != nullptr;
+        mGreedy = std::getenv("QWEN3_TTS_GREEDY") != nullptr;
 
         mPastKeyNames.reserve(mNumLayers);
         mPastValueNames.reserve(mNumLayers);
@@ -706,6 +708,22 @@ public:
         mDevicePastLength.allocate(sizeof(int64_t));
         mDeviceDummyKV.allocate(16);
         mDeviceLogits.allocate(static_cast<size_t>(mNumGroups) * mCodebookSize * mLogitsElementSize);
+        if (std::getenv("QWEN3_TTS_CP_DEVICE_EMBEDDINGS") != nullptr
+            && std::string(std::getenv("QWEN3_TTS_CP_DEVICE_EMBEDDINGS")) != "0")
+        {
+            size_t const embeddingBytes = mEmbeddings.size() * sizeof(float);
+            mDeviceEmbeddingTable.allocate(embeddingBytes);
+            CUDA_CHECK(cudaMemcpyAsync(
+                mDeviceEmbeddingTable.get(), mEmbeddings.data(), embeddingBytes, cudaMemcpyHostToDevice, mStream));
+            mUseDeviceEmbeddingTable = true;
+            LOG_INFO("Qwen3-TTS CP device embedding table enabled: %.1f MiB",
+                static_cast<double>(embeddingBytes) / (1024.0 * 1024.0));
+        }
+
+        mSampleLogits.resize(static_cast<size_t>(mCodebookSize));
+        mSampleRaw.resize(static_cast<size_t>(mCodebookSize));
+        mSampleVals.resize(static_cast<size_t>(mCodebookSize));
+        mSampleProbs.resize(static_cast<size_t>(mCodebookSize));
 
         std::vector<int64_t> cachePositions(32);
         for (int32_t i = 0; i < static_cast<int32_t>(cachePositions.size()); ++i)
@@ -746,6 +764,13 @@ public:
         CUDA_CHECK(cudaMemcpyAsync(mDeviceEmbeds.get(), hidden.data(), bytes, cudaMemcpyHostToDevice, mStream));
         CUDA_CHECK(cudaMemcpyAsync(static_cast<char*>(mDeviceEmbeds.get()) + bytes, primaryEmbedding.data(), bytes,
             cudaMemcpyHostToDevice, mStream));
+        return generatePreparedInputs(activeGroups, topK, topP, temperature, residualCodes);
+    }
+
+private:
+    bool generatePreparedInputs(
+        int32_t activeGroups, int32_t topK, float topP, float temperature, std::vector<int32_t>& residualCodes)
+    {
         int64_t const prefillCachePositions[2] = {0, 1};
         CUDA_CHECK(cudaMemcpyAsync(mDeviceCachePosition.get(), prefillCachePositions, sizeof(prefillCachePositions),
             cudaMemcpyHostToDevice, mStream));
@@ -802,8 +827,16 @@ public:
         int32_t const groupsToGenerate = std::min(activeGroups, mNumGroups);
         for (int32_t j = 1; j < groupsToGenerate; ++j)
         {
-            float const* embed = embedding(j - 1, residualCodes[j - 1]);
-            CUDA_CHECK(cudaMemcpyAsync(mDeviceEmbeds.get(), embed, bytes, cudaMemcpyHostToDevice, mStream));
+            if (mUseDeviceEmbeddingTable)
+            {
+                CUDA_CHECK(cudaMemcpyAsync(mDeviceEmbeds.get(), embeddingDevice(j - 1, residualCodes[j - 1]), bytes,
+                    cudaMemcpyDeviceToDevice, mStream));
+            }
+            else
+            {
+                CUDA_CHECK(cudaMemcpyAsync(mDeviceEmbeds.get(), embedding(j - 1, residualCodes[j - 1]), bytes,
+                    cudaMemcpyHostToDevice, mStream));
+            }
             int64_t const actualPast = j + 1;
             setScalar(mDeviceGenStep.get(), j);
             setScalar(mDevicePastLength.get(), actualPast);
@@ -828,7 +861,6 @@ public:
         return true;
     }
 
-private:
     struct EngineDeleter
     {
         template <typename T>
@@ -913,6 +945,14 @@ private:
         return mEmbeddings.data() + offset;
     }
 
+    void const* embeddingDevice(int32_t group, int32_t token) const
+    {
+        group = std::clamp(group, 0, mNumGroups - 1);
+        token = std::clamp(token, 0, mCodebookSize - 1);
+        size_t const offset = (static_cast<size_t>(group) * mCodebookSize + token) * mHiddenSize * sizeof(float);
+        return static_cast<char const*>(mDeviceEmbeddingTable.get()) + offset;
+    }
+
     void zeroKV()
     {
         size_t const kvBytes = static_cast<size_t>(mNumHeads) * 32 * mHeadDim * mKVElementSize;
@@ -944,64 +984,62 @@ private:
 
     int32_t sampleDeviceLogits(int32_t group, int32_t topK, float topP, float temperature)
     {
-        std::vector<float> logits(static_cast<size_t>(mCodebookSize));
         size_t const offset = mLogitsName == "logits_all" ? static_cast<size_t>(group) * mCodebookSize : 0;
         if (mLogitsElementSize == sizeof(float))
         {
-            CUDA_CHECK(cudaMemcpyAsync(logits.data(), static_cast<char*>(mDeviceLogits.get()) + offset * sizeof(float),
-                logits.size() * sizeof(float), cudaMemcpyDeviceToHost, mStream));
+            CUDA_CHECK(cudaMemcpyAsync(mSampleLogits.data(),
+                static_cast<char*>(mDeviceLogits.get()) + offset * sizeof(float),
+                mSampleLogits.size() * sizeof(float), cudaMemcpyDeviceToHost, mStream));
         }
         else
         {
-            std::vector<uint16_t> raw(logits.size());
-            CUDA_CHECK(cudaMemcpyAsync(raw.data(), static_cast<char*>(mDeviceLogits.get()) + offset * mLogitsElementSize,
-                raw.size() * mLogitsElementSize, cudaMemcpyDeviceToHost, mStream));
+            CUDA_CHECK(cudaMemcpyAsync(mSampleRaw.data(),
+                static_cast<char*>(mDeviceLogits.get()) + offset * mLogitsElementSize,
+                mSampleRaw.size() * mLogitsElementSize, cudaMemcpyDeviceToHost, mStream));
             CUDA_CHECK(cudaStreamSynchronize(mStream));
-            for (size_t i = 0; i < raw.size(); ++i)
+            for (size_t i = 0; i < mSampleRaw.size(); ++i)
             {
-                uint32_t bits = mLogitsAreBf16 ? (static_cast<uint32_t>(raw[i]) << 16) : halfToFloatBits(raw[i]);
-                std::memcpy(&logits[i], &bits, sizeof(float));
+                uint32_t bits = mLogitsAreBf16 ? (static_cast<uint32_t>(mSampleRaw[i]) << 16) : halfToFloatBits(mSampleRaw[i]);
+                std::memcpy(&mSampleLogits[i], &bits, sizeof(float));
             }
         }
         CUDA_CHECK(cudaStreamSynchronize(mStream));
         static bool dumpedFirstCpGroup0Logits = false;
-        if (group == 0 && !dumpedFirstCpGroup0Logits)
+        if (mDumpDebug && group == 0 && !dumpedFirstCpGroup0Logits)
         {
-            dumpVector("cp_logits_g0_f32.bin", logits);
+            dumpVector("cp_logits_g0_f32.bin", mSampleLogits);
             dumpedFirstCpGroup0Logits = true;
         }
         static int32_t dumpedCpSampleCalls = 0;
-        if (std::getenv("QWEN3_TTS_GREEDY") && dumpedCpSampleCalls < 32)
+        if (mDumpDebug && mGreedy && dumpedCpSampleCalls < 32)
         {
             dumpVector("cp_call_" + std::to_string(dumpedCpSampleCalls) + "_g" + std::to_string(group)
                     + "_logits_f32.bin",
-                logits);
+                mSampleLogits);
             ++dumpedCpSampleCalls;
         }
         int32_t const k = (topK > 0 && topK < mCodebookSize) ? topK : mCodebookSize;
-        std::vector<std::pair<float, int32_t>> vals(static_cast<size_t>(mCodebookSize));
         for (int32_t i = 0; i < mCodebookSize; ++i)
         {
-            vals[i] = {logits[i], i};
+            mSampleVals[i] = {mSampleLogits[i], i};
         }
-        std::partial_sort(vals.begin(), vals.begin() + k, vals.end(),
+        std::partial_sort(mSampleVals.begin(), mSampleVals.begin() + k, mSampleVals.end(),
             [](auto const& a, auto const& b) { return a.first > b.first; });
-        if (std::getenv("QWEN3_TTS_GREEDY"))
+        if (mGreedy)
         {
-            return vals[0].second;
+            return mSampleVals[0].second;
         }
-        double const maxVal = vals[0].first;
-        std::vector<double> probs(static_cast<size_t>(k));
+        double const maxVal = mSampleVals[0].first;
         double sum = 0.0;
         float const temp = temperature > 1e-6f ? temperature : 0.9f;
         for (int32_t i = 0; i < k; ++i)
         {
-            probs[i] = std::exp((static_cast<double>(vals[i].first) - maxVal) / temp);
-            sum += probs[i];
+            mSampleProbs[i] = std::exp((static_cast<double>(mSampleVals[i].first) - maxVal) / temp);
+            sum += mSampleProbs[i];
         }
-        for (auto& p : probs)
+        for (int32_t i = 0; i < k; ++i)
         {
-            p /= sum;
+            mSampleProbs[i] /= sum;
         }
         if (topP > 0.0f && topP < 1.0f)
         {
@@ -1009,7 +1047,7 @@ private:
             int32_t keep = 0;
             for (; keep < k; ++keep)
             {
-                cumulative += probs[static_cast<size_t>(keep)];
+                cumulative += mSampleProbs[static_cast<size_t>(keep)];
                 if (cumulative >= static_cast<double>(topP))
                 {
                     ++keep;
@@ -1019,23 +1057,23 @@ private:
             keep = std::max(1, std::min(keep, k));
             for (int32_t i = keep; i < k; ++i)
             {
-                probs[static_cast<size_t>(i)] = 0.0;
+                mSampleProbs[static_cast<size_t>(i)] = 0.0;
             }
             double filteredSum = 0.0;
-            for (double const p : probs)
+            for (int32_t i = 0; i < k; ++i)
             {
-                filteredSum += p;
+                filteredSum += mSampleProbs[static_cast<size_t>(i)];
             }
             if (filteredSum > 0.0)
             {
-                for (auto& p : probs)
+                for (int32_t i = 0; i < k; ++i)
                 {
-                    p /= filteredSum;
+                    mSampleProbs[static_cast<size_t>(i)] /= filteredSum;
                 }
             }
         }
-        std::discrete_distribution<int32_t> dist(probs.begin(), probs.end());
-        return vals[dist(mRng)].second;
+        std::discrete_distribution<int32_t> dist(mSampleProbs.begin(), mSampleProbs.begin() + k);
+        return mSampleVals[dist(mRng)].second;
     }
     int32_t mHiddenSize{};
     int32_t mCodebookSize{};
@@ -1046,6 +1084,10 @@ private:
     cudaStream_t mStream{};
     std::mt19937 mRng;
     std::vector<float> mEmbeddings;
+    std::vector<float> mSampleLogits;
+    std::vector<uint16_t> mSampleRaw;
+    std::vector<std::pair<float, int32_t>> mSampleVals;
+    std::vector<double> mSampleProbs;
     std::unique_ptr<nvinfer1::IRuntime, EngineDeleter> mRuntime;
     std::unique_ptr<nvinfer1::ICudaEngine, EngineDeleter> mEngine;
     std::unique_ptr<nvinfer1::IExecutionContext, EngineDeleter> mPrefillContext;
@@ -1054,6 +1096,9 @@ private:
     bool mHasGenStep{false};
     bool mHasPastLength{false};
     bool mLogitsAreBf16{false};
+    bool mUseDeviceEmbeddingTable{false};
+    bool mDumpDebug{false};
+    bool mGreedy{false};
     size_t mKVElementSize{4};
     size_t mLogitsElementSize{4};
     DeviceBuffer mDeviceEmbeds;
@@ -1062,6 +1107,7 @@ private:
     DeviceBuffer mDevicePastLength;
     DeviceBuffer mDeviceDummyKV;
     DeviceBuffer mDeviceLogits;
+    DeviceBuffer mDeviceEmbeddingTable;
     std::vector<DeviceBuffer> mKVA;
     std::vector<DeviceBuffer> mKVB;
     std::vector<std::string> mPastKeyNames;
@@ -3428,7 +3474,9 @@ bool Qwen3OmniTTSRuntime::runCodePredictorGenerationForFrame(int32_t codecToken,
     {
         static bool dumpedFirstDirectCpFrame = false;
         static int32_t directCpFrameIndex = 0;
-        bool const shouldDumpDirectCpFrame = !dumpedFirstDirectCpFrame;
+        bool const dumpCpInputs = std::getenv("QWEN3_TTS_DUMP_CP") != nullptr;
+        bool const shouldDumpDirectCpFrame = dumpCpInputs && !dumpedFirstDirectCpFrame;
+        std::vector<int32_t> residualCodes;
         std::vector<float> hiddenHost = canUseTalkerHiddenDirectly
             ? copyTensorToHostFloat(talkerHiddenState, mTalkerConfig.codePredictorHiddenSize, stream)
             : copyTensorToHostFloat(mSmallToMtpProjectedHidden, mTalkerConfig.codePredictorHiddenSize, stream);
@@ -3446,7 +3494,7 @@ bool Qwen3OmniTTSRuntime::runCodePredictorGenerationForFrame(int32_t codecToken,
             primaryEmbeddingHost
                 = copyTensorToHostFloat(mCodePredictorCodecEmbed, mTalkerConfig.codePredictorHiddenSize, stream);
         }
-        if (directCpFrameIndex < 2)
+        if (dumpCpInputs && directCpFrameIndex < 2)
         {
             dumpVector("cp_frame" + std::to_string(directCpFrameIndex) + "_input_hidden_f32.bin", hiddenHost);
             dumpVector("cp_frame" + std::to_string(directCpFrameIndex) + "_input_primary_emb_f32.bin",
@@ -3457,7 +3505,6 @@ bool Qwen3OmniTTSRuntime::runCodePredictorGenerationForFrame(int32_t codecToken,
             dumpVector("cp_input_hidden_f32.bin", hiddenHost);
             dumpVector("cp_input_primary_emb_f32.bin", primaryEmbeddingHost);
         }
-        std::vector<int32_t> residualCodes;
         if (!mQwen3TTSCodePredictorEngine->generate(hiddenHost, primaryEmbeddingHost, activeGroups,
                 samplingParams.topK, samplingParams.topP, samplingParams.temperature, residualCodes))
         {
