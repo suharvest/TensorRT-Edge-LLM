@@ -16,7 +16,7 @@ namespace
 {
 
 constexpr int kThreadsPerBlock = 256;
-constexpr int kOutputTile = 32;
+constexpr int kOutputTile = 16;
 constexpr int kKThreads = kThreadsPerBlock / kOutputTile;
 
 __global__ void w8a16_per_output_reference_kernel(
