@@ -691,6 +691,8 @@ public:
         mDumpDebug = std::getenv("QWEN3_TTS_DUMP_CP") != nullptr;
         mGreedy = std::getenv("QWEN3_TTS_GREEDY") != nullptr;
         mProfile = std::getenv("QWEN3_TTS_CP_PROFILE") != nullptr;
+        bool const requestedDecodeCudaGraph = std::getenv("QWEN3_TTS_CP_DECODE_CUDA_GRAPH") != nullptr
+            && std::string(std::getenv("QWEN3_TTS_CP_DECODE_CUDA_GRAPH")) != "0";
 
         mPastKeyNames.reserve(mNumLayers);
         mPastValueNames.reserve(mNumLayers);
@@ -711,8 +713,22 @@ public:
         mDeviceDummyKV.allocate(16);
         mDeviceLogits.allocate(static_cast<size_t>(mNumGroups) * mCodebookSize * mLogitsElementSize);
         mDeviceSelectedTokens.allocate(static_cast<size_t>(mNumGroups) * sizeof(int32_t));
-        if (std::getenv("QWEN3_TTS_CP_DEVICE_EMBEDDINGS") != nullptr
-            && std::string(std::getenv("QWEN3_TTS_CP_DEVICE_EMBEDDINGS")) != "0")
+        mDeviceDecodeGenSteps.allocate(static_cast<size_t>(mNumGroups) * sizeof(int64_t));
+        mDeviceDecodePastLengths.allocate(static_cast<size_t>(mNumGroups) * sizeof(int64_t));
+        std::vector<int64_t> decodeGenSteps(static_cast<size_t>(mNumGroups));
+        std::vector<int64_t> decodePastLengths(static_cast<size_t>(mNumGroups));
+        for (int32_t i = 0; i < mNumGroups; ++i)
+        {
+            decodeGenSteps[static_cast<size_t>(i)] = i;
+            decodePastLengths[static_cast<size_t>(i)] = i + 1;
+        }
+        CUDA_CHECK(cudaMemcpyAsync(mDeviceDecodeGenSteps.get(), decodeGenSteps.data(),
+            decodeGenSteps.size() * sizeof(int64_t), cudaMemcpyHostToDevice, mStream));
+        CUDA_CHECK(cudaMemcpyAsync(mDeviceDecodePastLengths.get(), decodePastLengths.data(),
+            decodePastLengths.size() * sizeof(int64_t), cudaMemcpyHostToDevice, mStream));
+        bool const requestedDeviceEmbeddings = std::getenv("QWEN3_TTS_CP_DEVICE_EMBEDDINGS") != nullptr
+            && std::string(std::getenv("QWEN3_TTS_CP_DEVICE_EMBEDDINGS")) != "0";
+        if (requestedDeviceEmbeddings || requestedDecodeCudaGraph)
         {
             size_t const embeddingBytes = mEmbeddings.size() * sizeof(float);
             mDeviceEmbeddingTable.allocate(embeddingBytes);
@@ -751,6 +767,17 @@ public:
             LOG_WARNING("Qwen3-TTS CP GPU top-k/top-p sampling enabled "
                         "(experimental; requires TTS/ASR quality gate)");
         }
+        mUseDecodeCudaGraph = requestedDecodeCudaGraph && mUseDeviceEmbeddingTable && !mUseGpuGreedy && !mUseGpuSampling;
+        if (requestedDecodeCudaGraph && !mUseDecodeCudaGraph)
+        {
+            LOG_WARNING("Qwen3-TTS CP decode CUDA graph requested but disabled; requires CPU sampling path and "
+                        "device embedding table.");
+        }
+        if (mUseDecodeCudaGraph)
+        {
+            mDecodeCudaGraphs.resize(static_cast<size_t>(mNumGroups) * 2);
+            LOG_WARNING("Qwen3-TTS CP decode CUDA graph enabled (experimental; CPU sampling keeps token quality)");
+        }
 
         mSampleLogits.resize(static_cast<size_t>(mCodebookSize));
         mSampleRaw.resize(static_cast<size_t>(mCodebookSize));
@@ -776,7 +803,10 @@ public:
         LOG_INFO("Qwen3-TTS CodePredictor enabled: %s", enginePath.string().c_str());
     }
 
-    ~Qwen3TTSCodePredictorEngine() = default;
+    ~Qwen3TTSCodePredictorEngine()
+    {
+        destroyDecodeCudaGraphs();
+    }
 
     void resetSampling()
     {
@@ -883,18 +913,21 @@ private:
         }
 
         nvinfer1::IExecutionContext* decode = mDecodeContext.get();
-        decode->setInputShape("inputs_embeds", nvinfer1::Dims3{1, 1, mHiddenSize});
-        decode->setTensorAddress("inputs_embeds", mDeviceEmbeds.get());
-        decode->setInputShape("cache_position", nvinfer1::Dims{1, {1}});
-        decode->setTensorAddress("cache_position", mDeviceCachePosition.get());
-        decode->setTensorAddress(mLogitsName.c_str(), mDeviceLogits.get());
-        if (mHasGenStep)
+        if (!mUseDecodeCudaGraph)
         {
-            decode->setTensorAddress("gen_step", mDeviceGenStep.get());
-        }
-        if (mHasPastLength)
-        {
-            decode->setTensorAddress("past_length", mDevicePastLength.get());
+            decode->setInputShape("inputs_embeds", nvinfer1::Dims3{1, 1, mHiddenSize});
+            decode->setTensorAddress("inputs_embeds", mDeviceEmbeds.get());
+            decode->setInputShape("cache_position", nvinfer1::Dims{1, {1}});
+            decode->setTensorAddress("cache_position", mDeviceCachePosition.get());
+            decode->setTensorAddress(mLogitsName.c_str(), mDeviceLogits.get());
+            if (mHasGenStep)
+            {
+                decode->setTensorAddress("gen_step", mDeviceGenStep.get());
+            }
+            if (mHasPastLength)
+            {
+                decode->setTensorAddress("past_length", mDevicePastLength.get());
+            }
         }
 
         std::vector<DeviceBuffer>* read = &mKVB;
@@ -903,7 +936,12 @@ private:
         for (int32_t j = 1; j < groupsToGenerate; ++j)
         {
             auto const embedStart = Clock::now();
-            if (mUseGpuGreedy || mUseGpuSampling)
+            if (mUseDecodeCudaGraph)
+            {
+                CUDA_CHECK(cudaMemcpyAsync(static_cast<int32_t*>(mDeviceSelectedTokens.get()) + j - 1,
+                    &residualCodes[j - 1], sizeof(int32_t), cudaMemcpyHostToDevice, mStream));
+            }
+            else if (mUseGpuGreedy || mUseGpuSampling)
             {
                 kernel::qwen3TtsCpGatherEmbedding(static_cast<float const*>(mDeviceEmbeddingTable.get()), mCodebookSize,
                     mHiddenSize, j - 1, static_cast<int32_t const*>(mDeviceSelectedTokens.get()),
@@ -927,20 +965,38 @@ private:
 
             auto const decodeSetupStart = Clock::now();
             int64_t const actualPast = j + 1;
-            setScalar(mDeviceGenStep.get(), j);
-            setScalar(mDevicePastLength.get(), actualPast);
-            CUDA_CHECK(cudaMemcpyAsync(mDeviceCachePosition.get(), &actualPast, sizeof(int64_t), cudaMemcpyHostToDevice, mStream));
-            for (int32_t i = 0; i < mNumLayers; ++i)
+            if (!mUseDecodeCudaGraph)
             {
-                decode->setInputShape(mPastKeyNames[i].c_str(), nvinfer1::Dims4{1, mNumHeads, actualPast, mHeadDim});
-                decode->setInputShape(mPastValueNames[i].c_str(), nvinfer1::Dims4{1, mNumHeads, actualPast, mHeadDim});
-                decode->setTensorAddress(mPastKeyNames[i].c_str(), (*read)[2 * i].get());
-                decode->setTensorAddress(mPastValueNames[i].c_str(), (*read)[2 * i + 1].get());
-                decode->setTensorAddress(mNewPastKeyNames[i].c_str(), (*write)[2 * i].get());
-                decode->setTensorAddress(mNewPastValueNames[i].c_str(), (*write)[2 * i + 1].get());
+                setScalar(mDeviceGenStep.get(), j);
+                setScalar(mDevicePastLength.get(), actualPast);
+                CUDA_CHECK(cudaMemcpyAsync(
+                    mDeviceCachePosition.get(), &actualPast, sizeof(int64_t), cudaMemcpyHostToDevice, mStream));
+                bindDecodeContext(j, actualPast, *read, *write, mDeviceGenStep.get(), mDevicePastLength.get(),
+                    mDeviceCachePosition.get());
             }
             profileAdd(mProfileDecodeSetupMs, decodeSetupStart);
-            if (!decode->enqueueV3(mStream))
+            bool decodeOk = false;
+            if (mUseDecodeCudaGraph)
+            {
+                decodeOk = launchDecodeCudaGraph(j, *read, *write);
+                if (!decodeOk)
+                {
+                    LOG_WARNING("Qwen3-TTS CP decode CUDA graph disabled; falling back to normal decode");
+                    mUseDecodeCudaGraph = false;
+                    setScalar(mDeviceGenStep.get(), j);
+                    setScalar(mDevicePastLength.get(), actualPast);
+                    CUDA_CHECK(cudaMemcpyAsync(
+                        mDeviceCachePosition.get(), &actualPast, sizeof(int64_t), cudaMemcpyHostToDevice, mStream));
+                    bindDecodeContext(j, actualPast, *read, *write, mDeviceGenStep.get(), mDevicePastLength.get(),
+                        mDeviceCachePosition.get());
+                    decodeOk = decode->enqueueV3(mStream);
+                }
+            }
+            else
+            {
+                decodeOk = decode->enqueueV3(mStream);
+            }
+            if (!decodeOk)
             {
                 LOG_ERROR("Qwen3-TTS CodePredictor decode failed at group %d", j);
                 return false;
@@ -1099,6 +1155,135 @@ private:
     void setScalar(void* devicePtr, int64_t value)
     {
         CUDA_CHECK(cudaMemcpyAsync(devicePtr, &value, sizeof(int64_t), cudaMemcpyHostToDevice, mStream));
+    }
+
+    void bindDecodeContext(int32_t group, int64_t actualPast, std::vector<DeviceBuffer> const& read,
+        std::vector<DeviceBuffer> const& write, void* genStepPtr, void* pastLengthPtr, void* cachePositionPtr)
+    {
+        nvinfer1::IExecutionContext* decode = mDecodeContext.get();
+        decode->setInputShape("inputs_embeds", nvinfer1::Dims3{1, 1, mHiddenSize});
+        decode->setTensorAddress("inputs_embeds", mDeviceEmbeds.get());
+        decode->setInputShape("cache_position", nvinfer1::Dims{1, {1}});
+        decode->setTensorAddress("cache_position", cachePositionPtr);
+        decode->setTensorAddress(mLogitsName.c_str(), mDeviceLogits.get());
+        if (mHasGenStep)
+        {
+            decode->setTensorAddress("gen_step", genStepPtr);
+        }
+        if (mHasPastLength)
+        {
+            decode->setTensorAddress("past_length", pastLengthPtr);
+        }
+        for (int32_t i = 0; i < mNumLayers; ++i)
+        {
+            decode->setInputShape(mPastKeyNames[i].c_str(), nvinfer1::Dims4{1, mNumHeads, actualPast, mHeadDim});
+            decode->setInputShape(mPastValueNames[i].c_str(), nvinfer1::Dims4{1, mNumHeads, actualPast, mHeadDim});
+            decode->setTensorAddress(mPastKeyNames[i].c_str(), read[2 * i].get());
+            decode->setTensorAddress(mPastValueNames[i].c_str(), read[2 * i + 1].get());
+            decode->setTensorAddress(mNewPastKeyNames[i].c_str(), write[2 * i].get());
+            decode->setTensorAddress(mNewPastValueNames[i].c_str(), write[2 * i + 1].get());
+        }
+    }
+
+    size_t decodeGraphIndex(int32_t group, std::vector<DeviceBuffer> const& read) const
+    {
+        bool const readIsA = !mKVA.empty() && read[0].get() == mKVA[0].get();
+        return static_cast<size_t>(group) * 2 + (readIsA ? 1U : 0U);
+    }
+
+    void destroyDecodeCudaGraphs()
+    {
+        for (auto& graphPair : mDecodeCudaGraphs)
+        {
+            if (graphPair.second != nullptr)
+            {
+                cudaGraphExecDestroy(graphPair.second);
+                graphPair.second = nullptr;
+            }
+            if (graphPair.first != nullptr)
+            {
+                cudaGraphDestroy(graphPair.first);
+                graphPair.first = nullptr;
+            }
+        }
+    }
+
+    bool captureDecodeCudaGraph(int32_t group, std::vector<DeviceBuffer> const& read, std::vector<DeviceBuffer> const& write)
+    {
+        size_t const graphIdx = decodeGraphIndex(group, read);
+        if (graphIdx >= mDecodeCudaGraphs.size())
+        {
+            return false;
+        }
+        int64_t const actualPast = group + 1;
+        auto* genStepPtr = static_cast<char*>(mDeviceDecodeGenSteps.get()) + static_cast<size_t>(group) * sizeof(int64_t);
+        auto* pastLengthPtr
+            = static_cast<char*>(mDeviceDecodePastLengths.get()) + static_cast<size_t>(group) * sizeof(int64_t);
+        bindDecodeContext(group, actualPast, read, write, genStepPtr, pastLengthPtr, pastLengthPtr);
+
+        cudaGraph_t graph = nullptr;
+        cudaGraphExec_t graphExec = nullptr;
+        bool executeStatus = true;
+        try
+        {
+            CUDA_CHECK(cudaStreamBeginCapture(mStream, cudaStreamCaptureModeThreadLocal));
+            kernel::qwen3TtsCpGatherEmbedding(static_cast<float const*>(mDeviceEmbeddingTable.get()), mCodebookSize,
+                mHiddenSize, group - 1, static_cast<int32_t const*>(mDeviceSelectedTokens.get()),
+                static_cast<float*>(mDeviceEmbeds.get()), mStream);
+            executeStatus &= mDecodeContext->enqueueV3(mStream);
+            CUDA_CHECK(cudaStreamEndCapture(mStream, &graph));
+            CUDA_CHECK(cudaGraphInstantiate(&graphExec, graph, nullptr, nullptr, 0));
+        }
+        catch (std::exception const& e)
+        {
+            LOG_WARNING("Failed to capture Qwen3-TTS CP decode CUDA graph group=%d: %s", group, e.what());
+            static_cast<void>(cudaGetLastError());
+            cudaStreamCaptureStatus streamStatus;
+            CUDA_CHECK(cudaStreamIsCapturing(mStream, &streamStatus));
+            if (streamStatus != cudaStreamCaptureStatusNone)
+            {
+                static_cast<void>(cudaStreamEndCapture(mStream, &graph));
+                static_cast<void>(cudaGetLastError());
+            }
+            if (graphExec != nullptr)
+            {
+                cudaGraphExecDestroy(graphExec);
+            }
+            if (graph != nullptr)
+            {
+                cudaGraphDestroy(graph);
+            }
+            return false;
+        }
+        if (!executeStatus)
+        {
+            if (graphExec != nullptr)
+            {
+                cudaGraphExecDestroy(graphExec);
+            }
+            if (graph != nullptr)
+            {
+                cudaGraphDestroy(graph);
+            }
+            return false;
+        }
+        mDecodeCudaGraphs[graphIdx] = {graph, graphExec};
+        return true;
+    }
+
+    bool launchDecodeCudaGraph(int32_t group, std::vector<DeviceBuffer> const& read, std::vector<DeviceBuffer> const& write)
+    {
+        size_t const graphIdx = decodeGraphIndex(group, read);
+        if (graphIdx >= mDecodeCudaGraphs.size())
+        {
+            return false;
+        }
+        if (mDecodeCudaGraphs[graphIdx].second == nullptr && !captureDecodeCudaGraph(group, read, write))
+        {
+            return false;
+        }
+        CUDA_CHECK(cudaGraphLaunch(mDecodeCudaGraphs[graphIdx].second, mStream));
+        return true;
     }
 
     using Clock = std::chrono::steady_clock;
@@ -1289,6 +1474,7 @@ private:
     bool mGreedy{false};
     bool mUseGpuGreedy{false};
     bool mUseGpuSampling{false};
+    bool mUseDecodeCudaGraph{false};
     bool mProfile{false};
     int64_t mProfileFrames{0};
     int64_t mProfileGroups{0};
@@ -1308,11 +1494,14 @@ private:
     DeviceBuffer mDeviceCachePosition;
     DeviceBuffer mDeviceGenStep;
     DeviceBuffer mDevicePastLength;
+    DeviceBuffer mDeviceDecodeGenSteps;
+    DeviceBuffer mDeviceDecodePastLengths;
     DeviceBuffer mDeviceDummyKV;
     DeviceBuffer mDeviceLogits;
     DeviceBuffer mDeviceSelectedTokens;
     DeviceBuffer mDeviceEmbeddingTable;
     DeviceBuffer mDeviceSamplingWorkspace;
+    std::vector<std::pair<cudaGraph_t, cudaGraphExec_t>> mDecodeCudaGraphs;
     size_t mGpuSamplingWorkspaceBytes{0};
     uint64_t mGpuSamplingSeed{0};
     uint64_t mGpuSamplingOffset{0};
