@@ -96,6 +96,16 @@ find_library(
   HINTS ${CUDA_DIR} ${CUDA_TARGET_DIR}
   PATH_SUFFIXES lib lib64 lib/stubs)
 
+find_library(
+  CUBLAS_LIB cublas
+  HINTS ${CUDA_DIR} ${CUDA_TARGET_DIR}
+  PATH_SUFFIXES lib lib64)
+
+find_library(
+  CUBLASLT_LIB cublasLt
+  HINTS ${CUDA_DIR} ${CUDA_TARGET_DIR}
+  PATH_SUFFIXES lib lib64)
+
 find_path(
   CURAND_KERNEL_INCLUDE_DIR
   NAMES curand_kernel.h

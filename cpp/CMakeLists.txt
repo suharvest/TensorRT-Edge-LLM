@@ -114,7 +114,7 @@ add_library(
   ${PROFILER_CPP_SRCS}
   ${TOKENIZER_CPP_SRCS})
 target_include_directories(edgellmCore PRIVATE ${COMMON_INCLUDE_DIRS})
-target_link_libraries(edgellmCore PRIVATE dl)
+target_link_libraries(edgellmCore PRIVATE dl ${CUBLAS_LIB} ${CUBLASLT_LIB})
 # Apply FMHA SM exclusion definitions
 target_compile_definitions(edgellmCore PRIVATE ${FMHA_EXCLUDE_DEFINITIONS})
 # Enable separable compilation for MoE Marlin kernel templates
@@ -140,7 +140,8 @@ target_compile_definitions(NvInfer_edgellm_plugin
                            PRIVATE ${FMHA_EXCLUDE_DEFINITIONS})
 target_link_libraries(
   NvInfer_edgellm_plugin PRIVATE commonLibraryExt edgellmKernels
-                                 ${CUDA_DRIVER_LIB} ${CUDART_LIB})
+                                 ${CUDA_DRIVER_LIB} ${CUDART_LIB}
+                                 ${CUBLAS_LIB} ${CUBLASLT_LIB})
 add_cross_build_link_options(NvInfer_edgellm_plugin)
 
 # CuTe DSL unified kernels (FMHA + GDN): link local prebuilt static library.
