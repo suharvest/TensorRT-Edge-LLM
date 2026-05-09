@@ -147,6 +147,78 @@ size_t dataTypeSize(nvinfer1::DataType dtype)
     }
 }
 
+bool loadLLMConfigOnly(std::filesystem::path const& configPath, LLMEngineRunnerConfig& config)
+{
+    std::ifstream configStream(configPath);
+    if (!configStream.is_open())
+    {
+        LOG_ERROR("Failed to open LLM config: %s", configPath.string().c_str());
+        return false;
+    }
+
+    Json configJson;
+    try
+    {
+        configJson = Json::parse(configStream);
+    }
+    catch (Json::parse_error const& e)
+    {
+        LOG_ERROR("Failed to parse LLM config %s: %s", configPath.string().c_str(), e.what());
+        return false;
+    }
+
+    try
+    {
+        auto const& builderConfig = configJson.value("builder_config", Json::object());
+        config = LLMEngineRunnerConfig{};
+        config.numDecoderLayers = configJson.value("num_hidden_layers", 0);
+        config.numKVHeads = configJson.value("num_key_value_heads", 0);
+        config.headDim = configJson.value("head_dim", 0);
+        config.rotaryDim = static_cast<int32_t>(config.headDim * configJson.value("partial_rotary_factor", 1.0f));
+        config.hiddenSize = configJson.value("hidden_size", 0);
+        config.vocabSize = configJson.value("vocab_size", 0);
+        config.reducedVocabSize = configJson.value("reduced_vocab_size", 0);
+        config.outputVocabSize = config.reducedVocabSize > 0 ? config.reducedVocabSize : config.vocabSize;
+        config.numDeepstackFeatures = configJson.value("num_deepstack_features", 0);
+        config.audioTokenId = configJson.value("audio_token_id", 0);
+        config.imageTokenId = configJson.value("image_token_id", 0);
+        config.numLinearAttnLayers = configJson.value("num_linear_attn_layers", 0);
+        config.numAttentionLayers = configJson.value("num_attention_layers", config.numDecoderLayers);
+        config.recurrentStateNumHeads = configJson.value("recurrent_state_num_heads", 0);
+        config.recurrentStateHeadDim = configJson.value("recurrent_state_head_dim", 0);
+        config.recurrentStateSize = configJson.value("recurrent_state_size", 0);
+        config.convDim = configJson.value("conv_dim", 0);
+        config.convKernel = configJson.value("conv_kernel", 0);
+        config.maxSupportedBatchSize = builderConfig.value("max_batch_size", 1);
+        config.maxSupportedInputLength = builderConfig.value("max_input_len", 1);
+        config.maxKVCacheCapacity = builderConfig.value("max_kv_cache_capacity", 1);
+        config.maxSupportedLoraRank = builderConfig.value("max_lora_rank", 0);
+        config.enableEagleSpecDecode = builderConfig.value("eagle_base", false);
+        config.useTrtNativeOps = builderConfig.value("trt_native_ops", false);
+        config.ropeConfig = collectRopeConfig(configJson);
+
+        if (config.numDecoderLayers <= 0 || config.numKVHeads <= 0 || config.headDim <= 0 || config.hiddenSize <= 0
+            || config.vocabSize <= 0 || config.maxSupportedInputLength <= 0 || config.maxKVCacheCapacity <= 0)
+        {
+            LOG_ERROR("Invalid LLM config in %s", configPath.string().c_str());
+            return false;
+        }
+
+        for (int32_t i = 0; i < config.numDecoderLayers; ++i)
+        {
+            config.layerTypes.push_back(rt::HybridCacheManager::LayerType::kAttention);
+            config.kvLayerConfigs.push_back({config.numKVHeads, config.headDim});
+        }
+    }
+    catch (std::exception const& e)
+    {
+        LOG_ERROR("Failed to load LLM config %s: %s", configPath.string().c_str(), e.what());
+        return false;
+    }
+
+    return true;
+}
+
 int32_t getQwen3TTSActiveCodePredictorGroups()
 {
     int32_t groups = talker_constants::kQwen3TTSActiveCodePredictorGroups;
@@ -1645,20 +1717,23 @@ Qwen3OmniTTSRuntime::Qwen3OmniTTSRuntime(std::string const& talkerEngineDir, std
     // Setup shared execution context memory for Talker and CodePredictor engines.
     // LLMEngineRunner uses kUSER_MANAGED allocation and requires setContextMemory() before execution.
     {
-        int64_t const talkerCtxSize = mTalkerLLMRunner->getRequiredContextMemorySize();
+        int64_t const talkerCtxSize = mTalkerLLMRunner ? mTalkerLLMRunner->getRequiredContextMemorySize() : 0;
         int64_t const cpCtxSize = mCodePredictorRunner ? mCodePredictorRunner->getRequiredContextMemorySize() : 0;
         int64_t const sharedCtxSize = std::max(talkerCtxSize, cpCtxSize);
         LOG_INFO("Setup shared execution context memory: %zu bytes (talker: %zu, code_predictor: %zu)",
             static_cast<size_t>(sharedCtxSize), static_cast<size_t>(talkerCtxSize), static_cast<size_t>(cpCtxSize));
-        mSharedExecContextMemory = rt::Tensor({sharedCtxSize}, rt::DeviceType::kGPU, nvinfer1::DataType::kUINT8,
-            "Qwen3OmniTTSRuntime::mSharedExecContextMemory");
-        if (!mTalkerLLMRunner->setContextMemory(mSharedExecContextMemory))
+        if (sharedCtxSize > 0)
         {
-            throw std::runtime_error("Failed to set context memory for Talker LLM engine");
-        }
-        if (mCodePredictorRunner && !mCodePredictorRunner->setContextMemory(mSharedExecContextMemory))
-        {
-            throw std::runtime_error("Failed to set context memory for CodePredictor engine");
+            mSharedExecContextMemory = rt::Tensor({sharedCtxSize}, rt::DeviceType::kGPU, nvinfer1::DataType::kUINT8,
+                "Qwen3OmniTTSRuntime::mSharedExecContextMemory");
+            if (mTalkerLLMRunner && !mTalkerLLMRunner->setContextMemory(mSharedExecContextMemory))
+            {
+                throw std::runtime_error("Failed to set context memory for Talker LLM engine");
+            }
+            if (mCodePredictorRunner && !mCodePredictorRunner->setContextMemory(mSharedExecContextMemory))
+            {
+                throw std::runtime_error("Failed to set context memory for CodePredictor engine");
+            }
         }
     }
 
@@ -1709,69 +1784,46 @@ Qwen3OmniTTSRuntime::~Qwen3OmniTTSRuntime()
 bool Qwen3OmniTTSRuntime::initializeEngineRunners(
     std::string const& talkerEngineDir, std::string const& codePredictorEngineDir)
 {
-    // Load Talker LLM engine
     std::filesystem::path talkerEnginePath = std::filesystem::path(talkerEngineDir) / "llm.engine";
     std::filesystem::path talkerConfigPath = std::filesystem::path(talkerEngineDir) / "config.json";
 
-    LOG_INFO("Loading Talker LLM engine from: %s", talkerEnginePath.string().c_str());
+    std::string explicitTalkerPath = mRuntimeOptions.qwen3TtsTalkerEnginePath;
+    if (explicitTalkerPath.empty())
+    {
+        if (char const* envPath = std::getenv("QWEN3_TTS_DIRECT_TALKER_ENGINE"))
+        {
+            explicitTalkerPath = envPath;
+        }
+    }
+    bool useExplicitTalker = false;
+    switch (mRuntimeOptions.talkerBackend)
+    {
+    case TalkerBackend::kAuto:
+        useExplicitTalker = !explicitTalkerPath.empty();
+        break;
+    case TalkerBackend::kGeneric:
+        useExplicitTalker = false;
+        break;
+    case TalkerBackend::kQwen3TTSExplicitKV:
+        if (explicitTalkerPath.empty())
+        {
+            LOG_ERROR("Qwen3-TTS explicit-KV Talker backend requested, but no direct Talker engine path was provided");
+            return false;
+        }
+        useExplicitTalker = true;
+        break;
+    }
+    LOG_INFO("Talker backend: %s", useExplicitTalker ? "qwen3_tts_explicit_kv" : "generic_llm_runner");
 
     try
     {
-        std::unordered_map<std::string, std::string> emptyLoraMap;
-        mTalkerLLMRunner = std::make_unique<LLMEngineRunner>(talkerEnginePath, talkerConfigPath, emptyLoraMap, mStream);
-        mTalkerLLMConfig = mTalkerLLMRunner->getEngineConfig();
-
-        LOG_INFO("Talker LLM engine loaded: vocabSize=%d, hiddenSize=%d", mTalkerLLMConfig.vocabSize,
-            mTalkerLLMConfig.hiddenSize);
-        mTalkerInputEmbedsDataType = mTalkerLLMRunner->getTensorDataType("inputs_embeds");
-        LOG_INFO("Talker inputs_embeds dtype: %s",
-            mTalkerInputEmbedsDataType == nvinfer1::DataType::kBF16
-                ? "BF16"
-                : (mTalkerInputEmbedsDataType == nvinfer1::DataType::kHALF ? "FP16" : "OTHER"));
-        mTalkerHiddenStatesDataType = mTalkerLLMRunner->getTensorDataType("hidden_states");
-        LOG_INFO("Talker hidden_states dtype: %s",
-            mTalkerHiddenStatesDataType == nvinfer1::DataType::kFLOAT ? "FP32"
-                : (mTalkerHiddenStatesDataType == nvinfer1::DataType::kBF16
-                        ? "BF16"
-                        : (mTalkerHiddenStatesDataType == nvinfer1::DataType::kHALF ? "FP16" : "OTHER")));
-        auto talkerKVType = mTalkerLLMRunner->getCacheManager().getKVCacheManager().getConfig().kvCacheType;
-        LOG_INFO("Talker KV cache dtype: %s",
-            talkerKVType == nvinfer1::DataType::kBF16
-                ? "BF16"
-                : (talkerKVType == nvinfer1::DataType::kHALF
-                        ? "FP16"
-                        : (talkerKVType == nvinfer1::DataType::kFP8 ? "FP8" : "UNKNOWN")));
-
-        std::string explicitTalkerPath = mRuntimeOptions.qwen3TtsTalkerEnginePath;
-        if (explicitTalkerPath.empty())
-        {
-            if (char const* envPath = std::getenv("QWEN3_TTS_DIRECT_TALKER_ENGINE"))
-            {
-                explicitTalkerPath = envPath;
-            }
-        }
-        bool useExplicitTalker = false;
-        switch (mRuntimeOptions.talkerBackend)
-        {
-        case TalkerBackend::kAuto:
-            useExplicitTalker = !explicitTalkerPath.empty();
-            break;
-        case TalkerBackend::kGeneric:
-            useExplicitTalker = false;
-            break;
-        case TalkerBackend::kQwen3TTSExplicitKV:
-            if (explicitTalkerPath.empty())
-            {
-                throw std::runtime_error(
-                    "Qwen3-TTS explicit-KV Talker backend requested, but no direct Talker engine path was provided");
-            }
-            useExplicitTalker = true;
-            break;
-        }
-        LOG_INFO("Talker backend: %s", useExplicitTalker ? "qwen3_tts_explicit_kv" : "generic_llm_runner");
-
         if (useExplicitTalker)
         {
+            LOG_INFO("Loading Talker config only from: %s", talkerConfigPath.string().c_str());
+            if (!loadLLMConfigOnly(talkerConfigPath, mTalkerLLMConfig))
+            {
+                return false;
+            }
             LLMEngineRunnerConfig directConfig = mTalkerLLMConfig;
             directConfig.outputVocabSize = directConfig.outputVocabSize > 0 ? directConfig.outputVocabSize : directConfig.vocabSize;
             mQwen3TTSTalkerEngine = std::make_unique<Qwen3TTSTalkerEngine>(
@@ -1794,6 +1846,35 @@ bool Qwen3OmniTTSRuntime::initializeEngineRunners(
             LOG_INFO("Talker execution will use explicit-KV Qwen3-TTS engine override.");
             LOG_INFO("Text projection mode: %s", mUseHostTextProjection ? "host_fp32" : "device");
             LOG_INFO("Qwen3-TTS prompt KV cache: %s", mRuntimeOptions.qwen3TtsPromptKvCache ? "enabled" : "disabled");
+        }
+        else
+        {
+            LOG_INFO("Loading Talker LLM engine from: %s", talkerEnginePath.string().c_str());
+            std::unordered_map<std::string, std::string> emptyLoraMap;
+            mTalkerLLMRunner
+                = std::make_unique<LLMEngineRunner>(talkerEnginePath, talkerConfigPath, emptyLoraMap, mStream);
+            mTalkerLLMConfig = mTalkerLLMRunner->getEngineConfig();
+
+            LOG_INFO("Talker LLM engine loaded: vocabSize=%d, hiddenSize=%d", mTalkerLLMConfig.vocabSize,
+                mTalkerLLMConfig.hiddenSize);
+            mTalkerInputEmbedsDataType = mTalkerLLMRunner->getTensorDataType("inputs_embeds");
+            LOG_INFO("Talker inputs_embeds dtype: %s",
+                mTalkerInputEmbedsDataType == nvinfer1::DataType::kBF16
+                    ? "BF16"
+                    : (mTalkerInputEmbedsDataType == nvinfer1::DataType::kHALF ? "FP16" : "OTHER"));
+            mTalkerHiddenStatesDataType = mTalkerLLMRunner->getTensorDataType("hidden_states");
+            LOG_INFO("Talker hidden_states dtype: %s",
+                mTalkerHiddenStatesDataType == nvinfer1::DataType::kFLOAT ? "FP32"
+                    : (mTalkerHiddenStatesDataType == nvinfer1::DataType::kBF16
+                            ? "BF16"
+                            : (mTalkerHiddenStatesDataType == nvinfer1::DataType::kHALF ? "FP16" : "OTHER")));
+            auto talkerKVType = mTalkerLLMRunner->getCacheManager().getKVCacheManager().getConfig().kvCacheType;
+            LOG_INFO("Talker KV cache dtype: %s",
+                talkerKVType == nvinfer1::DataType::kBF16
+                    ? "BF16"
+                    : (talkerKVType == nvinfer1::DataType::kHALF
+                            ? "FP16"
+                            : (talkerKVType == nvinfer1::DataType::kFP8 ? "FP8" : "UNKNOWN")));
         }
     }
     catch (std::exception const& e)
