@@ -220,6 +220,24 @@ bool envIsOne(char const* name)
     return value != nullptr && std::string(value) == "1";
 }
 
+int32_t envIntOr(char const* name, int32_t fallback)
+{
+    char const* value = std::getenv(name);
+    if (value == nullptr || *value == '\0')
+    {
+        return fallback;
+    }
+    try
+    {
+        return std::stoi(value);
+    }
+    catch (...)
+    {
+        LOG_WARNING("Ignoring invalid integer value for %s=%s", name, value);
+        return fallback;
+    }
+}
+
 std::vector<std::vector<int32_t>> transposeFrameWindow(
     std::vector<std::vector<int32_t>> const& frames, size_t begin, size_t end)
 {
@@ -370,6 +388,7 @@ int main(int argc, char** argv)
     cudaStream_t asyncCode2WavStream{};
     std::unique_ptr<Code2WavRunner> asyncCode2wavRunner;
     bool const lazyCode2Wav = envIsOne("EDGE_LLM_TTS_LAZY_CODE2WAV");
+    int32_t const code2WavContextFrameCap = envIntOr("EDGE_LLM_TTS_CODE2WAV_CONTEXT_FRAMES", -1);
     auto getAsyncCode2WavRunner = [&]() -> Code2WavRunner& {
         if (!asyncCode2wavRunner)
         {
@@ -553,7 +572,10 @@ int main(int argc, char** argv)
                     code2wavRunner = std::make_unique<Code2WavRunner>(args.code2wavEngineDir, stream);
                     logMemTag("worker_after_lazy_code2wav");
                 }
-                int32_t const leftContext = code2wavRunner->getConfig().leftContextSize;
+                int32_t const naturalLeftContext = code2wavRunner->getConfig().leftContextSize;
+                int32_t const leftContext = code2WavContextFrameCap >= 0
+                    ? std::min(naturalLeftContext, code2WavContextFrameCap)
+                    : naturalLeftContext;
                 int32_t const windowStart = std::max(0, lastEmittedFrames - leftContext);
                 int32_t const skipContextFrames = lastEmittedFrames - windowStart;
                 auto const windowCodes = transposeFrameWindow(
@@ -645,7 +667,10 @@ int main(int argc, char** argv)
                                     continue;
                                 }
 
-                                int32_t const leftContext = asyncRunner.getConfig().leftContextSize;
+                                int32_t const naturalLeftContext = asyncRunner.getConfig().leftContextSize;
+                                int32_t const leftContext = code2WavContextFrameCap >= 0
+                                    ? std::min(naturalLeftContext, code2WavContextFrameCap)
+                                    : naturalLeftContext;
                                 int32_t const windowStart = std::max(0, lastEmittedFrames - leftContext);
                                 skipContextFrames = lastEmittedFrames - windowStart;
                                 outputChunkIndex = chunkIndex;
