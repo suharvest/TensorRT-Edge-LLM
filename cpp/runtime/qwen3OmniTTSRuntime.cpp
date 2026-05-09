@@ -234,7 +234,7 @@ int32_t getQwen3TTSActiveCodePredictorGroups()
             LOG_WARNING("Ignoring invalid QWEN3_TTS_ACTIVE_CP_GROUPS=%s", groupsEnv);
         }
     }
-    return std::clamp(groups, 1, talker_constants::kNumRvqLayers);
+    return std::clamp(groups, talker_constants::kQwen3TTSMinActiveCodePredictorGroups, talker_constants::kNumRvqLayers);
 }
 
 std::vector<float> copyTensorToHostFloat(rt::Tensor const& tensor, int64_t elements, cudaStream_t stream)
@@ -793,9 +793,15 @@ public:
         }
 
         size_t const bytes = static_cast<size_t>(mHiddenSize) * sizeof(float);
+        auto const inputCopyStart = Clock::now();
         CUDA_CHECK(cudaMemcpyAsync(mDeviceEmbeds.get(), hidden.data(), bytes, cudaMemcpyHostToDevice, mStream));
         CUDA_CHECK(cudaMemcpyAsync(static_cast<char*>(mDeviceEmbeds.get()) + bytes, primaryEmbedding.data(), bytes,
             cudaMemcpyHostToDevice, mStream));
+        profileAdd(mProfileInputCopyMs, inputCopyStart);
+        if (mProfile)
+        {
+            ++mProfileHostHiddenFrames;
+        }
         return generatePreparedInputs(activeGroups, topK, topP, temperature, residualCodes);
     }
 
@@ -809,9 +815,15 @@ public:
         }
 
         size_t const bytes = static_cast<size_t>(mHiddenSize) * sizeof(float);
+        auto const inputCopyStart = Clock::now();
         CUDA_CHECK(cudaMemcpyAsync(mDeviceEmbeds.get(), hiddenDevice, bytes, cudaMemcpyDeviceToDevice, mStream));
         CUDA_CHECK(cudaMemcpyAsync(static_cast<char*>(mDeviceEmbeds.get()) + bytes, primaryEmbedding.data(), bytes,
             cudaMemcpyHostToDevice, mStream));
+        profileAdd(mProfileInputCopyMs, inputCopyStart);
+        if (mProfile)
+        {
+            ++mProfileDeviceHiddenFrames;
+        }
         return generatePreparedInputs(activeGroups, topK, topP, temperature, residualCodes);
     }
 
@@ -1109,12 +1121,15 @@ private:
         double const frames = static_cast<double>(std::max<int64_t>(1, mProfileFrames));
         double const groups = static_cast<double>(std::max<int64_t>(1, mProfileGroups));
         double const decodeGroups = static_cast<double>(std::max<int64_t>(1, mProfileDecodeGroups));
-        LOG_WARNING("Qwen3-TTS CP profile frames=%lld groups=%lld frame_ms=%.3f prefill_setup_ms=%.3f "
+        LOG_WARNING("Qwen3-TTS CP profile frames=%lld groups=%lld device_hidden=%lld host_hidden=%lld "
+                    "frame_ms=%.3f input_copy_ms=%.3f prefill_setup_ms=%.3f "
                     "decode_setup_ms/group=%.3f embed_copy_ms/group=%.3f sample_wait_ms/group=%.3f "
                     "sample_cpu_ms/group=%.3f",
             static_cast<long long>(mProfileFrames), static_cast<long long>(mProfileGroups),
-            mProfileFrameTotalMs / frames, mProfilePrefillSetupMs / frames, mProfileDecodeSetupMs / decodeGroups,
-            mProfileEmbedCopyMs / decodeGroups, mProfileSampleWaitMs / groups, mProfileSampleCpuMs / groups);
+            static_cast<long long>(mProfileDeviceHiddenFrames), static_cast<long long>(mProfileHostHiddenFrames),
+            mProfileFrameTotalMs / frames, mProfileInputCopyMs / frames, mProfilePrefillSetupMs / frames,
+            mProfileDecodeSetupMs / decodeGroups, mProfileEmbedCopyMs / decodeGroups, mProfileSampleWaitMs / groups,
+            mProfileSampleCpuMs / groups);
     }
 
     int32_t sampleDeviceLogits(int32_t group, int32_t topK, float topP, float temperature)
@@ -1278,7 +1293,10 @@ private:
     int64_t mProfileFrames{0};
     int64_t mProfileGroups{0};
     int64_t mProfileDecodeGroups{0};
+    int64_t mProfileDeviceHiddenFrames{0};
+    int64_t mProfileHostHiddenFrames{0};
     double mProfileFrameTotalMs{0.0};
+    double mProfileInputCopyMs{0.0};
     double mProfilePrefillSetupMs{0.0};
     double mProfileDecodeSetupMs{0.0};
     double mProfileEmbedCopyMs{0.0};

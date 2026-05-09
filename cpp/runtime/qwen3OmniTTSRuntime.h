@@ -49,7 +49,8 @@ constexpr int32_t kAssistantTrailingSuffix
 constexpr int32_t kNonStreamingPrefixRows = 8;     //!< Fixed prefix rows in non-streaming prefill (rows 0-7)
 constexpr int32_t kCodePredictorPrefillSeqLen = 2; //!< CodePredictor prefill sequence length
 constexpr int32_t kCodecEmbeddingCount = 6;        //!< Number of codec embeddings to add
-constexpr int32_t kQwen3TTSActiveCodePredictorGroups = 15; //!< Residual groups used by native Qwen3-TTS CP engine
+constexpr int32_t kQwen3TTSMinActiveCodePredictorGroups = 12; //!< Quality floor for high-performance CP pruning
+constexpr int32_t kQwen3TTSActiveCodePredictorGroups = 12;    //!< Residual groups used by native Qwen3-TTS CP engine
 } // namespace talker_constants
 
 /*!
