@@ -734,6 +734,23 @@ public:
         {
             LOG_WARNING("Qwen3-TTS CP GPU greedy sampling enabled (experimental; requires codes parity quality gate)");
         }
+        bool const requestedGpuSampling = std::getenv("QWEN3_TTS_CP_GPU_SAMPLING") != nullptr
+            && std::string(std::getenv("QWEN3_TTS_CP_GPU_SAMPLING")) != "0";
+        mUseGpuSampling = requestedGpuSampling && !mGreedy && mUseDeviceEmbeddingTable && mLogitsElementSize == sizeof(float);
+        if (requestedGpuSampling && !mUseGpuSampling)
+        {
+            LOG_WARNING("Qwen3-TTS CP GPU sampling requested but disabled; requires non-greedy sampling, "
+                        "QWEN3_TTS_CP_DEVICE_EMBEDDINGS=1, and FP32 logits.");
+        }
+        if (mUseGpuSampling)
+        {
+            SamplingParams const maxSamplingParams(1, mCodebookSize, 1.0f, mCodebookSize, 1.0f);
+            mGpuSamplingWorkspaceBytes = getTopKtopPSamplingWorkspaceSize(1, mCodebookSize, maxSamplingParams);
+            mDeviceSamplingWorkspace.allocate(mGpuSamplingWorkspaceBytes);
+            mGpuSamplingSeed = makeQwen3TTSSamplingSeed(0x53414D50);
+            LOG_WARNING("Qwen3-TTS CP GPU top-k/top-p sampling enabled "
+                        "(experimental; requires TTS/ASR quality gate)");
+        }
 
         mSampleLogits.resize(static_cast<size_t>(mCodebookSize));
         mSampleRaw.resize(static_cast<size_t>(mCodebookSize));
@@ -777,6 +794,22 @@ public:
 
         size_t const bytes = static_cast<size_t>(mHiddenSize) * sizeof(float);
         CUDA_CHECK(cudaMemcpyAsync(mDeviceEmbeds.get(), hidden.data(), bytes, cudaMemcpyHostToDevice, mStream));
+        CUDA_CHECK(cudaMemcpyAsync(static_cast<char*>(mDeviceEmbeds.get()) + bytes, primaryEmbedding.data(), bytes,
+            cudaMemcpyHostToDevice, mStream));
+        return generatePreparedInputs(activeGroups, topK, topP, temperature, residualCodes);
+    }
+
+    bool generateDeviceHidden(float const* hiddenDevice, std::vector<float> const& primaryEmbedding,
+        int32_t activeGroups, int32_t topK, float topP, float temperature, std::vector<int32_t>& residualCodes)
+    {
+        residualCodes.assign(static_cast<size_t>(mNumGroups), 0);
+        if (!mHasPastLength)
+        {
+            zeroKV();
+        }
+
+        size_t const bytes = static_cast<size_t>(mHiddenSize) * sizeof(float);
+        CUDA_CHECK(cudaMemcpyAsync(mDeviceEmbeds.get(), hiddenDevice, bytes, cudaMemcpyDeviceToDevice, mStream));
         CUDA_CHECK(cudaMemcpyAsync(static_cast<char*>(mDeviceEmbeds.get()) + bytes, primaryEmbedding.data(), bytes,
             cudaMemcpyHostToDevice, mStream));
         return generatePreparedInputs(activeGroups, topK, topP, temperature, residualCodes);
@@ -828,6 +861,10 @@ private:
         {
             sampleDeviceLogitsGreedyToDevice(0);
         }
+        else if (mUseGpuSampling)
+        {
+            sampleDeviceLogitsTopKTopPToDevice(0, topK, topP, temperature);
+        }
         else
         {
             residualCodes[0] = sampleDeviceLogits(0, topK, topP, temperature);
@@ -854,7 +891,7 @@ private:
         for (int32_t j = 1; j < groupsToGenerate; ++j)
         {
             auto const embedStart = Clock::now();
-            if (mUseGpuGreedy)
+            if (mUseGpuGreedy || mUseGpuSampling)
             {
                 kernel::qwen3TtsCpGatherEmbedding(static_cast<float const*>(mDeviceEmbeddingTable.get()), mCodebookSize,
                     mHiddenSize, j - 1, static_cast<int32_t const*>(mDeviceSelectedTokens.get()),
@@ -900,17 +937,23 @@ private:
             {
                 sampleDeviceLogitsGreedyToDevice(j);
             }
+            else if (mUseGpuSampling)
+            {
+                sampleDeviceLogitsTopKTopPToDevice(j, topK, topP, temperature);
+            }
             else
             {
                 residualCodes[j] = sampleDeviceLogits(j, topK, topP, temperature);
             }
             std::swap(read, write);
         }
-        if (mUseGpuGreedy && groupsToGenerate > 0)
+        if ((mUseGpuGreedy || mUseGpuSampling) && groupsToGenerate > 0)
         {
+            auto const waitStart = Clock::now();
             CUDA_CHECK(cudaMemcpyAsync(residualCodes.data(), mDeviceSelectedTokens.get(),
                 static_cast<size_t>(groupsToGenerate) * sizeof(int32_t), cudaMemcpyDeviceToHost, mStream));
             CUDA_CHECK(cudaStreamSynchronize(mStream));
+            profileAdd(mProfileSampleWaitMs, waitStart);
         }
         if (mProfile)
         {
@@ -1188,6 +1231,23 @@ private:
             static_cast<int32_t*>(mDeviceSelectedTokens.get()) + group, mStream);
     }
 
+    void sampleDeviceLogitsTopKTopPToDevice(int32_t group, int32_t topK, float topP, float temperature)
+    {
+        int32_t const effectiveTopK = topK > 0 ? std::min(topK, mCodebookSize) : mCodebookSize;
+        float const effectiveTopP = (topP > 0.0f && topP <= 1.0f) ? topP : 1.0f;
+        float const effectiveTemperature = temperature > 1e-6f ? temperature : 0.9f;
+        size_t const offset = mLogitsName == "logits_all" ? static_cast<size_t>(group) * mCodebookSize : 0;
+        SamplingParams const params(1, mCodebookSize, effectiveTemperature, effectiveTopK, effectiveTopP);
+        rt::Tensor logits(static_cast<float*>(mDeviceLogits.get()) + offset, {1, mCodebookSize},
+            rt::DeviceType::kGPU, nvinfer1::DataType::kFLOAT);
+        rt::Tensor selected(static_cast<int32_t*>(mDeviceSelectedTokens.get()) + group, {1, 1},
+            rt::DeviceType::kGPU, nvinfer1::DataType::kINT32);
+        rt::Tensor workspace(
+            mDeviceSamplingWorkspace.get(), {static_cast<int64_t>(mGpuSamplingWorkspaceBytes)}, rt::DeviceType::kGPU,
+            nvinfer1::DataType::kINT8);
+        topKtopPSamplingFromLogits(logits, selected, params, workspace, mStream, mGpuSamplingSeed, mGpuSamplingOffset++);
+    }
+
     int32_t mHiddenSize{};
     int32_t mCodebookSize{};
     int32_t mNumLayers{};
@@ -1213,6 +1273,7 @@ private:
     bool mDumpDebug{false};
     bool mGreedy{false};
     bool mUseGpuGreedy{false};
+    bool mUseGpuSampling{false};
     bool mProfile{false};
     int64_t mProfileFrames{0};
     int64_t mProfileGroups{0};
@@ -1233,6 +1294,10 @@ private:
     DeviceBuffer mDeviceLogits;
     DeviceBuffer mDeviceSelectedTokens;
     DeviceBuffer mDeviceEmbeddingTable;
+    DeviceBuffer mDeviceSamplingWorkspace;
+    size_t mGpuSamplingWorkspaceBytes{0};
+    uint64_t mGpuSamplingSeed{0};
+    uint64_t mGpuSamplingOffset{0};
     std::vector<DeviceBuffer> mKVA;
     std::vector<DeviceBuffer> mKVB;
     std::vector<std::string> mPastKeyNames;
@@ -3602,9 +3667,6 @@ bool Qwen3OmniTTSRuntime::runCodePredictorGenerationForFrame(int32_t codecToken,
         bool const dumpCpInputs = std::getenv("QWEN3_TTS_DUMP_CP") != nullptr;
         bool const shouldDumpDirectCpFrame = dumpCpInputs && !dumpedFirstDirectCpFrame;
         std::vector<int32_t> residualCodes;
-        std::vector<float> hiddenHost = canUseTalkerHiddenDirectly
-            ? copyTensorToHostFloat(talkerHiddenState, mTalkerConfig.codePredictorHiddenSize, stream)
-            : copyTensorToHostFloat(mSmallToMtpProjectedHidden, mTalkerConfig.codePredictorHiddenSize, stream);
         std::vector<float> primaryEmbeddingHost;
         if (mTalkerConfig.talkerHiddenSize == mTalkerConfig.codePredictorHiddenSize
             && !mHostTalkerEmbeddingTable.empty())
@@ -3619,6 +3681,15 @@ bool Qwen3OmniTTSRuntime::runCodePredictorGenerationForFrame(int32_t codecToken,
             primaryEmbeddingHost
                 = copyTensorToHostFloat(mCodePredictorCodecEmbed, mTalkerConfig.codePredictorHiddenSize, stream);
         }
+        bool const canUseDeviceHidden = canUseTalkerHiddenDirectly && talkerHiddenState.getDataType() == nvinfer1::DataType::kFLOAT
+            && !dumpCpInputs;
+        std::vector<float> hiddenHost;
+        if (!canUseDeviceHidden)
+        {
+            hiddenHost = canUseTalkerHiddenDirectly
+                ? copyTensorToHostFloat(talkerHiddenState, mTalkerConfig.codePredictorHiddenSize, stream)
+                : copyTensorToHostFloat(mSmallToMtpProjectedHidden, mTalkerConfig.codePredictorHiddenSize, stream);
+        }
         if (dumpCpInputs && directCpFrameIndex < 2)
         {
             dumpVector("cp_frame" + std::to_string(directCpFrameIndex) + "_input_hidden_f32.bin", hiddenHost);
@@ -3630,8 +3701,13 @@ bool Qwen3OmniTTSRuntime::runCodePredictorGenerationForFrame(int32_t codecToken,
             dumpVector("cp_input_hidden_f32.bin", hiddenHost);
             dumpVector("cp_input_primary_emb_f32.bin", primaryEmbeddingHost);
         }
-        if (!mQwen3TTSCodePredictorEngine->generate(hiddenHost, primaryEmbeddingHost, activeGroups,
-                samplingParams.topK, samplingParams.topP, samplingParams.temperature, residualCodes))
+        bool const cpOk = canUseDeviceHidden
+            ? mQwen3TTSCodePredictorEngine->generateDeviceHidden(
+                static_cast<float const*>(talkerHiddenState.rawPointer()), primaryEmbeddingHost, activeGroups,
+                samplingParams.topK, samplingParams.topP, samplingParams.temperature, residualCodes)
+            : mQwen3TTSCodePredictorEngine->generate(hiddenHost, primaryEmbeddingHost, activeGroups,
+                samplingParams.topK, samplingParams.topP, samplingParams.temperature, residualCodes);
+        if (!cpOk)
         {
             return false;
         }
