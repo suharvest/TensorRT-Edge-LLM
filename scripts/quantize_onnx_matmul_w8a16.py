@@ -79,6 +79,8 @@ def rewrite_model(
     min_elements: int,
     domain: str,
     keep_original_weights: bool,
+    cast_plugin_inputs_to_fp16: bool,
+    cast_plugin_outputs_to_fp32: bool,
 ) -> dict[str, int]:
     graph = model.graph
     initializers = _initializer_map(graph)
@@ -92,34 +94,42 @@ def rewrite_model(
     converted = 0
     skipped = 0
     converted_elements = 0
+    original_weight_bytes = 0
+    rewritten_nodes: list[onnx.NodeProto] = []
 
     for idx, node in enumerate(graph.node):
         if node.op_type != "MatMul" or len(node.input) != 2:
+            rewritten_nodes.append(node)
             continue
 
         name = _node_name(node, idx)
         if include and not _matches(include, name):
             skipped += 1
+            rewritten_nodes.append(node)
             continue
         if _matches(exclude, name):
             skipped += 1
+            rewritten_nodes.append(node)
             continue
 
         activation_name = node.input[0]
         weight_name = node.input[1]
         if weight_name not in initializers:
             skipped += 1
+            rewritten_nodes.append(node)
             continue
 
         weight_tensor = initializers[weight_name]
         if len(weight_tensor.dims) != 2:
             skipped += 1
+            rewritten_nodes.append(node)
             continue
 
         k, n = [int(dim) for dim in weight_tensor.dims]
         elements = k * n
         if elements < min_elements:
             skipped += 1
+            rewritten_nodes.append(node)
             continue
 
         weight = numpy_helper.to_array(weight_tensor)
@@ -131,8 +141,29 @@ def rewrite_model(
         new_initializers.append(numpy_helper.from_array(qweight, name=qweight_name))
         new_initializers.append(numpy_helper.from_array(scales, name=scales_name))
 
+        original_output_name = node.output[0]
+        if cast_plugin_inputs_to_fp16:
+            activation_fp16_name = f"{safe_name}_w8a16_activation_fp16"
+            rewritten_nodes.append(
+                helper.make_node(
+                    "Cast",
+                    [activation_name],
+                    [activation_fp16_name],
+                    name=f"{safe_name}_w8a16_cast_activation_fp16",
+                    to=onnx.TensorProto.FLOAT16,
+                )
+            )
+            activation_name = activation_fp16_name
+
+        if cast_plugin_outputs_to_fp32:
+            plugin_output_name = f"{safe_name}_w8a16_output_fp16"
+        else:
+            plugin_output_name = original_output_name
+
         del node.input[:]
         node.input.extend([activation_name, qweight_name, scales_name])
+        del node.output[:]
+        node.output.extend([plugin_output_name])
 
         node.op_type = "W8A16LinearPlugin"
         node.domain = domain
@@ -145,10 +176,26 @@ def rewrite_model(
                 helper.make_attribute("group_size", 0),
             ]
         )
+        rewritten_nodes.append(node)
+
+        if cast_plugin_outputs_to_fp32:
+            rewritten_nodes.append(
+                helper.make_node(
+                    "Cast",
+                    [plugin_output_name],
+                    [original_output_name],
+                    name=f"{safe_name}_w8a16_cast_output_fp32",
+                    to=onnx.TensorProto.FLOAT,
+                )
+            )
 
         converted_weight_counts[weight_name] = converted_weight_counts.get(weight_name, 0) + 1
         converted += 1
         converted_elements += elements
+        original_weight_bytes += weight.nbytes
+
+    del graph.node[:]
+    graph.node.extend(rewritten_nodes)
 
     if not keep_original_weights and converted_weight_counts:
         removable_weight_names = {
@@ -170,6 +217,7 @@ def rewrite_model(
         "converted_matmuls": converted,
         "skipped_matmuls": skipped,
         "converted_weight_elements": converted_elements,
+        "original_weight_bytes": original_weight_bytes,
         "fp16_weight_bytes": converted_elements * 2,
         "int8_weight_bytes": converted_elements,
         "per_output_scale_bytes": converted * 0,  # filled below
@@ -186,6 +234,16 @@ def main() -> None:
     parser.add_argument("--min-elements", type=int, default=0, help="Skip weights smaller than this many elements")
     parser.add_argument("--domain", default="trt", help="Custom op domain for plugin nodes")
     parser.add_argument("--keep-original-weights", action="store_true", help="Keep replaced FP weights in the ONNX file")
+    parser.add_argument(
+        "--cast-plugin-inputs-to-fp16",
+        action="store_true",
+        help="Insert Cast nodes before each W8A16 plugin so FLOAT graphs can keep FP32 public tensors",
+    )
+    parser.add_argument(
+        "--cast-plugin-outputs-to-fp32",
+        action="store_true",
+        help="Insert Cast nodes after each W8A16 plugin so downstream FLOAT graph consumers remain unchanged",
+    )
     parser.add_argument("--external-data", action="store_true", help="Save tensors as external data")
     parser.add_argument("--external-data-file", default=None, help="External tensor data filename")
     parser.add_argument("--size-threshold", type=int, default=1024, help="External data size threshold")
@@ -200,6 +258,8 @@ def main() -> None:
         min_elements=args.min_elements,
         domain=args.domain,
         keep_original_weights=args.keep_original_weights,
+        cast_plugin_inputs_to_fp16=args.cast_plugin_inputs_to_fp16,
+        cast_plugin_outputs_to_fp32=args.cast_plugin_outputs_to_fp32,
     )
 
     scale_elems = 0
@@ -207,7 +267,7 @@ def main() -> None:
         if initializer.name.endswith("_w8a16_scales"):
             scale_elems += math.prod(initializer.dims)
     summary["per_output_scale_bytes"] = scale_elems * 2
-    summary["estimated_weight_savings_bytes"] = summary["fp16_weight_bytes"] - (
+    summary["estimated_weight_savings_bytes"] = summary["original_weight_bytes"] - (
         summary["int8_weight_bytes"] + summary["per_output_scale_bytes"]
     )
 

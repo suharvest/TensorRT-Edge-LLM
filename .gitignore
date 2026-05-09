@@ -14,7 +14,8 @@ data.tar
 *.tar.gz
 internal/
 *.log
-.DS_Store/
+.DS_Store
+._*
 docs/cpp_docs/
 docs/build/
 docs/source/cpp_api/

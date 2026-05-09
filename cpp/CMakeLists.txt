@@ -69,10 +69,22 @@ else()
   message(STATUS "FMHA Kernels: Compiling cubins for all SM architectures")
 endif()
 
+function(filter_macos_metadata out_var)
+  set(_items ${${out_var}})
+  list(FILTER _items EXCLUDE REGEX "/\\._[^/]*$")
+  list(FILTER _items EXCLUDE REGEX "/\\.DS_Store$")
+  set(${out_var}
+      "${_items}"
+      PARENT_SCOPE)
+endfunction()
+
 # Generate Core C++ static library for LLM-SDK
 file(GLOB_RECURSE COMMON_CPP_SRCS "common/*.cpp")
 file(GLOB_RECURSE KERNELS_CPP_SRCS "kernels/*.cpp")
 file(GLOB_RECURSE KERNELS_CU_SRCS "kernels/*.cu")
+filter_macos_metadata(COMMON_CPP_SRCS)
+filter_macos_metadata(KERNELS_CPP_SRCS)
+filter_macos_metadata(KERNELS_CU_SRCS)
 # Exclude MoE Marlin ops/sm80 - compiled only via include from moeMarlin.cu
 list(FILTER KERNELS_CU_SRCS EXCLUDE REGEX
      "marlin_moe_wna16/(ops|sm80_kernel_float16_u4_float16)\\.cu$")
@@ -81,9 +93,15 @@ file(GLOB_RECURSE SAMPLER_CU_SRCS "sampler/*.cu")
 file(GLOB_RECURSE MULTIMODAL_CPP_SRCS "multimodal/*.cpp")
 file(GLOB_RECURSE RUNTIME_CPP_SRCS "runtime/*.cpp")
 file(GLOB_RECURSE PROFILER_CPP_SRCS "profiling/*.cpp")
+filter_macos_metadata(SAMPLER_CPP_SRCS)
+filter_macos_metadata(SAMPLER_CU_SRCS)
+filter_macos_metadata(MULTIMODAL_CPP_SRCS)
+filter_macos_metadata(RUNTIME_CPP_SRCS)
+filter_macos_metadata(PROFILER_CPP_SRCS)
 
 # Enable relocatable device code for MoE Marlin kernels
 file(GLOB_RECURSE MOE_MARLIN_CU_SRCS "kernels/moe/moe_marlin/*.cu")
+filter_macos_metadata(MOE_MARLIN_CU_SRCS)
 list(APPEND MOE_MARLIN_CU_SRCS
      "${CMAKE_CURRENT_SOURCE_DIR}/kernels/moe/nvf4_w4an/decoding_kernels.cu")
 set_source_files_properties(${MOE_MARLIN_CU_SRCS} PROPERTIES COMPILE_FLAGS
@@ -98,6 +116,7 @@ target_compile_definitions(edgellmKernels PRIVATE ${FMHA_EXCLUDE_DEFINITIONS})
 set_target_properties(edgellmKernels PROPERTIES CUDA_SEPARABLE_COMPILATION ON)
 
 file(GLOB_RECURSE TOKENIZER_CPP_SRCS "tokenizer/*.cpp")
+filter_macos_metadata(TOKENIZER_CPP_SRCS)
 
 add_library(
   edgellmCore STATIC
@@ -120,6 +139,7 @@ set_target_properties(edgellmCore PROPERTIES CUDA_SEPARABLE_COMPILATION ON)
 
 # Generate builder C++ static library
 file(GLOB_RECURSE BUILDER_CPP_SRCS "builder/*.cpp")
+filter_macos_metadata(BUILDER_CPP_SRCS)
 add_library(edgellmBuilder STATIC ${BUILDER_CPP_SRCS} ${COMMON_CPP_SRCS})
 target_include_directories(edgellmBuilder PRIVATE ${ONNX_PARSER_INCLUDE_DIR}
                                                   ${COMMON_INCLUDE_DIRS})
@@ -127,6 +147,7 @@ target_link_libraries(edgellmBuilder PRIVATE ${NV_ONNX_PARSER_LIB} dl)
 
 # Generate the TensorRT plugin shared libraries
 file(GLOB_RECURSE PLUGIN_CPP_SRCS "plugins/*.cpp")
+filter_macos_metadata(PLUGIN_CPP_SRCS)
 add_library(NvInfer_edgellm_plugin SHARED ${PLUGIN_CPP_SRCS})
 set_target_properties(NvInfer_edgellm_plugin PROPERTIES VERSION 1.0 SOVERSION 1)
 set_target_properties(NvInfer_edgellm_plugin PROPERTIES LIBRARY_OUTPUT_DIRECTORY
