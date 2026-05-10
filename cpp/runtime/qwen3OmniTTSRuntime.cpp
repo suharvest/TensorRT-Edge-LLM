@@ -2860,9 +2860,25 @@ bool Qwen3OmniTTSRuntime::loadTextTokenMap(std::filesystem::path const& weightsD
     mUsePrunedTextEmbedding = false;
     mTextTokenIdToPrunedRow.clear();
 
+    char const* pruneEnv = std::getenv("QWEN3_TTS_VOCAB_PRUNED");
+    bool const forcePruned = pruneEnv != nullptr
+        && (std::string(pruneEnv) == "1" || std::string(pruneEnv) == "true" || std::string(pruneEnv) == "yes");
+    bool const disablePruned = pruneEnv != nullptr
+        && (std::string(pruneEnv) == "0" || std::string(pruneEnv) == "false" || std::string(pruneEnv) == "no");
+    if (disablePruned)
+    {
+        LOG_INFO("Qwen3-TTS text vocab pruning disabled by QWEN3_TTS_VOCAB_PRUNED=%s", pruneEnv);
+        return true;
+    }
+
     std::filesystem::path const tokenMapPath = weightsDir / "token_map.bin";
     if (!std::filesystem::exists(tokenMapPath))
     {
+        if (forcePruned)
+        {
+            LOG_ERROR("QWEN3_TTS_VOCAB_PRUNED=1 but token_map.bin was not found in: %s", weightsDir.string().c_str());
+            return false;
+        }
         return true;
     }
 
