@@ -100,26 +100,30 @@ void invokeScatter(rt::Tensor const& source, rt::Tensor const& indices, rt::Tens
 //!   [0-2]:        projected[0-2]                            (role tokens)
 //!   [3]:          ttsPadEmbed + talkerEmbTable[codecNothinkId]
 //!   [4]:          ttsPadEmbed + talkerEmbTable[codecThinkBosId]
-//!   [5]:          ttsPadEmbed + talkerEmbTable[codecThinkEosId]
-//!   [6]:          ttsPadEmbed + talkerEmbTable[codecThinkEosId]
-//!   [7]:          optional raw speaker embedding
-//!   [7+s]:        ttsBosEmbed + talkerEmbTable[codecPadId]
-//!   [8+s..]:      projected[3+i] + talkerEmbTable[codecPadId]  (text tokens, N=textLen)
-//!   [8+s+N]:      ttsEosEmbed + talkerEmbTable[codecPadId]
-//!   [8+s+N+1]:    ttsPadEmbed + talkerEmbTable[codecBosId]
+//!   [5]:          ttsPadEmbed + talkerEmbTable[languageId]
+//!   [6]:          speaker condition row:
+//!                   - external clone embedding, when hasSpeakerEmbedding
+//!                   - ttsPadEmbed + talkerEmbTable[speakerId], when speakerId >= 0
+//!                   - ttsPadEmbed + talkerEmbTable[codecThinkEosId], default/canonical path
+//!   [7]:          ttsBosEmbed + talkerEmbTable[codecPadId]
+//!   [8..8+N-1]:   projected[3+i] + talkerEmbTable[codecPadId]  (text tokens, N=textLen)
+//!   [8+N]:        ttsEosEmbed + talkerEmbTable[codecPadId]
+//!   [8+N+1]:      ttsPadEmbed + talkerEmbTable[codecBosId]
 //!
 //! \param projected      MLP output [seqLen, H] (FP16)
 //! \param ttsPadEmbed/ttsBosEmbed/ttsEosEmbed  TTS special embeddings [H] (FP16)
 //! \param talkerEmbTable Talker embedding table [vocabSize, H] (FP16)
 //! \param codecNothinkId..codecBosId  Codec token IDs used in rows [3-8+N+1]
-//! \param speakerEmbedding Optional raw speaker embedding, used when hasSpeakerEmbedding is true
+//! \param speakerId      Local speaker token ID for row 6; negative keeps the canonical codecThinkEos row
+//! \param speakerEmbedding Optional raw speaker embedding replacing row 6 when hasSpeakerEmbedding is true
 //! \param textLen        Number of text token rows (N = seqLen - 8)
 //! \param output         Full output buffer [8+N+2, H] (FP16)
 //! \param stream         CUDA stream
 void invokeAssistantPreamble(rt::Tensor const& projected, rt::Tensor const& ttsPadEmbed, rt::Tensor const& ttsBosEmbed,
     rt::Tensor const& ttsEosEmbed, rt::Tensor const& talkerEmbTable, int32_t codecNothinkId, int32_t codecThinkBosId,
-    int32_t languageId, int32_t codecThinkEosId, int32_t codecPadId, int32_t codecBosId, int32_t textLen,
-    rt::Tensor const& speakerEmbedding, bool hasSpeakerEmbedding, rt::Tensor& output, cudaStream_t stream);
+    int32_t languageId, int32_t codecThinkEosId, int32_t speakerId, int32_t codecPadId, int32_t codecBosId,
+    int32_t textLen, rt::Tensor const& speakerEmbedding, bool hasSpeakerEmbedding, rt::Tensor& output,
+    cudaStream_t stream);
 
 //! \brief Fused residual connection for TTS decode input
 //!

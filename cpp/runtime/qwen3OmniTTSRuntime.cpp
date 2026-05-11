@@ -3092,7 +3092,7 @@ void Qwen3OmniTTSRuntime::initializeTTSEmbeddings(cudaStream_t stream)
 }
 
 bool Qwen3OmniTTSRuntime::projectToTalkerInput(
-    rt::Tensor const& thinkerEmbed, int32_t langId, std::vector<float> const& speakerEmbedding,
+    rt::Tensor const& thinkerEmbed, int32_t langId, int32_t speakerId, std::vector<float> const& speakerEmbedding,
     rt::Tensor& output, int64_t& outputSeqLen, cudaStream_t stream)
 {
     int64_t const seqLen = thinkerEmbed.getShape()[0];
@@ -3110,7 +3110,7 @@ bool Qwen3OmniTTSRuntime::projectToTalkerInput(
     }
     if (mUseHostTextProjection)
     {
-        return projectToTalkerInputHost(thinkerEmbed, langId, speakerEmbedding, output, outputSeqLen, stream);
+        return projectToTalkerInputHost(thinkerEmbed, langId, speakerId, speakerEmbedding, output, outputSeqLen, stream);
     }
     bool const hasSpeakerEmbedding = !speakerEmbedding.empty();
     if (hasSpeakerEmbedding && static_cast<int64_t>(speakerEmbedding.size()) != hiddenSize)
@@ -3120,10 +3120,9 @@ bool Qwen3OmniTTSRuntime::projectToTalkerInput(
         return false;
     }
 
-    // Fixed 9-row prefill, or 10 rows when x-vector voice cloning is used.
-    // The remaining
-    // text body tokens and the TTS EOS are injected through residual feedback.
-    outputSeqLen = hasSpeakerEmbedding ? 10 : 9;
+    // Fixed 9-row prefill. Row 6 is the single speaker-conditioning slot:
+    // canonical codecThinkEos, local speaker token, or external clone embedding.
+    outputSeqLen = 9;
 
     // Store trailing text length for residual addend (body[1:] + tts_eos)
     mTrailingTextLen = static_cast<int32_t>(N);
@@ -3148,7 +3147,7 @@ bool Qwen3OmniTTSRuntime::projectToTalkerInput(
     check::check(output.reshape({outputSeqLen, hiddenSize}), "Tensor reshape failed");
     kernel::invokeAssistantPreamble(mProjectedBuffer, mTtsPadEmbed, mTtsBosEmbed, mTtsEosEmbed, mTalkerEmbeddingTable,
         mTalkerConfig.codecThinkId, mTalkerConfig.codecThinkBosId,
-        langId, mTalkerConfig.codecThinkEosId,
+        langId, mTalkerConfig.codecThinkEosId, speakerId,
         mTalkerConfig.codecPadId, mTalkerConfig.codecBosId,
         static_cast<int32_t>(N), mSpeakerEmbedding, hasSpeakerEmbedding, output, stream);
 
@@ -3156,7 +3155,7 @@ bool Qwen3OmniTTSRuntime::projectToTalkerInput(
 }
 
 bool Qwen3OmniTTSRuntime::projectToTalkerInputHost(
-    rt::Tensor const& thinkerEmbed, int32_t langId, std::vector<float> const& speakerEmbedding,
+    rt::Tensor const& thinkerEmbed, int32_t langId, int32_t speakerId, std::vector<float> const& speakerEmbedding,
     rt::Tensor& output, int64_t& outputSeqLen, cudaStream_t stream)
 {
     int64_t const seqLen = thinkerEmbed.getShape()[0];
@@ -3180,7 +3179,7 @@ bool Qwen3OmniTTSRuntime::projectToTalkerInputHost(
             speakerEmbedding.size(), hiddenSize);
         return false;
     }
-    outputSeqLen = hasSpeakerEmbedding ? 10 : 9;
+    outputSeqLen = 9;
     mTrailingTextLen = static_cast<int32_t>(N);
 
     auto hostInput = copyTensorToHostFloat(thinkerEmbed, seqLen * thinkerHiddenSize, stream);
@@ -3197,14 +3196,16 @@ bool Qwen3OmniTTSRuntime::projectToTalkerInputHost(
     addHostRows(prefill.data() + 4 * hiddenSize, mHostTtsPadEmbed.data(), codecRow(mTalkerConfig.codecThinkBosId),
         hiddenSize);
     addHostRows(prefill.data() + 5 * hiddenSize, mHostTtsPadEmbed.data(), codecRow(langId), hiddenSize);
-    addHostRows(prefill.data() + 6 * hiddenSize, mHostTtsPadEmbed.data(), codecRow(mTalkerConfig.codecThinkEosId),
-        hiddenSize);
-    int row = 7;
     if (hasSpeakerEmbedding)
     {
-        std::copy(speakerEmbedding.begin(), speakerEmbedding.end(), prefill.begin() + row * hiddenSize);
-        ++row;
+        std::copy(speakerEmbedding.begin(), speakerEmbedding.end(), prefill.begin() + 6 * hiddenSize);
     }
+    else
+    {
+        int32_t const speakerTokenId = speakerId >= 0 ? speakerId : mTalkerConfig.codecThinkEosId;
+        addHostRows(prefill.data() + 6 * hiddenSize, mHostTtsPadEmbed.data(), codecRow(speakerTokenId), hiddenSize);
+    }
+    int row = 7;
     addHostRows(prefill.data() + row * hiddenSize, mHostTtsBosEmbed.data(), codecRow(mTalkerConfig.codecPadId),
         hiddenSize);
     ++row;
@@ -3527,10 +3528,29 @@ bool Qwen3OmniTTSRuntime::prepareTalkerInput(std::vector<int32_t> const& textTok
             langId = it->second;
         }
     }
+    bool const hasCloneSpeaker = !request.speakerEmbedding.empty();
+    bool const hasLocalSpeaker = request.speakerId >= 0 || !request.speakerName.empty();
+    if (hasCloneSpeaker && hasLocalSpeaker)
+    {
+        LOG_ERROR("prepareTalkerInput: speaker_embedding cannot be combined with speaker or speaker_id");
+        return false;
+    }
+    int32_t speakerId = -1;
+    if (!hasCloneSpeaker)
+    {
+        if (request.speakerId >= 0)
+        {
+            speakerId = request.speakerId;
+        }
+        else if (!request.speakerName.empty())
+        {
+            speakerId = getSpeakerIdByName(request.speakerName);
+        }
+    }
 
     // MLP projection: thinker embed → talker input embeds (9-row prefill)
     int64_t const hiddenSize = mTalkerConfig.talkerHiddenSize;
-    if (!projectToTalkerInput(mThinkerEmbedBuffer, langId, request.speakerEmbedding, mTalkerInputEmbeds, outSeqLen,
+    if (!projectToTalkerInput(mThinkerEmbedBuffer, langId, speakerId, request.speakerEmbedding, mTalkerInputEmbeds, outSeqLen,
             stream))
     {
         LOG_ERROR("MLP projection failed");

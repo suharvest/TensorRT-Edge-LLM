@@ -385,9 +385,14 @@ Qwen3OmniTTSRuntime::TalkerGenerationRequest buildRequest(Json const& item)
     req.predictorTopP = item.value("predictor_top_p", 0.0f);
     req.language = item.value("language", "");
     req.speakerName = item.value("speaker", "");
+    req.speakerId = item.value("speaker_id", -1);
     if (item.contains("speaker_embedding_b64") && item["speaker_embedding_b64"].is_string())
     {
         req.speakerEmbedding = float32VectorFromBytes(base64Decode(item["speaker_embedding_b64"].get<std::string>()));
+    }
+    if (!req.speakerEmbedding.empty() && (req.speakerId >= 0 || !req.speakerName.empty()))
+    {
+        throw std::runtime_error("speaker_embedding_b64 cannot be combined with speaker or speaker_id");
     }
 
     Message msg;

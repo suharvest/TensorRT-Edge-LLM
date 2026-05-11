@@ -440,9 +440,9 @@ private:
      * @param stream CUDA stream
      * @return True on success, false on failure
      */
-    bool projectToTalkerInput(rt::Tensor const& thinkerEmbed, int32_t languageId,
+    bool projectToTalkerInput(rt::Tensor const& thinkerEmbed, int32_t languageId, int32_t speakerId,
         std::vector<float> const& speakerEmbedding, rt::Tensor& output, int64_t& outputSeqLen, cudaStream_t stream);
-    bool projectToTalkerInputHost(rt::Tensor const& thinkerEmbed, int32_t languageId,
+    bool projectToTalkerInputHost(rt::Tensor const& thinkerEmbed, int32_t languageId, int32_t speakerId,
         std::vector<float> const& speakerEmbedding, rt::Tensor& output, int64_t& outputSeqLen, cudaStream_t stream);
 
     //! Embed token IDs, run MLP projection, and reshape buffers ready for Talker prefill.
