@@ -12,6 +12,7 @@
 #include "runtime/llmRuntimeUtils.h"
 #include "runtime/qwen3OmniTTSRuntime.h"
 #include <algorithm>
+#include <array>
 #include <chrono>
 #include <cmath>
 #include <condition_variable>
@@ -317,6 +318,59 @@ bool savePcm16(std::string const& filepath, std::vector<int16_t> const& samples)
     return static_cast<bool>(file);
 }
 
+std::vector<uint8_t> base64Decode(std::string const& input)
+{
+    std::array<int8_t, 256> table{};
+    table.fill(-1);
+    for (int i = 0; i < 26; ++i)
+    {
+        table[static_cast<uint8_t>('A' + i)] = i;
+        table[static_cast<uint8_t>('a' + i)] = i + 26;
+    }
+    for (int i = 0; i < 10; ++i)
+    {
+        table[static_cast<uint8_t>('0' + i)] = i + 52;
+    }
+    table[static_cast<uint8_t>('+')] = 62;
+    table[static_cast<uint8_t>('/')] = 63;
+
+    std::vector<uint8_t> out;
+    out.reserve(input.size() * 3 / 4);
+    int val = 0;
+    int bits = -8;
+    for (unsigned char c : input)
+    {
+        if (c == '=')
+        {
+            break;
+        }
+        int8_t decoded = table[c];
+        if (decoded < 0)
+        {
+            continue;
+        }
+        val = (val << 6) + decoded;
+        bits += 6;
+        if (bits >= 0)
+        {
+            out.push_back(static_cast<uint8_t>((val >> bits) & 0xFF));
+            bits -= 8;
+        }
+    }
+    return out;
+}
+
+std::vector<float> float32VectorFromBytes(std::vector<uint8_t> const& bytes)
+{
+    if (bytes.size() % sizeof(float) != 0)
+    {
+        throw std::runtime_error("speaker_embedding_b64 size is not a float32 vector");
+    }
+    std::vector<float> values(bytes.size() / sizeof(float));
+    std::memcpy(values.data(), bytes.data(), bytes.size());
+    return values;
+}
+
 Qwen3OmniTTSRuntime::TalkerGenerationRequest buildRequest(Json const& item)
 {
     Qwen3OmniTTSRuntime::TalkerGenerationRequest req;
@@ -331,6 +385,10 @@ Qwen3OmniTTSRuntime::TalkerGenerationRequest buildRequest(Json const& item)
     req.predictorTopP = item.value("predictor_top_p", 0.0f);
     req.language = item.value("language", "");
     req.speakerName = item.value("speaker", "");
+    if (item.contains("speaker_embedding_b64") && item["speaker_embedding_b64"].is_string())
+    {
+        req.speakerEmbedding = float32VectorFromBytes(base64Decode(item["speaker_embedding_b64"].get<std::string>()));
+    }
 
     Message msg;
     msg.role = "user";

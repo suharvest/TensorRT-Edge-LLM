@@ -150,6 +150,7 @@ public:
         std::string speakerName{""}; //!< Speaker name (e.g., "f245", "m02") - empty means use default
         std::string language{""};    //!< Language hint (e.g., "chinese", "english")
         int32_t speakerId{-1};       //!< Speaker ID - if >= 0, overrides speakerName
+        std::vector<float> speakerEmbedding; //!< Optional raw x-vector embedding [talkerHiddenSize]
 
         // Input: conversation messages for this request (runtime tokenizes internally)
         std::vector<Message> messages;
@@ -365,6 +366,7 @@ private:
     rt::Tensor mMLPWorkspace;       //!< Workspace for MLP intermediate results [maxTokens, 2048] FP16
     rt::Tensor mProjectedBuffer;    //!< Buffer for projected tokens [maxTokens, 1024] FP16
     rt::Tensor mTalkerInputEmbeds;  //!< Final talker input embeddings [seqLen, 1024] FP16
+    rt::Tensor mSpeakerEmbedding;   //!< Optional raw speaker embedding [talkerHiddenSize] FP16
     rt::Tensor mSamplingWorkspace;  //!< Workspace for sampling operations
 
     // Talker LLM workspace
@@ -436,10 +438,10 @@ private:
      * @param stream CUDA stream
      * @return True on success, false on failure
      */
-    bool projectToTalkerInput(rt::Tensor const& thinkerEmbed, int32_t languageId, rt::Tensor& output,
-        int64_t& outputSeqLen, cudaStream_t stream);
-    bool projectToTalkerInputHost(rt::Tensor const& thinkerEmbed, int32_t languageId, rt::Tensor& output,
-        int64_t& outputSeqLen, cudaStream_t stream);
+    bool projectToTalkerInput(rt::Tensor const& thinkerEmbed, int32_t languageId,
+        std::vector<float> const& speakerEmbedding, rt::Tensor& output, int64_t& outputSeqLen, cudaStream_t stream);
+    bool projectToTalkerInputHost(rt::Tensor const& thinkerEmbed, int32_t languageId,
+        std::vector<float> const& speakerEmbedding, rt::Tensor& output, int64_t& outputSeqLen, cudaStream_t stream);
 
     //! Embed token IDs, run MLP projection, and reshape buffers ready for Talker prefill.
     //! Populates mTalkerInputEmbeds and mTalkerHiddenStatesBuffer as side effects.
