@@ -73,6 +73,14 @@ if(NOT DEFINED AARCH64_BUILD)
   endif()
 endif()
 
+# Fork-specific: highperf TTS Talker MLP path requires CuTe DSL GEMM kernels
+# (talkerMLPKernels.cu has no fallback, just emits LOG_ERROR). Prebuilt tarballs
+# are already shipped under kernelSrcs/cuteDSLPrebuilt/ for sm_87 / sm_110 /
+# sm_121, so enabling this by default does not require an extra artifact build.
+# Upstream/official branches keep ENABLE_CUTE_DSL=OFF; on the highperf product
+# line we default to `gemm` so operators don't have to remember the flag.
+set_ifndef(ENABLE_CUTE_DSL "gemm")
+
 # Orin/JetPack cuda.h may lack cudaLibrary_t; GDN runner uses compat typedef
 # when this is set.
 if(DEFINED EMBEDDED_TARGET AND EMBEDDED_TARGET STREQUAL "jetson-orin")
