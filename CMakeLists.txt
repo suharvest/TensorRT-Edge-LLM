@@ -79,7 +79,13 @@ endif()
 # sm_121, so enabling this by default does not require an extra artifact build.
 # Upstream/official branches keep ENABLE_CUTE_DSL=OFF; on the highperf product
 # line we default to `gemm` so operators don't have to remember the flag.
-set_ifndef(ENABLE_CUTE_DSL "gemm")
+# Must be applied to the CACHE entry (set_ifndef only sets a normal variable,
+# which the cute_dsl_setup() function evaluates after CuteDsl.cmake creates a
+# cache STRING with default "OFF"; the cache wins inside that scope).
+if(NOT DEFINED CACHE{ENABLE_CUTE_DSL})
+  set(ENABLE_CUTE_DSL "gemm" CACHE STRING
+      "CuTe DSL kernels (highperf fork default: gemm). Override with OFF/ALL/...")
+endif()
 
 # Orin/JetPack cuda.h may lack cudaLibrary_t; GDN runner uses compat typedef
 # when this is set.
