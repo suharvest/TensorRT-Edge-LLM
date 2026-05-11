@@ -27,7 +27,7 @@ enum class W8A16ScaleMode : int32_t
  * small-M path for streaming decode. Faster tiled kernels can use the same ABI.
  */
 void w8a16_linear_forward(half const* input, int8_t const* weight, half const* scales, half* output, int m, int n,
-    int k, W8A16ScaleMode scaleMode, int groupSize, cudaStream_t stream) noexcept;
+    int k, W8A16ScaleMode scaleMode, int groupSize, int weightLayout, cudaStream_t stream) noexcept;
 
 } // namespace kernel
 } // namespace trt_edgellm
