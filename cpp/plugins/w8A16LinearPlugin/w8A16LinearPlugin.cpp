@@ -7,8 +7,15 @@
 #include "kernels/w8A16LinearKernels/w8A16Linear.h"
 
 #include <cassert>
+#include <algorithm>
+#include <cstdlib>
 #include <cuda_fp16.h>
+#include <iostream>
+#include <limits>
+#include <map>
 #include <mutex>
+#include <sstream>
+#include <tuple>
 
 using namespace nvinfer1;
 
@@ -32,6 +39,96 @@ bool hasSupportedActivationRank(Dims const& dims)
     return dims.nbDims == 2 || dims.nbDims == 3;
 }
 
+struct W8A16ProfileStats
+{
+    uint64_t calls{0};
+    double totalMs{0.0};
+    float minMs{std::numeric_limits<float>::max()};
+    float maxMs{0.0F};
+};
+
+std::mutex& w8A16ProfileMutex()
+{
+    static std::mutex mutex;
+    return mutex;
+}
+
+std::map<std::tuple<int32_t, int32_t, int32_t>, W8A16ProfileStats>& w8A16ProfileStatsMap()
+{
+    static std::map<std::tuple<int32_t, int32_t, int32_t>, W8A16ProfileStats> stats;
+    return stats;
+}
+
+bool w8A16ProfileEnabled()
+{
+    static bool enabled = [] {
+        char const* value = std::getenv("EDGE_LLM_W8A16_PROFILE");
+        return value != nullptr && value[0] != '\0' && value[0] != '0';
+    }();
+    return enabled;
+}
+
+void printW8A16ProfileSummary()
+{
+    if (!w8A16ProfileEnabled())
+    {
+        return;
+    }
+    std::lock_guard<std::mutex> lock(w8A16ProfileMutex());
+    auto const& stats = w8A16ProfileStatsMap();
+    if (stats.empty())
+    {
+        return;
+    }
+    std::cerr << "[W8A16_PROFILE] summary shapes=" << stats.size() << std::endl;
+    for (auto const& item : stats)
+    {
+        auto const& key = item.first;
+        auto const& value = item.second;
+        double avg = value.calls == 0 ? 0.0 : value.totalMs / static_cast<double>(value.calls);
+        std::cerr << "[W8A16_PROFILE] M=" << std::get<0>(key) << " K=" << std::get<1>(key)
+                  << " N=" << std::get<2>(key) << " calls=" << value.calls << " avg_ms=" << avg
+                  << " total_ms=" << value.totalMs << " min_ms=" << value.minMs << " max_ms=" << value.maxMs
+                  << std::endl;
+    }
+}
+
+void registerW8A16ProfilePrinter()
+{
+    static bool registered = [] {
+        if (w8A16ProfileEnabled())
+        {
+            std::atexit(printW8A16ProfileSummary);
+        }
+        return true;
+    }();
+    (void) registered;
+}
+
+void updateW8A16Profile(int32_t M, int32_t K, int32_t N, float elapsedMs)
+{
+    bool shouldPrint = false;
+    {
+        std::lock_guard<std::mutex> lock(w8A16ProfileMutex());
+        auto& stats = w8A16ProfileStatsMap()[std::make_tuple(M, K, N)];
+        stats.calls += 1;
+        stats.totalMs += static_cast<double>(elapsedMs);
+        stats.minMs = std::min(stats.minMs, elapsedMs);
+        stats.maxMs = std::max(stats.maxMs, elapsedMs);
+
+        uint64_t totalCalls = 0;
+        for (auto const& item : w8A16ProfileStatsMap())
+        {
+            totalCalls += item.second.calls;
+        }
+        shouldPrint = (totalCalls % 1000U) == 0U;
+    }
+    if (shouldPrint)
+    {
+        printW8A16ProfileSummary();
+    }
+}
+
 } // namespace
 
 PluginFieldCollection W8A16LinearPluginCreator::mFieldCollection{};
@@ -40,12 +137,13 @@ std::vector<PluginField> W8A16LinearPluginCreator::mPluginAttributes;
 REGISTER_TENSORRT_PLUGIN(W8A16LinearPluginCreator);
 
 W8A16LinearPlugin::W8A16LinearPlugin(
-    std::string const& name, int32_t N, int32_t K, int32_t scaleMode, int32_t groupSize)
+    std::string const& name, int32_t N, int32_t K, int32_t scaleMode, int32_t groupSize, int32_t weightLayout)
     : mLayerName(name)
     , mGemmN(N)
     , mGemmK(K)
     , mScaleMode(scaleMode)
     , mGroupSize(groupSize)
+    , mWeightLayout(weightLayout)
 {
 }
 
@@ -70,6 +168,10 @@ W8A16LinearPlugin::W8A16LinearPlugin(std::string const& name, PluginFieldCollect
         else if (fieldName == "group_size")
         {
             mGroupSize = *static_cast<int32_t const*>(fc->fields[i].data);
+        }
+        else if (fieldName == "weight_layout")
+        {
+            mWeightLayout = *static_cast<int32_t const*>(fc->fields[i].data);
         }
     }
 }
@@ -100,7 +202,7 @@ IPluginV3* W8A16LinearPlugin::clone() noexcept
 {
     try
     {
-        auto* plugin = new W8A16LinearPlugin(mLayerName, mGemmN, mGemmK, mScaleMode, mGroupSize);
+        auto* plugin = new W8A16LinearPlugin(mLayerName, mGemmN, mGemmK, mScaleMode, mGroupSize, mWeightLayout);
         plugin->setPluginNamespace(mNamespace.c_str());
         return plugin;
     }
@@ -189,7 +291,8 @@ bool W8A16LinearPlugin::supportsFormatCombination(
                 && hasSupportedActivationRank(desc.dims) && getLastDim(desc.dims) == mGemmK;
         case 1:
             return desc.type == DataType::kINT8 && desc.format == PluginFormat::kLINEAR && desc.dims.nbDims == 2
-                && desc.dims.d[0] == mGemmK && desc.dims.d[1] == mGemmN;
+                && ((mWeightLayout == 1 && desc.dims.d[0] == mGemmN && desc.dims.d[1] == mGemmK)
+                    || (mWeightLayout != 1 && desc.dims.d[0] == mGemmK && desc.dims.d[1] == mGemmN));
         case 2:
             return desc.type == DataType::kHALF && desc.format == PluginFormat::kLINEAR && desc.dims.nbDims == 1
                 && desc.dims.d[0] == mGemmN;
@@ -234,8 +337,29 @@ int32_t W8A16LinearPlugin::enqueue(PluginTensorDesc const* inputDesc, PluginTens
         auto const* scalesPtr = reinterpret_cast<half const*>(inputs[2]);
         auto* outputPtr = reinterpret_cast<half*>(outputs[0]);
 
-        trt_edgellm::kernel::w8a16_linear_forward(inputPtr, weightPtr, scalesPtr, outputPtr, M, mGemmN, mGemmK,
-            static_cast<trt_edgellm::kernel::W8A16ScaleMode>(mScaleMode), mGroupSize, stream);
+        if (w8A16ProfileEnabled())
+        {
+            registerW8A16ProfilePrinter();
+            cudaEvent_t start{};
+            cudaEvent_t stop{};
+            cudaEventCreate(&start);
+            cudaEventCreate(&stop);
+            cudaEventRecord(start, stream);
+            trt_edgellm::kernel::w8a16_linear_forward(inputPtr, weightPtr, scalesPtr, outputPtr, M, mGemmN, mGemmK,
+                static_cast<trt_edgellm::kernel::W8A16ScaleMode>(mScaleMode), mGroupSize, mWeightLayout, stream);
+            cudaEventRecord(stop, stream);
+            cudaEventSynchronize(stop);
+            float elapsedMs{0.0F};
+            cudaEventElapsedTime(&elapsedMs, start, stop);
+            cudaEventDestroy(start);
+            cudaEventDestroy(stop);
+            updateW8A16Profile(M, mGemmK, mGemmN, elapsedMs);
+        }
+        else
+        {
+            trt_edgellm::kernel::w8a16_linear_forward(inputPtr, weightPtr, scalesPtr, outputPtr, M, mGemmN, mGemmK,
+                static_cast<trt_edgellm::kernel::W8A16ScaleMode>(mScaleMode), mGroupSize, mWeightLayout, stream);
+        }
         return 0;
     }
     catch (std::exception const&)
@@ -263,6 +387,7 @@ PluginFieldCollection const* W8A16LinearPlugin::getFieldsToSerialize() noexcept
     mDataToSerialize.emplace_back("gemm_k", &mGemmK, PluginFieldType::kINT32, 1);
     mDataToSerialize.emplace_back("scale_mode", &mScaleMode, PluginFieldType::kINT32, 1);
     mDataToSerialize.emplace_back("group_size", &mGroupSize, PluginFieldType::kINT32, 1);
+    mDataToSerialize.emplace_back("weight_layout", &mWeightLayout, PluginFieldType::kINT32, 1);
 
     mFCToSerialize.nbFields = mDataToSerialize.size();
     mFCToSerialize.fields = mDataToSerialize.data();
@@ -279,6 +404,7 @@ W8A16LinearPluginCreator::W8A16LinearPluginCreator()
     mPluginAttributes.emplace_back(PluginField("gemm_k", nullptr, PluginFieldType::kINT32, 1));
     mPluginAttributes.emplace_back(PluginField("scale_mode", nullptr, PluginFieldType::kINT32, 1));
     mPluginAttributes.emplace_back(PluginField("group_size", nullptr, PluginFieldType::kINT32, 1));
+    mPluginAttributes.emplace_back(PluginField("weight_layout", nullptr, PluginFieldType::kINT32, 1));
 
     mFieldCollection.nbFields = mPluginAttributes.size();
     mFieldCollection.fields = mPluginAttributes.data();

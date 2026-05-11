@@ -31,7 +31,7 @@ class W8A16LinearPlugin : public nvinfer1::IPluginV3,
                           public nvinfer1::IPluginV3OneRuntime
 {
 public:
-    W8A16LinearPlugin(std::string const& name, int32_t N, int32_t K, int32_t scaleMode, int32_t groupSize);
+    W8A16LinearPlugin(std::string const& name, int32_t N, int32_t K, int32_t scaleMode, int32_t groupSize, int32_t weightLayout);
     W8A16LinearPlugin(std::string const& name, nvinfer1::PluginFieldCollection const* fc);
     W8A16LinearPlugin() = delete;
     W8A16LinearPlugin(W8A16LinearPlugin const&) = delete;
@@ -79,6 +79,7 @@ private:
     int32_t mGemmK{};
     int32_t mScaleMode{};
     int32_t mGroupSize{};
+    int32_t mWeightLayout{};
 
     std::vector<nvinfer1::PluginField> mDataToSerialize;
     nvinfer1::PluginFieldCollection mFCToSerialize;
