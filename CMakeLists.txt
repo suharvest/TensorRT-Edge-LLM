@@ -86,6 +86,17 @@ if(NOT DEFINED CACHE{ENABLE_CUTE_DSL})
   set(ENABLE_CUTE_DSL "gemm" CACHE STRING
       "CuTe DSL kernels (highperf fork default: gemm). Override with OFF/ALL/...")
 endif()
+# CuTe DSL artifact tag is inferred from EMBEDDED_TARGET (jetson_orin -> sm_87);
+# without it the artifact dir scan fails on a fresh checkout. Pin both defaults
+# so the fork's highperf build configures out-of-the-box on Orin.
+if(NOT DEFINED EMBEDDED_TARGET)
+  set(EMBEDDED_TARGET "jetson_orin"
+      CACHE STRING "Embedded target (highperf fork default: jetson_orin)")
+endif()
+if(NOT DEFINED CACHE{CUTE_DSL_ARTIFACT_TAG})
+  set(CUTE_DSL_ARTIFACT_TAG "sm_87" CACHE STRING
+      "CuTe DSL artifact tag (highperf fork default: sm_87)")
+endif()
 
 # Orin/JetPack cuda.h may lack cudaLibrary_t; GDN runner uses compat typedef
 # when this is set.
