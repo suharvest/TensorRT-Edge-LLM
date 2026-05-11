@@ -117,9 +117,10 @@ void invokeScatter(rt::Tensor const& source, rt::Tensor const& indices, rt::Tens
 //! \param output         Full output buffer [8+N+2, H] (FP16)
 //! \param stream         CUDA stream
 void invokeAssistantPreamble(rt::Tensor const& projected, rt::Tensor const& ttsPadEmbed, rt::Tensor const& ttsBosEmbed,
-    rt::Tensor const& ttsEosEmbed, rt::Tensor const& talkerEmbTable, int32_t codecNothinkId, int32_t codecThinkBosId,
-    int32_t languageId, int32_t codecThinkEosId, int32_t codecPadId, int32_t codecBosId, int32_t textLen,
-    rt::Tensor const& speakerEmbedding, bool hasSpeakerEmbedding, rt::Tensor& output, cudaStream_t stream);
+    rt::Tensor const& ttsEosEmbed, rt::Tensor const& talkerEmbTable, int32_t codecThinkId, int32_t codecNothinkId,
+    int32_t codecThinkBosId, int32_t languageId, int32_t codecThinkEosId, int32_t speakerId, int32_t codecPadId,
+    int32_t codecBosId, int32_t textLen, rt::Tensor const& speakerEmbedding, bool hasSpeakerEmbedding,
+    rt::Tensor& output, cudaStream_t stream);
 
 //! \brief Fused residual connection for TTS decode input
 //!

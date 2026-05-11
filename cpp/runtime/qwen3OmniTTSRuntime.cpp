@@ -3147,9 +3147,9 @@ bool Qwen3OmniTTSRuntime::projectToTalkerInput(
     // Fused kernel: build complete non-streaming prefill buffer
     check::check(output.reshape({outputSeqLen, hiddenSize}), "Tensor reshape failed");
     kernel::invokeAssistantPreamble(mProjectedBuffer, mTtsPadEmbed, mTtsBosEmbed, mTtsEosEmbed, mTalkerEmbeddingTable,
-        mTalkerConfig.codecThinkId, mTalkerConfig.codecThinkBosId,
-        langId, mTalkerConfig.codecThinkEosId,
-        mTalkerConfig.codecPadId, mTalkerConfig.codecBosId,
+        mTalkerConfig.codecThinkId, mTalkerConfig.codecNothinkId,
+        mTalkerConfig.codecThinkBosId, langId, mTalkerConfig.codecThinkEosId,
+        mTalkerConfig.defaultSpeakerId, mTalkerConfig.codecPadId, mTalkerConfig.codecBosId,
         static_cast<int32_t>(N), mSpeakerEmbedding, hasSpeakerEmbedding, output, stream);
 
     return true;
@@ -3192,13 +3192,19 @@ bool Qwen3OmniTTSRuntime::projectToTalkerInputHost(
     auto codecRow = [&](int32_t token) {
         return mHostTalkerEmbeddingTable.data() + static_cast<size_t>(token) * hiddenSize;
     };
-    addHostRows(prefill.data() + 3 * hiddenSize, mHostTtsPadEmbed.data(), codecRow(mTalkerConfig.codecThinkId),
-        hiddenSize);
+    // Layout matches the kernel path in assistantPreambleKernel:
+    //   hasSpeakerEmbedding=false → frozen-artifact layout
+    //     (row 3 codecNothink, row 5 codecThinkEos, row 6 speakerId, row 7 ttsBos)
+    //   hasSpeakerEmbedding=true  → highperf clone layout
+    //     (row 3 codecThink, row 5 languageId, row 6 codecThinkEos, row 7 speaker, row 8 ttsBos)
+    int32_t const row3Id = hasSpeakerEmbedding ? mTalkerConfig.codecThinkId : mTalkerConfig.codecNothinkId;
+    int32_t const row5Id = hasSpeakerEmbedding ? langId : mTalkerConfig.codecThinkEosId;
+    int32_t const row6Id = hasSpeakerEmbedding ? mTalkerConfig.codecThinkEosId : mTalkerConfig.defaultSpeakerId;
+    addHostRows(prefill.data() + 3 * hiddenSize, mHostTtsPadEmbed.data(), codecRow(row3Id), hiddenSize);
     addHostRows(prefill.data() + 4 * hiddenSize, mHostTtsPadEmbed.data(), codecRow(mTalkerConfig.codecThinkBosId),
         hiddenSize);
-    addHostRows(prefill.data() + 5 * hiddenSize, mHostTtsPadEmbed.data(), codecRow(langId), hiddenSize);
-    addHostRows(prefill.data() + 6 * hiddenSize, mHostTtsPadEmbed.data(), codecRow(mTalkerConfig.codecThinkEosId),
-        hiddenSize);
+    addHostRows(prefill.data() + 5 * hiddenSize, mHostTtsPadEmbed.data(), codecRow(row5Id), hiddenSize);
+    addHostRows(prefill.data() + 6 * hiddenSize, mHostTtsPadEmbed.data(), codecRow(row6Id), hiddenSize);
     int row = 7;
     if (hasSpeakerEmbedding)
     {

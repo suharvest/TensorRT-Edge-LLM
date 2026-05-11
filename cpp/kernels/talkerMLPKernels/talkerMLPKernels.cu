@@ -437,25 +437,46 @@ void invokeScatter(rt::Tensor const& source, rt::Tensor const& indices, rt::Tens
 
 //! \brief Non-streaming fused assistant preamble construction kernel
 //!
-//! Each block handles one output row (blockIdx.x). Total rows = 8 + textLen + 2.
+//! Each block handles one output row (blockIdx.x).
 //!
-//! Row definitions:
+//! Two layouts coexist:
+//!
+//! (A) Default / no-clone (hasSpeakerEmbedding=false), matches the row
+//! ordering the orin-{nx,nano}-highperf-2026-05-10/11 frozen artifacts
+//! were exported against. Total rows = 8 + textLen + 2.
+//!   0-2:        copy projected[0-2]
+//!   3:          ttsPad + embTable[codecNothinkId]
+//!   4:          ttsPad + embTable[codecThinkBosId]
+//!   5:          ttsPad + embTable[codecThinkEosId]
+//!   6:          ttsPad + embTable[speakerId]
+//!   7:          ttsBos + embTable[codecPadId]
+//!   8..7+N:     projected[3+i] + embTable[codecPadId]
+//!   8+N:        ttsEos + embTable[codecPadId]
+//!   8+N+1:      ttsPad + embTable[codecBosId]
+//!
+//! (B) Voice clone (hasSpeakerEmbedding=true). Total rows = 9 + textLen + 2.
 //!   0-2:        copy projected[0-2]
 //!   3:          ttsPad + embTable[codecThinkId]
 //!   4:          ttsPad + embTable[codecThinkBosId]
 //!   5:          ttsPad + embTable[languageId]
 //!   6:          ttsPad + embTable[codecThinkEosId]
-//!   7:          optional raw speaker embedding
-//!   7+s:        ttsBos + embTable[codecPadId]
-//!   8+s..:      projected[3+i] + embTable[codecPadId]
-//!   8+s+N:      ttsEos + embTable[codecPadId]
-//!   8+s+N+1:    ttsPad + embTable[codecBosId]
+//!   7:          raw speaker embedding
+//!   8:          ttsBos + embTable[codecPadId]
+//!   9..8+N:     projected[3+i] + embTable[codecPadId]
+//!   9+N:        ttsEos + embTable[codecPadId]
+//!   9+N+1:      ttsPad + embTable[codecBosId]
+//!
+//! Reverting the no-clone path to layout (A) restores the prefill semantics
+//! the frozen Talker engines were trained against. Without it the first
+//! codec token diverges (1995 → 1574/1093) and the audio degenerates into
+//! one repeated character. See docs/issues/2026-05-11-tts-audio-quality-regression.md
 template <int32_t VEC_SIZE = 8>
 __global__ void assistantPreambleKernel(half const* __restrict__ projected, half const* __restrict__ ttsPadEmbed,
     half const* __restrict__ ttsBosEmbed, half const* __restrict__ ttsEosEmbed, half const* __restrict__ embTable,
-    int32_t codecThinkId, int32_t codecThinkBosId, int32_t languageId, int32_t codecThinkEosId, int32_t codecPadId,
-    int32_t codecBosId, int32_t textLen, half const* __restrict__ speakerEmbedding, bool hasSpeakerEmbedding,
-    int32_t hiddenDim, half* __restrict__ output)
+    int32_t codecThinkId, int32_t codecNothinkId, int32_t codecThinkBosId, int32_t languageId,
+    int32_t codecThinkEosId, int32_t speakerId, int32_t codecPadId, int32_t codecBosId, int32_t textLen,
+    half const* __restrict__ speakerEmbedding, bool hasSpeakerEmbedding, int32_t hiddenDim,
+    half* __restrict__ output)
 {
     int32_t const rowIdx = blockIdx.x;
     int32_t const speakerRows = hasSpeakerEmbedding ? 1 : 0;
@@ -483,7 +504,7 @@ __global__ void assistantPreambleKernel(half const* __restrict__ projected, half
         case 2: srcA = projected + 2 * hiddenDim; break;
         case 3:
             srcA = ttsPadEmbed;
-            srcB = embTable + static_cast<int64_t>(codecThinkId) * hiddenDim;
+            srcB = embTable + static_cast<int64_t>(hasSpeakerEmbedding ? codecThinkId : codecNothinkId) * hiddenDim;
             break;
         case 4:
             srcA = ttsPadEmbed;
@@ -491,11 +512,11 @@ __global__ void assistantPreambleKernel(half const* __restrict__ projected, half
             break;
         case 5:
             srcA = ttsPadEmbed;
-            srcB = embTable + static_cast<int64_t>(languageId) * hiddenDim;
+            srcB = embTable + static_cast<int64_t>(hasSpeakerEmbedding ? languageId : codecThinkEosId) * hiddenDim;
             break;
         default: // rowIdx == 6
             srcA = ttsPadEmbed;
-            srcB = embTable + static_cast<int64_t>(codecThinkEosId) * hiddenDim;
+            srcB = embTable + static_cast<int64_t>(hasSpeakerEmbedding ? codecThinkEosId : speakerId) * hiddenDim;
             break;
         }
     }
@@ -542,9 +563,10 @@ __global__ void assistantPreambleKernel(half const* __restrict__ projected, half
 }
 
 void invokeAssistantPreamble(rt::Tensor const& projected, rt::Tensor const& ttsPadEmbed, rt::Tensor const& ttsBosEmbed,
-    rt::Tensor const& ttsEosEmbed, rt::Tensor const& talkerEmbTable, int32_t codecNothinkId, int32_t codecThinkBosId,
-    int32_t languageId, int32_t codecThinkEosId, int32_t codecPadId, int32_t codecBosId, int32_t textLen,
-    rt::Tensor const& speakerEmbedding, bool hasSpeakerEmbedding, rt::Tensor& output, cudaStream_t stream)
+    rt::Tensor const& ttsEosEmbed, rt::Tensor const& talkerEmbTable, int32_t codecThinkId, int32_t codecNothinkId,
+    int32_t codecThinkBosId, int32_t languageId, int32_t codecThinkEosId, int32_t speakerId, int32_t codecPadId,
+    int32_t codecBosId, int32_t textLen, rt::Tensor const& speakerEmbedding, bool hasSpeakerEmbedding,
+    rt::Tensor& output, cudaStream_t stream)
 {
     constexpr int32_t kVecSize = 8;
 
@@ -564,8 +586,8 @@ void invokeAssistantPreamble(rt::Tensor const& projected, rt::Tensor const& ttsP
     half* outPtr = static_cast<half*>(output.rawPointer());
 
     assistantPreambleKernel<kVecSize><<<grid, block, 0, stream>>>(projPtr, padPtr, bosPtr, eosPtr, embPtr,
-        codecNothinkId, codecThinkBosId, languageId, codecThinkEosId, codecPadId, codecBosId, textLen,
-        speakerEmbedding.dataPointer<half>(), hasSpeakerEmbedding, hiddenDim, outPtr);
+        codecThinkId, codecNothinkId, codecThinkBosId, languageId, codecThinkEosId, speakerId, codecPadId, codecBosId,
+        textLen, speakerEmbedding.dataPointer<half>(), hasSpeakerEmbedding, hiddenDim, outPtr);
     CUDA_CHECK(cudaPeekAtLastError());
 }
 
