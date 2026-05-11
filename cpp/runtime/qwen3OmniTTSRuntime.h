@@ -341,6 +341,8 @@ private:
 
     // ========== Embedding Tables ==========
     rt::Tensor mTextEmbeddingTable; //!< Text embedding table [thinkerVocabSize, thinkerHiddenSize] (for standalone TTS)
+    rt::Tensor mTextEmbeddingScale; //!< Optional per-group dequant scales [vocab, hidden/128] when text embedding is FP8
+    bool mTextEmbeddingHasScale{false}; //!< True when mTextEmbeddingScale is populated (FP8 text embedding)
     std::vector<int32_t>
         mTextTokenIdToPrunedRow; //!< Optional original thinker token ID -> pruned text embedding row mapping
     bool mUsePrunedTextEmbedding{false};

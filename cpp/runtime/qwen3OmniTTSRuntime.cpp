@@ -2812,11 +2812,47 @@ bool Qwen3OmniTTSRuntime::loadTalkerWeights(std::string const& weightsDir, cudaS
         return false;
     }
     check::check(!textEmbedTensors.empty(), "text_embedding.safetensors is empty");
+    // Look up tensors by name. The file may contain just `text_embedding`
+    // (FP16/BF16 path) or both `text_embedding` (FP8) plus
+    // `text_embedding_scale` (FP32 per-group scales) when produced by
+    // scripts/quantize_embedding_safetensors_fp8.py. Indexing by position is
+    // unsafe because nlohmann::json sorts keys alphabetically on parse, so
+    // tensor[0] could be either depending on naming.
+    rt::Tensor* textEmbedPtr = nullptr;
+    rt::Tensor* textEmbedScalePtr = nullptr;
+    for (auto& t : textEmbedTensors)
+    {
+        std::string const& n = t.getName();
+        if (n == "text_embedding")
+        {
+            textEmbedPtr = &t;
+        }
+        else if (n == "text_embedding_scale")
+        {
+            textEmbedScalePtr = &t;
+        }
+    }
+    if (textEmbedPtr == nullptr && textEmbedTensors.size() == 1)
+    {
+        // Backward-compatible: legacy single-tensor file with no explicit name match.
+        textEmbedPtr = &textEmbedTensors[0];
+    }
     check::check(
-        textEmbedTensors[0].getShape().getNumDims() == 2, "text_embedding tensor should be 2D [vocabSize, hiddenSize]");
-    mTextEmbeddingTable = std::move(textEmbedTensors[0]);
+        textEmbedPtr != nullptr, "text_embedding.safetensors must contain a tensor named `text_embedding`");
+    check::check(textEmbedPtr->getShape().getNumDims() == 2,
+        "text_embedding tensor should be 2D [vocabSize, hiddenSize]");
+    mTextEmbeddingTable = std::move(*textEmbedPtr);
     LOG_INFO("Text embedding table loaded: [%lld, %lld]", mTextEmbeddingTable.getShape()[0],
         mTextEmbeddingTable.getShape()[1]);
+    if (textEmbedScalePtr != nullptr)
+    {
+        check::check(textEmbedScalePtr->getShape().getNumDims() == 2,
+            "text_embedding_scale tensor should be 2D [vocabSize, hiddenSize/blockSize]");
+        mTextEmbeddingScale = std::move(*textEmbedScalePtr);
+        mTextEmbeddingHasScale = true;
+        LOG_INFO("Text embedding scale loaded: [%lld, %lld] (FP8 dequant per-group scales)",
+            mTextEmbeddingScale.getShape()[0], mTextEmbeddingScale.getShape()[1]);
+    }
     if (!loadTextTokenMap(std::filesystem::path(weightsDir)))
     {
         return false;
@@ -3014,7 +3050,8 @@ void Qwen3OmniTTSRuntime::initializeTTSEmbeddings(cudaStream_t stream)
     CUDA_CHECK(cudaMemcpyAsync(
         ttsIds.rawPointer(), hostTtsIds.data(), kNumTtsTokens * sizeof(int32_t), cudaMemcpyHostToDevice, stream));
 
-    kernel::embeddingLookup(ttsIds, mTextEmbeddingTable, std::nullopt, ttsRaw, stream);
+    kernel::embeddingLookup(ttsIds, mTextEmbeddingTable,
+        mTextEmbeddingHasScale ? rt::OptionalInputTensor{mTextEmbeddingScale} : std::nullopt, ttsRaw, stream);
     // Reshape from [1, 3, hidden] to [3, hidden] for MLP (expects 2D input)
     check::check(ttsRaw.reshape({kNumTtsTokens, thinkerHiddenSize}), "Tensor reshape failed");
     if (mUseHostTextProjection)
@@ -3475,7 +3512,9 @@ bool Qwen3OmniTTSRuntime::prepareTalkerInput(std::vector<int32_t> const& textTok
     CUDA_CHECK(cudaMemcpyAsync(mGpuTokenIdsBuffer.rawPointer(), mappedTextTokenIds.data(), seqLen * sizeof(int32_t),
         cudaMemcpyHostToDevice, stream));
     check::check(mThinkerEmbedBuffer.reshape({1, seqLen, thinkerHiddenSize}), "Tensor reshape failed");
-    kernel::embeddingLookup(mGpuTokenIdsBuffer, mTextEmbeddingTable, std::nullopt, mThinkerEmbedBuffer, stream);
+    kernel::embeddingLookup(mGpuTokenIdsBuffer, mTextEmbeddingTable,
+        mTextEmbeddingHasScale ? rt::OptionalInputTensor{mTextEmbeddingScale} : std::nullopt,
+        mThinkerEmbedBuffer, stream);
     check::check(mThinkerEmbedBuffer.reshape({seqLen, thinkerHiddenSize}), "Tensor reshape failed");
 
     // Determine language ID for codec embedding (default: Chinese 2055)
