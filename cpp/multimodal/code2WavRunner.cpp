@@ -32,11 +32,31 @@
 #include <algorithm>
 #include <cmath>
 #include <cuda_fp16.h>
+#include <chrono>
+#include <cstdlib>
 #include <filesystem>
 #include <fstream>
 #include <stdexcept>
 
 using Json = nlohmann::json;
+
+namespace
+{
+
+using Clock = std::chrono::steady_clock;
+
+bool code2WavProfileEnabled()
+{
+    char const* env = std::getenv("QWEN3_TTS_CODE2WAV_PROFILE");
+    return env != nullptr && std::string(env) != "0";
+}
+
+double elapsedMs(Clock::time_point start)
+{
+    return std::chrono::duration<double, std::milli>(Clock::now() - start).count();
+}
+
+} // namespace
 
 namespace trt_edgellm
 {
@@ -360,21 +380,31 @@ bool Code2WavRunner::generateWaveform(
         = mCode2WavEngine->getProfileShape(binding_names::kCode2WavCodes, 0, nvinfer1::OptProfileSelector::kMAX);
     int64_t const maxCodeLen = codesShapeMax.d[2];
     int64_t waveformLen = 0;
+    bool const profile = code2WavProfileEnabled();
+    auto const totalStart = Clock::now();
+    double prepareMs = 0.0;
+    double inferEnqueueMs = 0.0;
+    double d2hEnqueueMs = 0.0;
+    double syncMs = 0.0;
 
     // Use direct inference if sequence fits in engine's max capacity
     if (seqLen <= maxCodeLen)
     {
         LOG_DEBUG("Direct inference: seqLen=%ld", seqLen);
 
+        auto const prepareStart = Clock::now();
         if (!prepareCodes(codes, stream))
         {
             return false;
         }
+        prepareMs = elapsedMs(prepareStart);
 
+        auto const inferStart = Clock::now();
         if (!infer(stream))
         {
             return false;
         }
+        inferEnqueueMs = elapsedMs(inferStart);
 
         // Get actual output shape from the engine. Code2Wav output can be shorter than
         // seqLen * upsampleRate because the model trims samples at the boundaries.
@@ -388,8 +418,10 @@ bool Code2WavRunner::generateWaveform(
 
         outputAudio.waveform
             = std::make_shared<rt::Tensor>(rt::Tensor({1, waveformLen}, rt::DeviceType::kCPU, mWaveformDtype));
+        auto const d2hStart = Clock::now();
         CUDA_CHECK(cudaMemcpyAsync(outputAudio.waveform->rawPointer(), mOutputWaveform.rawPointer(),
             math::cast<size_t>(waveformLen) * rt::utils::getTypeSize(mWaveformDtype), cudaMemcpyDeviceToHost, stream));
+        d2hEnqueueMs = elapsedMs(d2hStart);
     }
     else
     {
@@ -406,11 +438,23 @@ bool Code2WavRunner::generateWaveform(
 
         outputAudio.waveform
             = std::make_shared<rt::Tensor>(rt::Tensor({1, waveformLen}, rt::DeviceType::kCPU, mWaveformDtype));
+        auto const d2hStart = Clock::now();
         CUDA_CHECK(cudaMemcpyAsync(outputAudio.waveform->rawPointer(), finalWaveform.rawPointer(),
             math::cast<size_t>(waveformLen) * rt::utils::getTypeSize(mWaveformDtype), cudaMemcpyDeviceToHost, stream));
+        d2hEnqueueMs = elapsedMs(d2hStart);
     }
 
+    auto const syncStart = Clock::now();
     CUDA_CHECK(cudaStreamSynchronize(stream));
+    syncMs = elapsedMs(syncStart);
+
+    if (profile)
+    {
+        LOG_WARNING("Qwen3-TTS Code2Wav profile seq_len=%lld waveform_len=%lld direct=%d prepare_ms=%.3f "
+                    "infer_enqueue_ms=%.3f d2h_enqueue_ms=%.3f sync_ms=%.3f total_ms=%.3f",
+            static_cast<long long>(seqLen), static_cast<long long>(waveformLen), seqLen <= maxCodeLen ? 1 : 0,
+            prepareMs, inferEnqueueMs, d2hEnqueueMs, syncMs, elapsedMs(totalStart));
+    }
 
     outputAudio.sampleRate = mConfig.sampleRate;
     outputAudio.numChannels = 1;
