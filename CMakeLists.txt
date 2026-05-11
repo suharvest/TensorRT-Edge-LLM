@@ -62,7 +62,12 @@ set_ifndef(CUDA_CTK_VERSION 12.8)
 set_ifndef(CUDA_DIR /usr/local/cuda-${CUDA_CTK_VERSION})
 
 if(NOT DEFINED AARCH64_BUILD)
-  set(CMAKE_CUDA_ARCHITECTURES 80;86;89)
+  # Fork-specific (qwen3-tts-highperf-runtime-w8a16): this branch ships only
+  # on Jetson Orin (SM87). Without 87 in the FMHA cubin set, the ASR thinker
+  # engine fails at first MHA dispatch with "There must be one kernel to
+  # implement the MHA". Keep the upstream SM80/86/89 set too so cross-builds
+  # for desktop dGPU still compile (e.g. for engine baking on x86_64).
+  set(CMAKE_CUDA_ARCHITECTURES 80;86;87;89)
   if(CUDA_CTK_VERSION VERSION_GREATER_EQUAL 12.8)
     list(APPEND CMAKE_CUDA_ARCHITECTURES 100a 120)
   endif()
