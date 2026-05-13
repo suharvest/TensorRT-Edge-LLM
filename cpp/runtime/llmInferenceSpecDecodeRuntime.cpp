@@ -2280,10 +2280,35 @@ bool LLMInferenceSpecDecodeRuntime::setUpForPrefillExecutionForChunk(SpecDecodeI
 // in M2). Calls into the existing one-shot setup path so LoRA / KV reset /
 // system-prompt restore / reuse lengths are bound identically to the
 // handleRequest path.
-bool LLMInferenceSpecDecodeRuntime::beginAsrSession(SpecDecodeInferenceContext& context)
+//
+// M3.5: when a CUDA stream is supplied and an audio runner is loaded, also
+// initializes the audio runner's MRope cos/sin cache once for the worst-case
+// session length (bounded by max_kv_cache_capacity, currently 256 on the
+// shipped ASR thinker). Per-chunk encodeMelChunk calls thereafter do not
+// need to touch MRope state — the worker stays oblivious to it.
+bool LLMInferenceSpecDecodeRuntime::beginAsrSession(SpecDecodeInferenceContext& context, cudaStream_t stream)
 {
     NVTX_SCOPED_RANGE(nvtx_begin_asr, "BEGIN_ASR_SESSION", nvtx_colors::PALE_GREEN);
-    return setUpForPrefillExecutionOneShot(context);
+    if (!setUpForPrefillExecutionOneShot(context))
+    {
+        return false;
+    }
+
+    if (mAudioRunner && stream != nullptr)
+    {
+        // Bound by KV cap so the MRope cache spans the worst-case session.
+        // Audio tokens are 1:1 with KV positions consumed by audio embeds
+        // (one MRope slot per audio token), so max_kv_cache_capacity is the
+        // tightest upper bound on cumulative audio tokens.
+        int32_t const maxAudioTokens = getMaxKvCacheCapacity();
+        if (!mAudioRunner->initializeMRopeForSession(
+                maxAudioTokens, mBaseEngineRunner->getRopeCosSinCacheTensor(), stream))
+        {
+            LOG_ERROR("beginAsrSession: audio runner MRope session-init failed");
+            return false;
+        }
+    }
+    return true;
 }
 
 // Streaming-ASR session teardown (M2). Frees the KV slot bound to this context

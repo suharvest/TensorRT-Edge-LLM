@@ -269,7 +269,19 @@ public:
     //!        structured error events.
     int32_t peekKvCacheLength(int32_t batchIdx, cudaStream_t stream);
 
-    bool beginAsrSession(SpecDecodeInferenceContext& context);
+    //! @brief Begin a streaming-ASR session.
+    //!
+    //! Wraps the one-shot setup path so LoRA / KV reset / system-prompt
+    //! restore / reuse lengths are bound identically to the handleRequest
+    //! path. When a `stream` is supplied and an audio runner is loaded, also
+    //! initializes the audio runner's MRope cos/sin cache for the worst-case
+    //! session length (bounded by max_kv_cache_capacity) so per-chunk
+    //! encodeMelChunk calls do not touch MRope state.
+    //!
+    //! @param context  Inference context to bind.
+    //! @param stream   CUDA stream for MRope init. If 0 (default), MRope init
+    //!                 is skipped — preserves the M2 spike_m2 API.
+    bool beginAsrSession(SpecDecodeInferenceContext& context, cudaStream_t stream = 0);
 
     /*!
      * @brief End an in-flight streaming-ASR session and release its state.

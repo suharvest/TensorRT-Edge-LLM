@@ -124,6 +124,23 @@ public:
         [[maybe_unused]] cudaStream_t stream);
 
     /*!
+     * @brief Initialize MRope cos/sin cache for a streaming ASR session.
+     * @details Default implementation is a no-op (returns true). Audio runners
+     *          that use MRope (e.g. Qwen3OmniAudioRunner) override this to fill
+     *          the cache once at session start so per-chunk encoder calls do
+     *          not need to touch MRope state.
+     * @param maxAudioTokens          Upper bound on cumulative audio tokens for this session.
+     * @param ropeRotaryCosSinDevice  RoPE cache tensor.
+     * @param stream                  CUDA stream.
+     * @return True on success, false on failure.
+     */
+    virtual bool initializeMRopeForSession([[maybe_unused]] int32_t maxAudioTokens,
+        [[maybe_unused]] rt::Tensor& ropeRotaryCosSinDevice, [[maybe_unused]] cudaStream_t stream)
+    {
+        return true;
+    }
+
+    /*!
      * @brief Run multimodal inference
      * @param stream CUDA stream
      * @return True on success, false on failure
