@@ -358,8 +358,23 @@ private:
 
     // Consume batched input ids and the hash table of system prompt KVCache, produce the padded input ids and input
     // lengths. Instantiate the KVCache from the hash table if the system prompt has been cached.
+    //
+    // OneShot variant: full setup for a fresh request (LoRA switch, reuseKVCacheLengths
+    // init, system-prompt cache restore, tokenIds (re)seed, cache-manager reset).
+    // Use this on session start / single-request handleRequest path.
     //! @throws std::runtime_error if system prompt is malformed
-    bool setUpForPrefillExecution(SpecDecodeInferenceContext& context);
+    bool setUpForPrefillExecutionOneShot(SpecDecodeInferenceContext& context);
+
+    // Per-chunk variant for streaming/chunked prefill (M1, streaming ASR).
+    // Only performs the BOTH-classified work: NVTX scope, activeBatchSize fetch,
+    // engine-max validation against context.effectivePrefillLengths (per-chunk slice
+    // length). All one-shot mutations (LoRA, KV-restore, tokenIds.clear,
+    // resetForNewSequences) are skipped. Caller must have already set
+    // context.effectivePrefillLengths[i] to this chunk's token-slice length, and must
+    // not have reset cache lengths between chunks (engine derives kvcache_start_index
+    // from live cache state — see design doc §10c-real).
+    //! @throws std::runtime_error if a CUDA error occurs
+    bool setUpForPrefillExecutionForChunk(SpecDecodeInferenceContext& context);
 
     // Batch eviction support
     //! @brief Perform batch eviction
