@@ -2275,6 +2275,115 @@ bool LLMInferenceSpecDecodeRuntime::setUpForPrefillExecutionForChunk(SpecDecodeI
     return true;
 }
 
+// Streaming-ASR Milestone 1 entrypoint. Append one chunk of audio-bearing
+// prefill embeddings to an in-flight session. Subset of runBaseModelPrefill
+// (~L976): no draft model, no deepstack, no sampling — only the base-engine
+// prefill is invoked. Cache state is owned by the engine (auto-derived
+// kvcache_start_index, additive commit), so we must NOT call
+// setUpForPrefillExecutionOneShot here.
+bool LLMInferenceSpecDecodeRuntime::appendPrefillEmbeds(SpecDecodeInferenceContext& context,
+    Tensor const& audioEmbedsDelta, int32_t audioIndexBase, std::vector<int32_t> const& tokenSliceDelta,
+    cudaStream_t stream)
+{
+    NVTX_SCOPED_RANGE(nvtx_append_prefill, "APPEND_PREFILL_EMBEDS", nvtx_colors::PURPLE);
+
+    // ----- M1 scope guards. Loosen in M2+ when these paths are needed. -----
+    check::check(context.activeBatchSize == 1, "appendPrefillEmbeds: M1 supports activeBatchSize==1 only");
+    check::check(!hasDraftModel(), "appendPrefillEmbeds: M1 does not support speculative-decode draft model");
+    check::check(mBaseEngineConfig.numDeepstackFeatures == 0,
+        "appendPrefillEmbeds: M1 does not support deepstack-feature models");
+    check::check(!context.visualEmbeddings.has_value(),
+        "appendPrefillEmbeds: M1 supports audio-only streaming (no visual embeddings)");
+    check::check(!tokenSliceDelta.empty(), "appendPrefillEmbeds: tokenSliceDelta must be non-empty");
+
+    constexpr int32_t kBatchIdx = 0;
+    int32_t const chunkLen = static_cast<int32_t>(tokenSliceDelta.size());
+
+    // 1. Extend context.tokenIds[0] with the new token slice. Do NOT clear —
+    //    setUpForPrefillExecutionForChunk explicitly skips the clear so the
+    //    accumulated session token-ID list survives across chunks.
+    context.tokenIds[kBatchIdx].insert(
+        context.tokenIds[kBatchIdx].end(), tokenSliceDelta.begin(), tokenSliceDelta.end());
+
+    // 2. Per-chunk effective prefill length is the chunk slice length itself,
+    //    matching the mContextLengthsInput contract for executePrefillStep
+    //    (Spike B2: ctxLenB2[0] = N2, not N1+N2 — engine adds kv start index
+    //    internally, llmEngineRunner.cpp:1247-1264).
+    context.effectivePrefillLengths[kBatchIdx] = chunkLen;
+
+    // 3. Per-chunk validation only. No KV reset, no LoRA switch, no system-prompt
+    //    cache mutation — those happened during OneShot session-start.
+    if (!setUpForPrefillExecutionForChunk(context))
+    {
+        LOG_ERROR("appendPrefillEmbeds: per-chunk setup validation failed (chunkLen=%d, engineMax=%d)",
+            chunkLen, mBaseEngineConfig.maxSupportedInputLength);
+        return false;
+    }
+
+    // 4. Build mIdsInput / mInputsEmbeds / mMultimodalIndices / mContextLengthsInput
+    //    for this chunk only (delta slice; engine consumes [chunk] rows).
+    check::check(mIdsInput.reshape({1, chunkLen}), "mIdsInput reshape failed");
+    check::check(mContextLengthsInput.reshape({1}), "mContextLengthsInput reshape failed");
+    check::check(mInputsEmbeds.reshape({1, chunkLen, mBaseEngineConfig.hiddenSize}), "mInputsEmbeds reshape failed");
+    check::check(mLogitsOutput.reshape({1, mBaseEngineConfig.outputVocabSize}), "mLogitsOutput reshape failed");
+
+    // Stage tokenSliceDelta into pinned host memory, then D2H to mIdsInput.
+    check::check(mHostPackedTokenIds.reshape({1, chunkLen}), "mHostPackedTokenIds reshape failed");
+    int32_t* hostTokenIdsData = mHostPackedTokenIds.dataPointer<int32_t>();
+    std::copy(tokenSliceDelta.begin(), tokenSliceDelta.end(), hostTokenIdsData);
+    mContextLengthsInput.dataPointer<int32_t>()[0] = chunkLen;
+
+    CUDA_CHECK(cudaMemcpyAsync(
+        mIdsInput.rawPointer(), hostTokenIdsData, chunkLen * sizeof(int32_t), cudaMemcpyHostToDevice, stream));
+
+    // 5. Generate multimodalIndices for THIS chunk, biased by audioIndexBase so
+    //    multimodalIdx values encode the cumulative offset into the caller-owned
+    //    audioEmbedsDelta tensor. The kernel reads
+    //    audioEmbeds[multimodalIdx * hiddenSize] (embeddingKernels.cu:413), so the
+    //    bias is the only surface change needed kernel-side. See
+    //    generateMultimodalIndices (llmRuntimeUtils.cpp:518).
+    std::optional<int32_t> audioTokenIdOpt
+        = (mBaseEngineConfig.audioTokenId != 0) ? std::optional<int32_t>{mBaseEngineConfig.audioTokenId} : std::nullopt;
+    std::optional<int32_t> imageTokenIdOpt
+        = (mBaseEngineConfig.imageTokenId != 0) ? std::optional<int32_t>{mBaseEngineConfig.imageTokenId} : std::nullopt;
+
+    Tensor inputIdsCPU({1, chunkLen}, DeviceType::kCPU, nvinfer1::DataType::kINT32);
+    std::copy(tokenSliceDelta.begin(), tokenSliceDelta.end(), inputIdsCPU.dataPointer<int32_t>());
+
+    Tensor multimodalIndicesCPU = generateMultimodalIndices(
+        inputIdsCPU, audioTokenIdOpt, imageTokenIdOpt, mBaseEngineConfig.vocabSize, audioIndexBase);
+    auto const indicesShape = multimodalIndicesCPU.getShape();
+    check::check(mMultimodalIndices.reshape(indicesShape), "mMultimodalIndices reshape failed");
+    size_t const indicesBytes = static_cast<size_t>(indicesShape.volume()) * sizeof(int32_t);
+    CUDA_CHECK(cudaMemcpy(
+        mMultimodalIndices.rawPointer(), multimodalIndicesCPU.rawPointer(), indicesBytes, cudaMemcpyHostToDevice));
+
+    // 6. Embedding lookup (multimodal path; audio only). audioEmbedsDelta carries
+    //    the audio embedding rows the kernel will index via multimodalIdx.
+    OptionalInputTensor visualEmbedsOpt{std::nullopt};
+    OptionalInputTensor audioEmbedsOpt{std::cref(audioEmbedsDelta)};
+    kernel::embeddingLookupMultimodal(mIdsInput, mEmbedding.table, mEmbedding.scalesAsOptional(),
+        std::optional{std::ref(mMultimodalIndices)}, imageTokenIdOpt, visualEmbedsOpt, audioTokenIdOpt, audioEmbedsOpt,
+        mInputsEmbeds, stream);
+
+    // 7. Fire the engine. No deepstack, no hidden-states output (draft path
+    //    disabled). Logits are bound but their content for non-final chunks is
+    //    irrelevant — the engine emits logits only for the last row of the
+    //    final-chunk anyway (kLastTokenIds gating, design doc §10c-real).
+    OptionalInputTensors emptyDeepstack{};
+    OptionalOutputTensor noHidden = std::nullopt;
+    bool const prefillOk = mBaseEngineRunner->executePrefillStep(
+        mInputsEmbeds, mContextLengthsInput, emptyDeepstack, mLogitsOutput, noHidden, stream);
+    if (!prefillOk)
+    {
+        LOG_ERROR("appendPrefillEmbeds: executePrefillStep failed at chunkLen=%d, audioIndexBase=%d",
+            chunkLen, audioIndexBase);
+        return false;
+    }
+
+    return true;
+}
+
 bool LLMInferenceSpecDecodeRuntime::genAndSaveSystemPromptKVCache(
     SpecDecodeInferenceContext& context, int32_t genAndSaveBatchIdx)
 {

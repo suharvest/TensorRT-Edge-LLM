@@ -212,6 +212,43 @@ public:
      */
     void setActionNoiseSeed(int32_t seed) noexcept;
 
+    /*!
+     * @brief Append one chunk of prefill embeddings to an in-flight streaming
+     *        prefill session. Milestone 1 of the streaming-ASR plan
+     *        (design doc §12).
+     *
+     * Preconditions:
+     *  - Caller has already run one OneShot prefill (e.g. via handleRequest /
+     *    a session-init path) on context, so LoRA, KV-cache state, system-prompt
+     *    restore, and recurrent state init are done.
+     *  - The engine's KV cache lengths reflect prior chunks; this function does
+     *    NOT reset them. Cache start index is derived inside the engine from
+     *    live cache lengths (see design doc §10c-real,
+     *    cpp/runtime/llmEngineRunner.cpp:1247-1264).
+     *  - Single batch only (activeBatchSize == 1) in M1.
+     *  - audioEmbedsDelta layout matches the one-shot path: shape
+     *    `[totalAudioTokensSoFar, hiddenSize]` cumulative, OR
+     *    `[chunkAudioTokens, hiddenSize]` per-chunk — either is supported via
+     *    audioIndexBase. Per-chunk + base=cumulative-so-far is the recommended
+     *    call pattern: it avoids the caller having to grow a single tensor.
+     *
+     * @param context           Inference context that has been used for prior
+     *                          chunks. tokenIds[0] is extended in place.
+     * @param audioEmbedsDelta  Audio embedding rows visible to the kernel for
+     *                          this call. With audioIndexBase==N, the kernel
+     *                          reads row indices in [N, N + tokenSliceDelta's
+     *                          audio-token count). Must be device FP16.
+     * @param audioIndexBase    Number of audio tokens consumed by prior chunks
+     *                          in this session (cumulative).
+     * @param tokenSliceDelta   New token IDs for this chunk (the audio-pad /
+     *                          audio-eos / text suffix slice). Appended to
+     *                          context.tokenIds[0].
+     * @param stream            CUDA stream (must match context.stream).
+     * @return True on success, false on prefill failure.
+     */
+    bool appendPrefillEmbeds(SpecDecodeInferenceContext& context, Tensor const& audioEmbedsDelta,
+        int32_t audioIndexBase, std::vector<int32_t> const& tokenSliceDelta, cudaStream_t stream);
+
     //! Get LLM prefill stage metrics
     metrics::LLMPrefillMetrics const& getPrefillMetrics() const noexcept
     {
