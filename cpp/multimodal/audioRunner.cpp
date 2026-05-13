@@ -567,6 +567,46 @@ bool Qwen3OmniAudioRunner::preprocessSystemPrompt(std::string const& systemPromp
     return initializeSequentialMRopeCache(1, ropeRotaryCosSinDevice, stream);
 }
 
+// Session-scoped MRope init for streaming ASR. Streaming batch is always 1
+// (single sequence per session); the underlying cache layout matches the
+// one-shot path. `maxAudioTokens` bounds the worst-case session length and is
+// validated against `ropeRotaryCosSinDevice`'s maxPositionEmbeddings so a
+// session that would outgrow the cache fails fast at begin-time instead of
+// silently corrupting MRope mid-session.
+bool Qwen3OmniAudioRunner::initializeMRopeForSession(
+    int32_t maxAudioTokens, rt::Tensor& ropeRotaryCosSinDevice, cudaStream_t stream)
+{
+    if (mConfig.mropeTheta <= 0.0F)
+    {
+        // Not an MRope model — nothing to do.
+        return true;
+    }
+
+    auto const ropeShape = ropeRotaryCosSinDevice.getShape();
+    if (ropeShape.getNumDims() < 3)
+    {
+        LOG_ERROR("initializeMRopeForSession: ropeRotaryCosSinDevice has unexpected rank %d",
+            ropeShape.getNumDims());
+        return false;
+    }
+    int64_t const maxPositionEmbeddings = ropeShape[1];
+
+    if (maxAudioTokens > maxPositionEmbeddings)
+    {
+        LOG_ERROR(
+            "initializeMRopeForSession: maxAudioTokens=%d exceeds MRope cache capacity "
+            "(maxPositionEmbeddings=%ld); rebuild thinker engine with larger capacity.",
+            maxAudioTokens, maxPositionEmbeddings);
+        return false;
+    }
+
+    // Streaming sessions are always batch=1. Layout (positions, dimensions) is
+    // identical to the one-shot path used by preprocess(), so a session-init
+    // call here is interchangeable with the per-call init that the one-shot
+    // path performs.
+    return initializeSequentialMRopeCache(/*activeBatchSize*/ 1, ropeRotaryCosSinDevice, stream);
+}
+
 bool Qwen3OmniAudioRunner::initializeSequentialMRopeCache(
     int64_t activeBatchSize, rt::Tensor& ropeRotaryCosSinDevice, cudaStream_t stream)
 {

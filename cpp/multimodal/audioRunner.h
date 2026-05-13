@@ -117,6 +117,22 @@ public:
     bool encodeMelChunk(
         rt::audioUtils::AudioData const& mel, rt::Tensor& outEmbedding, cudaStream_t stream);
 
+    //! \brief Initialize MRope cos/sin cache once per streaming ASR session.
+    //! \details Session-scoped variant of `initializeSequentialMRopeCache`. Sized once at
+    //!          session start so per-chunk `encodeMelChunk` calls do not need to touch the
+    //!          MRope cache. Streaming batch is always 1 (single sequence per ASR session).
+    //!          Position-id layout matches the one-shot path (T=H=W sequential).
+    //! \param[in]      maxAudioTokens          Upper bound on cumulative audio tokens for this
+    //!                                         session (informational/bound; the underlying
+    //!                                         cache spans the full `maxPositionEmbeddings`
+    //!                                         of the rope tensor, same as the one-shot path).
+    //! \param[in,out]  ropeRotaryCosSinDevice  RoPE cache tensor (e.g.
+    //!                                         `LLMEngineRunner::getRopeCosSinCacheTensor()`).
+    //! \param[in]      stream                  CUDA stream.
+    //! \return True on success, false otherwise.
+    bool initializeMRopeForSession(
+        int32_t maxAudioTokens, rt::Tensor& ropeRotaryCosSinDevice, cudaStream_t stream);
+
 private:
     //! \brief Preprocess audio buffers and run encoder inference
     //! \param[in] audioBuffers Input audio data with mel-spectrogram paths or waveforms
