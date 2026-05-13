@@ -2159,51 +2159,72 @@ bool LLMInferenceSpecDecodeRuntime::setUpForPrefillExecutionOneShot(SpecDecodeIn
     {
         auto const& prompt = context.systemPrompts[i];
         auto const promptKey = keySystemPromptWithLoraWeights(prompt, context.loraWeightsName);
+        bool useCachedKV = false;
         if (mSystemPromptKVCacheBase.count(promptKey) > 0)
         {
             auto& precachedKVCacheBase = mSystemPromptKVCacheBase[promptKey];
-            baseCacheManager.restoreKVCache(precachedKVCacheBase.kvCacheLayers, i, context.stream);
+            auto const reuseLength = math::cast<size_t>(precachedKVCacheBase.kvCacheLayers[0].getShape()[2]);
 
-            if (mDraftEngineRunner != nullptr)
+            // Validate cache shape before any side-effecting restore.
+            bool const shapeOk = (reuseLength > 0 && reuseLength < batchedInputIds[i].size());
+
+            // Token-id alignment must match the cached prefix exactly. If the
+            // cached `tokenizedPrompt` was built with different tokenizer flags
+            // (e.g. add_special_tokens=true at cache build vs false at live
+            // request), the cached KV has MRoPE positions baked at build-time
+            // positions that won't align with live-request positions, producing
+            // silent decoding corruption. Fall back to fresh prefill instead of
+            // proceeding with mismatched cache.
+            bool const matchIds = shapeOk
+                && precachedKVCacheBase.tokenizedPrompt.size() <= batchedInputIds[i].size()
+                && std::equal(precachedKVCacheBase.tokenizedPrompt.begin(),
+                    precachedKVCacheBase.tokenizedPrompt.end(), batchedInputIds[i].begin());
+
+            if (shapeOk && matchIds)
             {
-                check::check(mSystemPromptKVCacheDraft.count(promptKey) > 0,
-                    "System prompt cache inconsistency between base and draft model");
-                auto& precachedKVCacheDraft = mSystemPromptKVCacheDraft[promptKey];
-                mDraftEngineRunner->getCacheManager().restoreKVCache(
-                    precachedKVCacheDraft.kvCacheLayers, i, context.stream);
+                baseCacheManager.restoreKVCache(precachedKVCacheBase.kvCacheLayers, i, context.stream);
+
+                if (mDraftEngineRunner != nullptr)
+                {
+                    check::check(mSystemPromptKVCacheDraft.count(promptKey) > 0,
+                        "System prompt cache inconsistency between base and draft model");
+                    auto& precachedKVCacheDraft = mSystemPromptKVCacheDraft[promptKey];
+                    mDraftEngineRunner->getCacheManager().restoreKVCache(
+                        precachedKVCacheDraft.kvCacheLayers, i, context.stream);
+                }
+
+                // Restore recurrent states if applicable
+                if (mBaseEngineConfig.numLinearAttnLayers > 0)
+                {
+                    restoreRecurrentStates(i, precachedKVCacheBase, context.stream);
+                }
+
+                // Reuse N-1 tokens from the cached prefix so the Nth token is treated as real input in prefill;
+                // this keeps the draft prefill boundary aligned with the true next-token position.
+                auto const effectiveReuseLength = reuseLength - 1;
+                reuseKVCacheLengthsData[i] = math::cast<int32_t>(effectiveReuseLength);
+
+                // Directly assign to context.tokenIds (skip only the reused portion, keep the next token for normal flow)
+                context.tokenIds[i].assign(
+                    batchedInputIds[i].begin() + effectiveReuseLength, batchedInputIds[i].end());
+                context.effectivePrefillLengths[i]
+                    = math::cast<int32_t>(batchedInputIds[i].size() - effectiveReuseLength);
+                useCachedKV = true;
             }
-
-            // Restore recurrent states if applicable
-            if (mBaseEngineConfig.numLinearAttnLayers > 0)
-            {
-                restoreRecurrentStates(i, precachedKVCacheBase, context.stream);
-            }
-
-            auto reuseLength = math::cast<size_t>(precachedKVCacheBase.kvCacheLayers[0].getShape()[2]);
-            // If the system prompt is not well designed, the boundary of the inputIDs could be mis-aligned.
-            check::check(reuseLength > 0 && reuseLength < batchedInputIds[i].size(),
-                "The reuse length shall be larger than 0 and not exceed the input length.");
-            // Reuse N-1 tokens from the cached prefix so the Nth token is treated as real input in prefill;
-            // this keeps the draft prefill boundary aligned with the true next-token position.
-            auto const effectiveReuseLength = reuseLength - 1;
-            reuseKVCacheLengthsData[i] = math::cast<int32_t>(effectiveReuseLength);
-
-            // Directly assign to context.tokenIds (skip only the reused portion, keep the next token for normal flow)
-            context.tokenIds[i].assign(batchedInputIds[i].begin() + effectiveReuseLength, batchedInputIds[i].end());
-            context.effectivePrefillLengths[i] = math::cast<int32_t>(batchedInputIds[i].size() - effectiveReuseLength);
-
-            bool const matchIds = std::equal(precachedKVCacheBase.tokenizedPrompt.begin(),
-                precachedKVCacheBase.tokenizedPrompt.end(), batchedInputIds[i].begin());
-            if (!matchIds)
+            else
             {
                 LOG_WARNING(
-                    "Though system prompt strings are matched, token_ids are not perfectly aligned."
-                    "This may generate incorrect result, please check your system prompt design.");
+                    "System-prompt KV cache token_ids mismatch for seq %d "
+                    "(cached_len=%zu, live_input_len=%zu, shapeOk=%d, matchIds=%d) "
+                    "-- falling back to fresh prefill to avoid MRoPE/position misalignment.",
+                    i, precachedKVCacheBase.tokenizedPrompt.size(), batchedInputIds[i].size(),
+                    static_cast<int>(shapeOk), static_cast<int>(matchIds));
             }
         }
-        else
+
+        if (!useCachedKV)
         {
-            // Directly assign to context.tokenIds (full input)
+            // Fresh prefill: full input, no reuse.
             context.tokenIds[i] = batchedInputIds[i];
             context.effectivePrefillLengths[i] = static_cast<int32_t>(batchedInputIds[i].size());
             reuseKVCacheLengthsData[i] = 0;
