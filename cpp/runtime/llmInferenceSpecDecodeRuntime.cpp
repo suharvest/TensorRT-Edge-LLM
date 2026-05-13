@@ -2042,6 +2042,17 @@ bool LLMInferenceSpecDecodeRuntime::setUpForPrefillExecutionForChunk(SpecDecodeI
     return true;
 }
 
+// Streaming-ASR Milestone 1 session-init wrapper. Calls into the existing
+// one-shot setup path so LoRA / KV reset / system-prompt restore / reuse
+// lengths are bound identically to the handleRequest path. This is the only
+// session bootstrap entrypoint exposed for the chunked-prefill API; later
+// milestones will wrap it as part of beginAsrSession.
+bool LLMInferenceSpecDecodeRuntime::beginChunkedPrefillSession(SpecDecodeInferenceContext& context)
+{
+    NVTX_SCOPED_RANGE(nvtx_begin_chunked, "BEGIN_CHUNKED_PREFILL_SESSION", nvtx_colors::PALE_GREEN);
+    return setUpForPrefillExecutionOneShot(context);
+}
+
 // Streaming-ASR Milestone 1 entrypoint. Append one chunk of audio-bearing
 // prefill embeddings to an in-flight session. Subset of runBaseModelPrefill
 // (~L976): no draft model, no deepstack, no sampling — only the base-engine

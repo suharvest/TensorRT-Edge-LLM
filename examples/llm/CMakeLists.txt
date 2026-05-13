@@ -38,3 +38,15 @@ target_include_directories(llm_bench PRIVATE ${COMMON_INCLUDE_DIRS}
                                              ${CMAKE_SOURCE_DIR}/examples/utils)
 target_compile_options(llm_bench PRIVATE -Wno-psabi)
 add_cross_build_link_options(llm_bench)
+
+# Streaming-ASR M1 acceptance test (design doc §12).
+# Drives the new appendPrefillEmbeds public API through one-shot vs split-chunk
+# paths on the real thinker engine and compares logits element-wise.
+add_executable(spike_m1_append_prefill_embeds spike_m1_append_prefill_embeds.cpp)
+target_link_libraries(spike_m1_append_prefill_embeds PRIVATE edgellmCore
+                                                             exampleUtils
+                                                             commonLibraryExt)
+target_include_directories(
+  spike_m1_append_prefill_embeds PRIVATE ${COMMON_INCLUDE_DIRS}
+                                          ${CMAKE_SOURCE_DIR}/examples/utils)
+add_cross_build_link_options(spike_m1_append_prefill_embeds)
