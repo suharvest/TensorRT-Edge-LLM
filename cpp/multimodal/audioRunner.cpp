@@ -344,6 +344,154 @@ bool Qwen3OmniAudioRunner::loadMelSpectrogramFromFile(
     return true;
 }
 
+// Shared per-audio encoder forward pass. Used by:
+//   - preprocessAudio (one-shot path, looped over audioBuffers)
+//   - encodeMelChunk  (streaming path, single chunk)
+// No text/MRope side effects; only fills `mAudioEmbedding` and the encoder's
+// scratch tensors. Bit-exact preserved vs the original inline body.
+bool Qwen3OmniAudioRunner::encodeOneAudioImpl(
+    rt::audioUtils::AudioData const& audio, int64_t& outTokens, cudaStream_t stream)
+{
+    if (!mAudioEngine || !mAudioContext)
+    {
+        LOG_ERROR("Audio encoder not loaded");
+        return false;
+    }
+
+    rt::Tensor melSpec;
+
+    // Load pre-computed mel-spectrogram
+    // Audio preprocessing (Mel-spectrogram computation) must be done externally
+    // using dedicated audio processing libraries (e.g., librosa, torchaudio) in Python
+    if (audio.melSpectrogramPath.empty())
+    {
+        LOG_ERROR(
+            "Pre-computed mel-spectrogram path is required. "
+            "Audio preprocessing must be done externally using Python or other pipelines.");
+        return false;
+    }
+
+    if (!loadMelSpectrogramFromFile(audio.melSpectrogramPath, audio.melSpectrogramFormat, melSpec, stream))
+    {
+        LOG_ERROR("Failed to load mel-spectrogram from file");
+        return false;
+    }
+
+    int64_t const timeSteps = melSpec.getShape()[2];
+    LOG_DEBUG("Mel-spectrogram shape: [%ld, %ld, %ld]", melSpec.getShape()[0], melSpec.getShape()[1], timeSteps);
+
+    // Preprocess for audio encoder
+    std::vector<int64_t> afterCNNLens;
+    if (!audioUtils::preprocessAudioForEncoder(
+            melSpec, mConfig.nWindow, mPaddedFeature, mPaddedMaskAfterCNN, afterCNNLens, stream))
+    {
+        LOG_ERROR("Failed to preprocess audio for encoder");
+        return false;
+    }
+
+    // Convert mask to indices
+    if (!audioUtils::convertMaskToIndices(mPaddedMaskAfterCNN, mPaddedMaskIndices, stream))
+    {
+        LOG_ERROR("Failed to convert mask to indices");
+        return false;
+    }
+
+    LOG_DEBUG("Mask shape: [%ld, %ld], Indices shape: [%ld, %ld]", mPaddedMaskAfterCNN.getShape()[0],
+        mPaddedMaskAfterCNN.getShape()[1], mPaddedMaskIndices.getShape()[0], mPaddedMaskIndices.getShape()[1]);
+
+    // Create attention mask with merged windows (matching PyTorch cu_seqlens logic)
+    if (!audioUtils::createChunkwiseAttentionMask(
+            afterCNNLens, mConfig.nWindow, mConfig.nWindowInfer, mAudioAttentionMask, stream))
+    {
+        LOG_ERROR("Failed to create attention mask");
+        return false;
+    }
+
+    LOG_DEBUG(
+        "Created attention mask [%ld, %ld]", mAudioAttentionMask.getShape()[0], mAudioAttentionMask.getShape()[1]);
+
+    // Calculate total audio tokens
+    int64_t const totalAudioTokens = mPaddedMaskIndices.getShape()[0];
+
+    // Reshape output buffer
+    if (!mAudioEmbedding.reshape({totalAudioTokens, mConfig.audioFeatureDim}))
+    {
+        LOG_ERROR("Failed to reshape audio output");
+        return false;
+    }
+
+    LOG_DEBUG("Reshaped audio output to [%ld, %d]", totalAudioTokens, mConfig.audioFeatureDim);
+
+    // Set input shapes
+    if (!mAudioContext->setInputShape(binding_names::kAudioPaddedFeatures, mPaddedFeature.getShape().getTRTDims()))
+    {
+        LOG_ERROR("Failed to set padded features input shape");
+        return false;
+    }
+
+    if (!mAudioContext->setInputShape(
+            binding_names::kAudioPaddedMaskIndices, mPaddedMaskIndices.getShape().getTRTDims()))
+    {
+        LOG_ERROR("Failed to set padded mask indices input shape");
+        return false;
+    }
+
+    if (!mAudioContext->setInputShape(
+            binding_names::kAudioAttentionMask, mAudioAttentionMask.getShape().getTRTDims()))
+    {
+        LOG_ERROR("Failed to set attention mask input shape");
+        return false;
+    }
+
+    // Set tensor addresses
+    if (!mAudioContext->setTensorAddress(binding_names::kAudioPaddedFeatures, mPaddedFeature.rawPointer()))
+    {
+        LOG_ERROR("Failed to set padded features input address");
+        return false;
+    }
+
+    if (!mAudioContext->setTensorAddress(binding_names::kAudioPaddedMaskIndices, mPaddedMaskIndices.rawPointer()))
+    {
+        LOG_ERROR("Failed to set padded mask indices input address");
+        return false;
+    }
+
+    if (!mAudioContext->setTensorAddress(binding_names::kAudioAttentionMask, mAudioAttentionMask.rawPointer()))
+    {
+        LOG_ERROR("Failed to set attention mask input address");
+        return false;
+    }
+
+    if (!mAudioContext->setTensorAddress(binding_names::kAudioOutput, mAudioEmbedding.rawPointer()))
+    {
+        LOG_ERROR("Failed to set audio output address");
+        return false;
+    }
+
+    // Execute audio encoder
+    LOG_DEBUG(
+        "Executing audio encoder with shapes: "
+        "input=[%ld,%ld,%ld], indices=[%ld,2], mask=[%ld,%ld], output=[%ld,%ld]",
+        mPaddedFeature.getShape()[0], mPaddedFeature.getShape()[1], mPaddedFeature.getShape()[2],
+        mPaddedMaskIndices.getShape()[0], mAudioAttentionMask.getShape()[0], mAudioAttentionMask.getShape()[1],
+        mAudioEmbedding.getShape()[0], mAudioEmbedding.getShape()[1]);
+
+    {
+        TIME_STAGE(metrics::StageNames::kAUDIO_ENCODER, stream);
+
+        if (!mAudioContext->enqueueV3(stream))
+        {
+            LOG_ERROR("Audio encoder inference failed");
+            return false;
+        }
+    }
+
+    LOG_DEBUG("Audio encoder inference completed");
+
+    outTokens = totalAudioTokens;
+    return true;
+}
+
 bool Qwen3OmniAudioRunner::preprocessAudio(std::vector<rt::audioUtils::AudioData> const& audioBuffers,
     std::vector<int64_t>& audioTokenLengths, cudaStream_t stream)
 {
@@ -358,142 +506,50 @@ bool Qwen3OmniAudioRunner::preprocessAudio(std::vector<rt::audioUtils::AudioData
         return false;
     }
 
-    // Process each audio clip
+    // Process each audio clip via the shared per-audio encoder forward pass.
     for (auto const& audio : audioBuffers)
     {
-        rt::Tensor melSpec;
-
-        // Load pre-computed mel-spectrogram
-        // Audio preprocessing (Mel-spectrogram computation) must be done externally
-        // using dedicated audio processing libraries (e.g., librosa, torchaudio) in Python
-        if (audio.melSpectrogramPath.empty())
+        int64_t totalAudioTokens = 0;
+        if (!encodeOneAudioImpl(audio, totalAudioTokens, stream))
         {
-            LOG_ERROR(
-                "Pre-computed mel-spectrogram path is required. "
-                "Audio preprocessing must be done externally using Python or other pipelines.");
             return false;
         }
-
-        if (!loadMelSpectrogramFromFile(audio.melSpectrogramPath, audio.melSpectrogramFormat, melSpec, stream))
-        {
-            LOG_ERROR("Failed to load mel-spectrogram from file");
-            return false;
-        }
-
-        int64_t const timeSteps = melSpec.getShape()[2];
-        LOG_DEBUG("Mel-spectrogram shape: [%ld, %ld, %ld]", melSpec.getShape()[0], melSpec.getShape()[1], timeSteps);
-
-        // Preprocess for audio encoder
-        std::vector<int64_t> afterCNNLens;
-        if (!audioUtils::preprocessAudioForEncoder(
-                melSpec, mConfig.nWindow, mPaddedFeature, mPaddedMaskAfterCNN, afterCNNLens, stream))
-        {
-            LOG_ERROR("Failed to preprocess audio for encoder");
-            return false;
-        }
-
-        // Convert mask to indices
-        if (!audioUtils::convertMaskToIndices(mPaddedMaskAfterCNN, mPaddedMaskIndices, stream))
-        {
-            LOG_ERROR("Failed to convert mask to indices");
-            return false;
-        }
-
-        LOG_DEBUG("Mask shape: [%ld, %ld], Indices shape: [%ld, %ld]", mPaddedMaskAfterCNN.getShape()[0],
-            mPaddedMaskAfterCNN.getShape()[1], mPaddedMaskIndices.getShape()[0], mPaddedMaskIndices.getShape()[1]);
-
-        // Create attention mask with merged windows (matching PyTorch cu_seqlens logic)
-        if (!audioUtils::createChunkwiseAttentionMask(
-                afterCNNLens, mConfig.nWindow, mConfig.nWindowInfer, mAudioAttentionMask, stream))
-        {
-            LOG_ERROR("Failed to create attention mask");
-            return false;
-        }
-
-        LOG_DEBUG(
-            "Created attention mask [%ld, %ld]", mAudioAttentionMask.getShape()[0], mAudioAttentionMask.getShape()[1]);
-
-        // Calculate total audio tokens
-        int64_t const totalAudioTokens = mPaddedMaskIndices.getShape()[0];
-
-        // Reshape output buffer
-        if (!mAudioEmbedding.reshape({totalAudioTokens, mConfig.audioFeatureDim}))
-        {
-            LOG_ERROR("Failed to reshape audio output");
-            return false;
-        }
-
-        LOG_DEBUG("Reshaped audio output to [%ld, %d]", totalAudioTokens, mConfig.audioFeatureDim);
-
-        // Set input shapes
-        if (!mAudioContext->setInputShape(binding_names::kAudioPaddedFeatures, mPaddedFeature.getShape().getTRTDims()))
-        {
-            LOG_ERROR("Failed to set padded features input shape");
-            return false;
-        }
-
-        if (!mAudioContext->setInputShape(
-                binding_names::kAudioPaddedMaskIndices, mPaddedMaskIndices.getShape().getTRTDims()))
-        {
-            LOG_ERROR("Failed to set padded mask indices input shape");
-            return false;
-        }
-
-        if (!mAudioContext->setInputShape(
-                binding_names::kAudioAttentionMask, mAudioAttentionMask.getShape().getTRTDims()))
-        {
-            LOG_ERROR("Failed to set attention mask input shape");
-            return false;
-        }
-
-        // Set tensor addresses
-        if (!mAudioContext->setTensorAddress(binding_names::kAudioPaddedFeatures, mPaddedFeature.rawPointer()))
-        {
-            LOG_ERROR("Failed to set padded features input address");
-            return false;
-        }
-
-        if (!mAudioContext->setTensorAddress(binding_names::kAudioPaddedMaskIndices, mPaddedMaskIndices.rawPointer()))
-        {
-            LOG_ERROR("Failed to set padded mask indices input address");
-            return false;
-        }
-
-        if (!mAudioContext->setTensorAddress(binding_names::kAudioAttentionMask, mAudioAttentionMask.rawPointer()))
-        {
-            LOG_ERROR("Failed to set attention mask input address");
-            return false;
-        }
-
-        if (!mAudioContext->setTensorAddress(binding_names::kAudioOutput, mAudioEmbedding.rawPointer()))
-        {
-            LOG_ERROR("Failed to set audio output address");
-            return false;
-        }
-
-        // Execute audio encoder
-        LOG_DEBUG(
-            "Executing audio encoder with shapes: "
-            "input=[%ld,%ld,%ld], indices=[%ld,2], mask=[%ld,%ld], output=[%ld,%ld]",
-            mPaddedFeature.getShape()[0], mPaddedFeature.getShape()[1], mPaddedFeature.getShape()[2],
-            mPaddedMaskIndices.getShape()[0], mAudioAttentionMask.getShape()[0], mAudioAttentionMask.getShape()[1],
-            mAudioEmbedding.getShape()[0], mAudioEmbedding.getShape()[1]);
-
-        {
-            TIME_STAGE(metrics::StageNames::kAUDIO_ENCODER, stream);
-
-            if (!mAudioContext->enqueueV3(stream))
-            {
-                LOG_ERROR("Audio encoder inference failed");
-                return false;
-            }
-        }
-
-        LOG_DEBUG("Audio encoder inference completed");
-
         audioTokenLengths.push_back(totalAudioTokens);
     }
 
+    CUDA_CHECK(cudaStreamSynchronize(stream));
+    return true;
+}
+
+// Streaming entry point: encode a single mel chunk via the shared per-audio
+// forward pass, then copy the result into the caller-allocated `outEmbedding`.
+// Does NOT touch text or MRope state — those are handled by the runtime layer
+// (see beginAsrSession / appendPrefillEmbeds).
+bool Qwen3OmniAudioRunner::encodeMelChunk(
+    rt::audioUtils::AudioData const& mel, rt::Tensor& outEmbedding, cudaStream_t stream)
+{
+    int64_t totalAudioTokens = 0;
+    if (!encodeOneAudioImpl(mel, totalAudioTokens, stream))
+    {
+        return false;
+    }
+
+    if (outEmbedding.getDataType() != nvinfer1::DataType::kHALF)
+    {
+        LOG_ERROR("encodeMelChunk: outEmbedding must be FP16 (kHALF)");
+        return false;
+    }
+
+    if (!outEmbedding.reshape({totalAudioTokens, mConfig.audioFeatureDim}))
+    {
+        LOG_ERROR("encodeMelChunk: failed to reshape outEmbedding to [%ld, %d] (allocation too small?)",
+            totalAudioTokens, mConfig.audioFeatureDim);
+        return false;
+    }
+
+    size_t const bytes = static_cast<size_t>(totalAudioTokens) * mConfig.audioFeatureDim * sizeof(half);
+    CUDA_CHECK(cudaMemcpyAsync(
+        outEmbedding.rawPointer(), mAudioEmbedding.rawPointer(), bytes, cudaMemcpyDeviceToDevice, stream));
     CUDA_CHECK(cudaStreamSynchronize(stream));
     return true;
 }

@@ -102,6 +102,21 @@ public:
     bool preprocessSystemPrompt(std::string const& systemPrompt, tokenizer::Tokenizer const* tokenizer,
         rt::Tensor& ropeRotaryCosSinDevice, cudaStream_t stream) override;
 
+    //! \brief Encode a single mel-spectrogram chunk to audio embeddings (streaming entry point).
+    //! \details Thin public wrapper over the per-audio encoder forward path. Does NOT touch
+    //!          text tokens or MRope state — callers (streaming worker / runtime) drive those
+    //!          separately. The one-shot `preprocess` path is preserved bit-exact and unchanged.
+    //! \param[in]  mel          AudioData describing the mel chunk (must carry
+    //!                          `melSpectrogramPath`/`melSpectrogramFormat`; PCM is M4 scope).
+    //! \param[out] outEmbedding Caller-allocated GPU half-precision tensor. Reshaped on
+    //!                          success to [audio_tokens_this_chunk, audioFeatureDim] and
+    //!                          populated. Caller must size the underlying allocation big
+    //!                          enough — the function only reshapes within it.
+    //! \param[in]  stream       CUDA stream for execution.
+    //! \return True on success, false otherwise.
+    bool encodeMelChunk(
+        rt::audioUtils::AudioData const& mel, rt::Tensor& outEmbedding, cudaStream_t stream);
+
 private:
     //! \brief Preprocess audio buffers and run encoder inference
     //! \param[in] audioBuffers Input audio data with mel-spectrogram paths or waveforms
@@ -110,6 +125,18 @@ private:
     //! \return True if preprocessing and inference succeeded, false otherwise
     bool preprocessAudio(std::vector<rt::audioUtils::AudioData> const& audioBuffers,
         std::vector<int64_t>& audioTokenLengths, cudaStream_t stream);
+
+    //! \brief Encode a single mel chunk to `mAudioEmbedding` via the encoder TRT context.
+    //! \details Shared body for both `preprocessAudio` (one-shot, looped per buffer) and
+    //!          `encodeMelChunk` (streaming, single buffer). Does only the forward pass —
+    //!          no text/MRope side effects. On success, `mAudioEmbedding` is reshaped to
+    //!          [totalAudioTokens, audioFeatureDim] and `outTokens` carries that count.
+    //! \param[in]  audio      Single audio data (mel-spectrogram path).
+    //! \param[out] outTokens  Number of audio tokens produced for this chunk.
+    //! \param[in]  stream     CUDA stream.
+    //! \return True on success, false otherwise.
+    bool encodeOneAudioImpl(
+        rt::audioUtils::AudioData const& audio, int64_t& outTokens, cudaStream_t stream);
 
     //! \brief Tokenize text and insert audio tokens
     //! \param[in] request LLM generation request
