@@ -216,7 +216,27 @@ public:
      *
      * @return True on success, false on validation failure.
      */
-    bool beginChunkedPrefillSession(SpecDecodeInferenceContext& context);
+    bool beginAsrSession(SpecDecodeInferenceContext& context);
+
+    /*!
+     * @brief End an in-flight streaming-ASR session and release its state.
+     *        Mirror of beginAsrSession.
+     *
+     * Frees the KV-cache slot bound to this context (via
+     * HybridCacheManager::resetForNewSequences with zero reuse lengths),
+     * clears the accumulated session token-ID list and per-batch effective
+     * prefill lengths so a subsequent beginAsrSession on the same context
+     * starts from a clean slate.
+     *
+     * Safe to call without a paired begin (returns true and is a no-op on
+     * unused contexts). Safe to call repeatedly. After endAsrSession returns,
+     * the context can be reused via beginAsrSession.
+     *
+     * @param context  Inference context previously passed to beginAsrSession.
+     * @param stream   CUDA stream used to issue the cache-length reset H2D.
+     * @return True on success.
+     */
+    bool endAsrSession(SpecDecodeInferenceContext& context, cudaStream_t stream);
 
     /*!
      * @brief Append one chunk of prefill embeddings to an in-flight streaming

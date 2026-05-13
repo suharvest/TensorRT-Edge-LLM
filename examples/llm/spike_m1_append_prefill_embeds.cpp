@@ -14,7 +14,7 @@
 //   Path B — two chunks of length N1, N2 (N1 + N2 = N) split at an audio_pad
 //            boundary, also through appendPrefillEmbeds.
 //
-// Both paths begin from the same beginChunkedPrefillSession state and consume
+// Both paths begin from the same beginAsrSession state and consume
 // the same FP16 audio embedding rows and the same token-ID layout
 // (text prefix + audio_bos + audio_pad × N_audio + audio_eos + text suffix).
 // We download mLogitsOutput after each path and compare element-wise.
@@ -166,9 +166,9 @@ int main(int argc, char** argv)
         ctx.rawBatchedInputIds.assign(1, {});
         ctx.tokenIds[0].clear();
 
-        if (!runtime->beginChunkedPrefillSession(ctx))
+        if (!runtime->beginAsrSession(ctx))
         {
-            fprintf(stderr, "[%s] beginChunkedPrefillSession FAILED\n", label);
+            fprintf(stderr, "[%s] beginAsrSession FAILED\n", label);
             std::exit(3);
         }
         printf("[%s] session begun\n", label);
