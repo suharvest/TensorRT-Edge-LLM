@@ -131,7 +131,7 @@ public:
     //! \param[in]      stream                  CUDA stream.
     //! \return True on success, false otherwise.
     bool initializeMRopeForSession(
-        int32_t maxAudioTokens, rt::Tensor& ropeRotaryCosSinDevice, cudaStream_t stream);
+        int32_t maxAudioTokens, rt::Tensor& ropeRotaryCosSinDevice, cudaStream_t stream) override;
 
 private:
     //! \brief Preprocess audio buffers and run encoder inference
