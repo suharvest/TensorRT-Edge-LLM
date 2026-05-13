@@ -213,6 +213,25 @@ public:
     void setActionNoiseSeed(int32_t seed) noexcept;
 
     /*!
+     * @brief One-time per-session setup that must run before any
+     *        appendPrefillEmbeds calls. Reuses the OneShot setup path so LoRA
+     *        binding, KV-cache reset, system-prompt restore, and reuse-length
+     *        bookkeeping happen exactly as they do in handleRequest.
+     *
+     * After this returns true the caller may invoke appendPrefillEmbeds any
+     * number of times (subject to engine max_input_len per chunk and max KV
+     * capacity total), then drive decode separately.
+     *
+     * Caller must populate context.activeBatchSize, context.systemPrompts[i],
+     * context.rawBatchedInputIds[i] (initial prompt token IDs — typically the
+     * text prefix that precedes any audio), and context.loraWeightsName / stream
+     * before calling.
+     *
+     * @return True on success, false on validation failure.
+     */
+    bool beginChunkedPrefillSession(SpecDecodeInferenceContext& context);
+
+    /*!
      * @brief Append one chunk of prefill embeddings to an in-flight streaming
      *        prefill session. Milestone 1 of the streaming-ASR plan
      *        (design doc §12).
@@ -317,6 +336,15 @@ public:
     std::vector<std::vector<int32_t>> const& getBaseModelInputTokenIds() const noexcept
     {
         return mLastInputTokenIds;
+    }
+
+    //! @brief Test-only accessor: read-only view of the most recent prefill
+    //! logits binding. Used by the M1 acceptance test to bit-exact compare
+    //! single-chunk vs split-chunk paths. Not part of the production API —
+    //! production callers receive tokens via handleRequest, not raw logits.
+    rt::Tensor const& getLogitsForTesting() const noexcept
+    {
+        return mLogitsOutput;
     }
 
     //! @brief Check if draft model is loaded and spec-decode is available
