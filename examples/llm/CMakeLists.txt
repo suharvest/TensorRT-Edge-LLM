@@ -50,3 +50,15 @@ target_include_directories(
   spike_m1_append_prefill_embeds PRIVATE ${COMMON_INCLUDE_DIRS}
                                           ${CMAKE_SOURCE_DIR}/examples/utils)
 add_cross_build_link_options(spike_m1_append_prefill_embeds)
+
+# Streaming-ASR M2 acceptance test (design doc §12 milestone 2): session
+# lifecycle (beginAsrSession/endAsrSession idempotence) + capacity caps
+# (KV-overflow + per-chunk-overflow refusal).
+add_executable(spike_m2_session_lifecycle spike_m2_session_lifecycle.cpp)
+target_link_libraries(spike_m2_session_lifecycle PRIVATE edgellmCore
+                                                          exampleUtils
+                                                          commonLibraryExt)
+target_include_directories(
+  spike_m2_session_lifecycle PRIVATE ${COMMON_INCLUDE_DIRS}
+                                      ${CMAKE_SOURCE_DIR}/examples/utils)
+add_cross_build_link_options(spike_m2_session_lifecycle)
