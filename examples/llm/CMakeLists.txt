@@ -74,3 +74,18 @@ target_include_directories(
   spike_m35_audio_runner_split PRIVATE ${COMMON_INCLUDE_DIRS}
                                         ${CMAKE_SOURCE_DIR}/examples/utils)
 add_cross_build_link_options(spike_m35_audio_runner_split)
+
+# Streaming-ASR M3.6 empirical LCS test: end-to-end chunked-prefill text-quality
+# comparison. Drives beginAsrSession + encodeMelChunk + appendPrefillEmbeds +
+# decodeAfterChunkedPrefillForTesting + endAsrSession for chunk_blocks in
+# {1, 2, 4, 8} on a real ASR sample, then compares decoded token sequences via
+# LCS-similarity. If LCS >= 0.95 for production chunk sizes the streaming
+# worker ships as-is with no encoder rework.
+add_executable(spike_m36_empirical_lcs spike_m36_empirical_lcs.cpp)
+target_link_libraries(spike_m36_empirical_lcs PRIVATE edgellmCore
+                                                       exampleUtils
+                                                       commonLibraryExt)
+target_include_directories(
+  spike_m36_empirical_lcs PRIVATE ${COMMON_INCLUDE_DIRS}
+                                   ${CMAKE_SOURCE_DIR}/examples/utils)
+add_cross_build_link_options(spike_m36_empirical_lcs)

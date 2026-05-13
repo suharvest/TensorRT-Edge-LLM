@@ -362,6 +362,47 @@ public:
         return mLogitsOutput;
     }
 
+    //! @brief Test-only accessor: tokenizer pointer used by the runtime. The
+    //! M3.6 empirical-LCS spike needs to encode the request prompt prefix /
+    //! suffix outside handleRequest to drive chunked prefill manually.
+    //! Production callers should hand text to handleRequest instead.
+    tokenizer::Tokenizer* getTokenizerForTesting() const noexcept
+    {
+        return mTokenizer.get();
+    }
+
+    //! @brief Test-only accessor: audio runner pointer used by the runtime.
+    //! Returns nullptr if no audio runner is loaded. The M3.6 spike calls
+    //! encodeMelChunk through this handle (after dynamic_cast to the concrete
+    //! Qwen3OmniAudioRunner) so the runtime's MRope-init issued in
+    //! beginAsrSession is the one driving per-chunk encoding.
+    //! Production callers should not bypass handleRequest.
+    MultimodalRunner* getAudioRunnerForTesting() const noexcept
+    {
+        return mAudioRunner.get();
+    }
+
+    //! @brief Test-only post-prefill decode driver for the M3.6 empirical-LCS
+    //! spike. Preconditions:
+    //!   - The caller has just finished its last appendPrefillEmbeds call for
+    //!     this session. mLogitsOutput holds the logits over the LAST prefill
+    //!     token (i.e., the next token to sample).
+    //!   - context.activeBatchSize == 1, no draft model, no streaming/cancel
+    //!     wiring is attached.
+    //!
+    //! Behavior: greedy-samples the first generated token from mLogitsOutput,
+    //! appends it to context.tokenIds[0], then loops runVanillaDecoding until
+    //! EOS or until @p maxNewTokens additional generated tokens have been
+    //! produced (inclusive of the first sampled token). Returns the list of
+    //! GENERATED token IDs (not the prefill tokens) in @p outGeneratedTokens.
+    //!
+    //! This duplicates the post-prefill loop of handleRequest in a stripped
+    //! form (no spec-decode, no streaming, no eviction). It exists so the
+    //! M3.6 spike can compare chunked-prefill text quality without touching
+    //! the production handleRequest path.
+    bool decodeAfterChunkedPrefillForTesting(SpecDecodeInferenceContext& context, int32_t maxNewTokens,
+        std::vector<int32_t>& outGeneratedTokens, cudaStream_t stream);
+
     //! @brief Check if draft model is loaded and spec-decode is available
     bool hasDraftModel() const noexcept
     {

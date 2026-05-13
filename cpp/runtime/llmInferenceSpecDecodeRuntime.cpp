@@ -2118,6 +2118,72 @@ bool LLMInferenceSpecDecodeRuntime::endAsrSession(SpecDecodeInferenceContext& co
     return true;
 }
 
+// ----------------------------------------------------------------------------
+// Test-only post-prefill decode driver for the M3.6 empirical-LCS spike.
+// Strips handleRequest's post-prefill loop down to: sample-first-token from
+// mLogitsOutput, then loop runVanillaDecoding until EOS / maxNewTokens.
+// No spec-decode, no streaming, no eviction. Single batch only.
+// ----------------------------------------------------------------------------
+bool LLMInferenceSpecDecodeRuntime::decodeAfterChunkedPrefillForTesting(SpecDecodeInferenceContext& context,
+    int32_t maxNewTokens, std::vector<int32_t>& outGeneratedTokens, cudaStream_t stream)
+{
+    NVTX_SCOPED_RANGE(nvtx_decode_test, "DECODE_AFTER_CHUNKED_PREFILL_TEST", nvtx_colors::PURPLE);
+    check::check(context.activeBatchSize == 1, "decodeAfterChunkedPrefillForTesting: batch==1 only");
+    check::check(!hasDraftModel(), "decodeAfterChunkedPrefillForTesting: no spec-decode");
+    constexpr int32_t kBatchIdx = 0;
+
+    outGeneratedTokens.clear();
+
+    // Step 1 — sample first token from the prefill logits already in mLogitsOutput.
+    // mLogitsOutput has shape [1, outputVocabSize] from the last appendPrefillEmbeds call.
+    check::check(mSamplingIndices.reshape({1, 1}), "mSamplingIndices reshape failed");
+    {
+        constexpr int32_t kSAMPLING_TOP_K = 1;
+        selectAllTopK(mLogitsOutput, std::nullopt, mSamplingIndices, kSAMPLING_TOP_K, mSamplingWorkspace, stream);
+    }
+    if (mBaseEngineConfig.reducedVocabSize > 0)
+    {
+        mapReducedVocabToFullVocab(mSamplingIndices, mBaseVocabMappingTable, stream);
+    }
+    check::check(mHostSelectedTokenIds.reshape({1}), "mHostSelectedTokenIds reshape failed");
+    int32_t* hostSel = mHostSelectedTokenIds.dataPointer<int32_t>();
+    CUDA_CHECK(cudaMemcpyAsync(hostSel, mSamplingIndices.rawPointer(), sizeof(int32_t), cudaMemcpyDeviceToHost, stream));
+    CUDA_CHECK(cudaStreamSynchronize(stream));
+
+    int32_t firstToken = hostSel[0];
+    context.tokenIds[kBatchIdx].push_back(firstToken);
+    context.currentGenerateLengths[kBatchIdx] += 1;
+    outGeneratedTokens.push_back(firstToken);
+
+    int32_t const eosId = mTokenizer->getEosId();
+    if (firstToken == eosId)
+    {
+        return true;
+    }
+
+    // Step 2 — loop runVanillaDecoding until EOS or maxNewTokens.
+    context.generationRound = 1; // post-prefill round number, mirrors handleRequest convention.
+    while (static_cast<int32_t>(outGeneratedTokens.size()) < maxNewTokens)
+    {
+        bool const ok = runVanillaDecoding(context);
+        if (!ok)
+        {
+            LOG_ERROR("decodeAfterChunkedPrefillForTesting: runVanillaDecoding failed at round %d",
+                context.generationRound);
+            return false;
+        }
+        // runVanillaDecoding appended the next token to context.tokenIds[0].
+        int32_t const lastTok = context.tokenIds[kBatchIdx].back();
+        outGeneratedTokens.push_back(lastTok);
+        context.generationRound += 1;
+        if (lastTok == eosId)
+        {
+            break;
+        }
+    }
+    return true;
+}
+
 // Streaming-ASR Milestone 1 entrypoint. Append one chunk of audio-bearing
 // prefill embeddings to an in-flight session. Subset of runBaseModelPrefill
 // (~L976): no draft model, no deepstack, no sampling — only the base-engine
