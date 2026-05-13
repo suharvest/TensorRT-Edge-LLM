@@ -2275,15 +2275,54 @@ bool LLMInferenceSpecDecodeRuntime::setUpForPrefillExecutionForChunk(SpecDecodeI
     return true;
 }
 
-// Streaming-ASR Milestone 1 session-init wrapper. Calls into the existing
-// one-shot setup path so LoRA / KV reset / system-prompt restore / reuse
-// lengths are bound identically to the handleRequest path. This is the only
-// session bootstrap entrypoint exposed for the chunked-prefill API; later
-// milestones will wrap it as part of beginAsrSession.
-bool LLMInferenceSpecDecodeRuntime::beginChunkedPrefillSession(SpecDecodeInferenceContext& context)
+// Streaming-ASR session-init entrypoint (renamed from beginChunkedPrefillSession
+// in M2). Calls into the existing one-shot setup path so LoRA / KV reset /
+// system-prompt restore / reuse lengths are bound identically to the
+// handleRequest path.
+bool LLMInferenceSpecDecodeRuntime::beginAsrSession(SpecDecodeInferenceContext& context)
 {
-    NVTX_SCOPED_RANGE(nvtx_begin_chunked, "BEGIN_CHUNKED_PREFILL_SESSION", nvtx_colors::PALE_GREEN);
+    NVTX_SCOPED_RANGE(nvtx_begin_asr, "BEGIN_ASR_SESSION", nvtx_colors::PALE_GREEN);
     return setUpForPrefillExecutionOneShot(context);
+}
+
+// Streaming-ASR session teardown (M2). Frees the KV slot bound to this context
+// and clears accumulated per-session state so the context can be reused by a
+// later beginAsrSession call. Safe to call without a paired begin (no-op on a
+// fresh context); safe to call repeatedly.
+bool LLMInferenceSpecDecodeRuntime::endAsrSession(SpecDecodeInferenceContext& context, cudaStream_t stream)
+{
+    NVTX_SCOPED_RANGE(nvtx_end_asr, "END_ASR_SESSION", nvtx_colors::PALE_GREEN);
+
+    int32_t const activeBatchSize = context.activeBatchSize;
+    if (activeBatchSize <= 0)
+    {
+        // Context never carried an active session — nothing to free.
+        return true;
+    }
+
+    // Free the KV slot by issuing a resetForNewSequences with all-zero reuse
+    // lengths. This is the same mechanism setUpForPrefillExecutionOneShot uses
+    // to bring fresh sessions to zero (cpp/runtime/llmInferenceSpecDecodeRuntime.cpp ~L1995),
+    // reused here for teardown.
+    check::check(mHostReuseKVCacheLengths.reshape({activeBatchSize}), "Tensor reshape failed");
+    int32_t* reuseData = mHostReuseKVCacheLengths.dataPointer<int32_t>();
+    std::fill(reuseData, reuseData + activeBatchSize, 0);
+
+    rt::HybridCacheManager& baseCacheManager = mBaseEngineRunner->getCacheManager();
+    baseCacheManager.resetForNewSequences(mHostReuseKVCacheLengths, stream);
+    if (mDraftEngineRunner != nullptr)
+    {
+        mDraftEngineRunner->getCacheManager().resetForNewSequences(mHostReuseKVCacheLengths, stream);
+    }
+
+    // Clear accumulated per-session bookkeeping.
+    for (auto& seq : context.tokenIds)
+    {
+        seq.clear();
+    }
+    std::fill(context.effectivePrefillLengths.begin(), context.effectivePrefillLengths.end(), 0);
+
+    return true;
 }
 
 // Streaming-ASR Milestone 1 entrypoint. Append one chunk of audio-bearing
