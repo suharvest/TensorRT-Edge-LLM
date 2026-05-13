@@ -637,7 +637,7 @@ bool LLMInferenceSpecDecodeRuntime::handleRequest(LLMGenerationRequest const& re
 
     // Conduct the preparation work to handle a new set of sequences, including inputIds packing, input/output tensor
     // preparation, reset the KVCache state, and apply reused prefix KVCache if available.
-    if (!setUpForPrefillExecution(context))
+    if (!setUpForPrefillExecutionOneShot(context))
     {
         LOG_ERROR("Prefill execution setup failed. This request cannot be handled.");
         return false;
@@ -2125,7 +2125,7 @@ void LLMInferenceSpecDecodeRuntime::zeroRecurrentStates(int32_t batchIdx, cudaSt
     }
 }
 
-bool LLMInferenceSpecDecodeRuntime::setUpForPrefillExecution(SpecDecodeInferenceContext& context)
+bool LLMInferenceSpecDecodeRuntime::setUpForPrefillExecutionOneShot(SpecDecodeInferenceContext& context)
 {
     NVTX_SCOPED_RANGE(nvtx_setup, "SETUP_PREFILL_EXECUTION", nvtx_colors::PALE_GREEN);
 
@@ -2235,6 +2235,46 @@ bool LLMInferenceSpecDecodeRuntime::setUpForPrefillExecution(SpecDecodeInference
     return true;
 }
 
+// Per-chunk prefill setup for streaming/chunked prefill (M1 of streaming ASR).
+//
+// Carries ONLY the BOTH-classified lines from the original setUpForPrefillExecution
+// (per codex spec, design doc §12 milestone 1):
+//   - NVTX scope / prologue
+//   - activeBatchSize fetch
+//   - effective prefill length validation against engine max
+//
+// Explicitly OMITTED (one-shot only):
+//   - switchLoraWeights (LoRA binding is session-scoped, set once at session start
+//     via the OneShot path on the first chunk).
+//   - rawBatchedInputIds construction (caller appends to context.tokenIds itself).
+//   - reuseKVCacheLengths reshape/zero + system-prompt restore (one-shot init only).
+//   - context.tokenIds.clear()+resize (would destroy accumulated session tokens).
+//   - baseCacheManager.resetForNewSequences (would zero KV cache lengths; the
+//     engine derives kvcache_start_index from live cache lengths per §10c-real).
+//   - draft cache resetForNewSequences (same reasoning).
+//
+// Precondition: context.effectivePrefillLengths[i] has been set by the caller
+// to the per-chunk token-slice length for chunk K.
+bool LLMInferenceSpecDecodeRuntime::setUpForPrefillExecutionForChunk(SpecDecodeInferenceContext& context)
+{
+    NVTX_SCOPED_RANGE(nvtx_setup_chunk, "SETUP_PREFILL_EXECUTION_FOR_CHUNK", nvtx_colors::PALE_GREEN);
+
+    int32_t const activeBatchSize = context.activeBatchSize;
+    (void) activeBatchSize; // currently unused beyond validation; reserved for future per-batch logic.
+
+    // Validate max input length (per-chunk slice must fit engine binding).
+    int32_t const maxInputLength
+        = *std::max_element(context.effectivePrefillLengths.begin(), context.effectivePrefillLengths.end());
+    if (maxInputLength > mBaseEngineConfig.maxSupportedInputLength)
+    {
+        LOG_ERROR("The per-chunk input length (%d) exceeds the max supported input length (%d) of the LLM Engine.",
+            maxInputLength, mBaseEngineConfig.maxSupportedInputLength);
+        return false;
+    }
+
+    return true;
+}
+
 bool LLMInferenceSpecDecodeRuntime::genAndSaveSystemPromptKVCache(
     SpecDecodeInferenceContext& context, int32_t genAndSaveBatchIdx)
 {
@@ -2288,7 +2328,7 @@ bool LLMInferenceSpecDecodeRuntime::genAndSaveSystemPromptKVCache(
     tempContext.tokenIds[0] = tokenizedPrompt;
 
     // Setup for prefill execution: handles KV cache reset and applies any reused system prompt cache
-    if (!setUpForPrefillExecution(tempContext))
+    if (!setUpForPrefillExecutionOneShot(tempContext))
     {
         LOG_ERROR("Prefill execution setup failed for system prompt KVCache generation.");
         return false;
