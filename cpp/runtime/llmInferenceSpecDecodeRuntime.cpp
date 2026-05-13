@@ -2485,6 +2485,23 @@ int32_t LLMInferenceSpecDecodeRuntime::getMaxKvCacheCapacity() const noexcept
     return mBaseEngineConfig.maxKVCacheCapacity;
 }
 
+// M2: synchronous D2H read of the live KV cache length for the given batch
+// slot. Issues a 1-int memcpy + stream-sync on the supplied stream. Reuses
+// mHostKvLengthSnapshot as the pinned host buffer (single-slot read).
+int32_t LLMInferenceSpecDecodeRuntime::peekKvCacheLength(int32_t batchIdx, cudaStream_t stream)
+{
+    rt::HybridCacheManager& cm = mBaseEngineRunner->getCacheManager();
+    rt::Tensor const& devLen = cm.getKVCacheLengths();
+    check::check(batchIdx >= 0 && batchIdx < devLen.getShape()[0],
+        "peekKvCacheLength: batchIdx out of range for active KV cache lengths tensor");
+    check::check(mHostKvLengthSnapshot.reshape({1}), "mHostKvLengthSnapshot reshape failed");
+    int32_t* host = mHostKvLengthSnapshot.dataPointer<int32_t>();
+    auto const* devBase = static_cast<int32_t const*>(devLen.rawPointer());
+    CUDA_CHECK(cudaMemcpyAsync(host, devBase + batchIdx, sizeof(int32_t), cudaMemcpyDeviceToHost, stream));
+    CUDA_CHECK(cudaStreamSynchronize(stream));
+    return host[0];
+}
+
 bool LLMInferenceSpecDecodeRuntime::genAndSaveSystemPromptKVCache(
     SpecDecodeInferenceContext& context, int32_t genAndSaveBatchIdx)
 {

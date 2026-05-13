@@ -263,6 +263,12 @@ public:
     //!        to advertise the cap in a structured error.
     int32_t getMaxKvCacheCapacity() const noexcept;
 
+    //! @brief Synchronous D2H read of the live KV cache length for batch slot
+    //!        @p batchIdx. M2 helper for both the lifecycle acceptance test and
+    //!        the M3 worker, which wants to advertise live cache occupancy in
+    //!        structured error events.
+    int32_t peekKvCacheLength(int32_t batchIdx, cudaStream_t stream);
+
     bool beginAsrSession(SpecDecodeInferenceContext& context);
 
     /*!
