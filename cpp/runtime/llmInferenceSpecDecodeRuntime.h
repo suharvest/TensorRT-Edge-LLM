@@ -229,6 +229,40 @@ public:
      *
      * @return True on success, false on validation failure.
      */
+    /*!
+     * @brief Status code reported by the most recent appendPrefillEmbeds call.
+     *        M2 introduces the kKvCapacityExceeded / kChunkTooLong refusal
+     *        modes so callers can distinguish capacity refusal from engine
+     *        prefill failure and emit a structured error event.
+     */
+    enum class AppendPrefillStatus : int32_t
+    {
+        kOk = 0,                  //!< Append succeeded.
+        kKvCapacityExceeded = 1,  //!< current_kv_length + chunkLen > max_kv_cache_capacity.
+        kChunkTooLong = 2,        //!< tokenSliceDelta.size() > engine max_input_len.
+        kPreconditionFailed = 3,  //!< Per-chunk validation in setUpForPrefillExecutionForChunk failed.
+        kPrefillFailed = 4,       //!< Underlying executePrefillStep returned false.
+    };
+
+    //! @brief Status of the most recent appendPrefillEmbeds call (kOk if never called).
+    AppendPrefillStatus getLastAppendStatus() const noexcept
+    {
+        return mLastAppendStatus;
+    }
+
+    //! @brief Snapshot of the live KV cache length (batch slot 0) read at entry
+    //!        to the most recent appendPrefillEmbeds call. Useful for the
+    //!        worker to surface in a structured capacity-error event.
+    int32_t getLastObservedKvLength() const noexcept
+    {
+        return mLastObservedKvLength;
+    }
+
+    //! @brief Static read of the engine's max KV cache capacity (256 in the
+    //!        shipped ASR thinker engine). Convenience for callers that want
+    //!        to advertise the cap in a structured error.
+    int32_t getMaxKvCacheCapacity() const noexcept;
+
     bool beginAsrSession(SpecDecodeInferenceContext& context);
 
     /*!
@@ -448,6 +482,19 @@ private:
     rt::Tensor mHostAcceptLengths;       //!< Host pinned memory for accept lengths from verification
     rt::Tensor mHostAcceptedTokenIds;    //!< Host pinned memory for accepted token IDs
     rt::Tensor mHostReuseKVCacheLengths; //!< Host pinned memory for reuse KV cache lengths
+
+    //! @brief Pinned host scratch for D2H copy of the live KV cache lengths
+    //!        tensor — populated at the entry of appendPrefillEmbeds so the
+    //!        capacity check can run synchronously with respect to in-flight
+    //!        prefill commits.
+    rt::Tensor mHostKvLengthSnapshot{};
+
+    //! @brief Status of the most recent appendPrefillEmbeds call.
+    AppendPrefillStatus mLastAppendStatus{AppendPrefillStatus::kOk};
+
+    //! @brief Snapshot of live KV cache length observed by the most recent
+    //!        appendPrefillEmbeds call (batch slot 0). 0 if never called.
+    int32_t mLastObservedKvLength{0};
 
     // [7] Multimodal support tensors for audio/image token indexing
     rt::Tensor mMultimodalIndices; //!< Multimodal indices tensor [batchSize, seqLen] for audio/image embeddings

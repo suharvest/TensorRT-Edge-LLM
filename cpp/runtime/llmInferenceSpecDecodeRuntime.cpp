@@ -328,6 +328,7 @@ void LLMInferenceSpecDecodeRuntime::initializeCommon(std::string const& engineDi
         mDeviceBatchMapping = rt::Tensor({mMaxRuntimeBatchSize}, rt::DeviceType::kGPU, DataType::kINT32,
             "LLMInferenceSpecDecodeRuntime::mDeviceBatchMapping");
 
+        mHostKvLengthSnapshot = rt::Tensor({1}, rt::DeviceType::kCPU, nvinfer1::DataType::kINT32, "hostKvLengthSnapshot");
         mHostPackedTokenIds = rt::Tensor({mMaxRuntimeBatchSize, mBaseEngineConfig.maxSupportedInputLength},
             rt::DeviceType::kCPU, DataType::kINT32, "LLMInferenceSpecDecodeRuntime::mHostPackedTokenIds");
         mHostSelectedTokenIds = rt::Tensor({mMaxRuntimeBatchSize}, rt::DeviceType::kCPU, DataType::kINT32,
@@ -2349,6 +2350,46 @@ bool LLMInferenceSpecDecodeRuntime::appendPrefillEmbeds(SpecDecodeInferenceConte
     constexpr int32_t kBatchIdx = 0;
     int32_t const chunkLen = static_cast<int32_t>(tokenSliceDelta.size());
 
+    // ----- M2 capacity guards. ------------------------------------------------
+    //
+    // (a) Per-chunk cap: chunkLen must fit the engine's max_input_len binding.
+    //     setUpForPrefillExecutionForChunk also enforces this, but we surface a
+    //     dedicated status code BEFORE state mutation so the worker can emit a
+    //     structured error and the context stays untouched.
+    int32_t const engineMaxIn = mBaseEngineConfig.maxSupportedInputLength;
+    if (chunkLen > engineMaxIn)
+    {
+        LOG_ERROR("appendPrefillEmbeds: chunk too long (chunkLen=%d > max_input_len=%d)", chunkLen, engineMaxIn);
+        mLastAppendStatus = AppendPrefillStatus::kChunkTooLong;
+        return false;
+    }
+
+    // (b) KV capacity cap: live cache length + chunkLen must fit
+    //     max_kv_cache_capacity (256 in the shipped ASR thinker engine). The
+    //     authoritative live length lives on the device in mDeviceKVCacheLengths;
+    //     issue a synchronous D2H of the slot-0 int32 and compare on the host.
+    rt::HybridCacheManager& baseCacheManager = mBaseEngineRunner->getCacheManager();
+    rt::Tensor const& deviceKvLengths = baseCacheManager.getKVCacheLengths();
+    check::check(deviceKvLengths.getShape()[0] >= 1, "appendPrefillEmbeds: KV lengths tensor has no active batch slot");
+    check::check(mHostKvLengthSnapshot.reshape({1}), "mHostKvLengthSnapshot reshape failed");
+    int32_t* hostKvLenPtr = mHostKvLengthSnapshot.dataPointer<int32_t>();
+    // Synchronous D2H — the worker is making a binding policy decision on this
+    // value; no overlap with prefill is possible.
+    CUDA_CHECK(cudaMemcpyAsync(
+        hostKvLenPtr, deviceKvLengths.rawPointer(), sizeof(int32_t), cudaMemcpyDeviceToHost, stream));
+    CUDA_CHECK(cudaStreamSynchronize(stream));
+    int32_t const currentKvLen = hostKvLenPtr[0];
+    mLastObservedKvLength = currentKvLen;
+    int32_t const maxKvCap = mBaseEngineConfig.maxKVCacheCapacity;
+    if (currentKvLen + chunkLen > maxKvCap)
+    {
+        LOG_ERROR("appendPrefillEmbeds: KV capacity exceeded (current=%d, chunk=%d, cap=%d)", currentKvLen, chunkLen,
+            maxKvCap);
+        mLastAppendStatus = AppendPrefillStatus::kKvCapacityExceeded;
+        return false;
+    }
+    // ------------------------------------------------------------------------
+
     // 1. Extend context.tokenIds[0] with the new token slice. Do NOT clear —
     //    setUpForPrefillExecutionForChunk explicitly skips the clear so the
     //    accumulated session token-ID list survives across chunks.
@@ -2367,6 +2408,7 @@ bool LLMInferenceSpecDecodeRuntime::appendPrefillEmbeds(SpecDecodeInferenceConte
     {
         LOG_ERROR("appendPrefillEmbeds: per-chunk setup validation failed (chunkLen=%d, engineMax=%d)",
             chunkLen, mBaseEngineConfig.maxSupportedInputLength);
+        mLastAppendStatus = AppendPrefillStatus::kPreconditionFailed;
         return false;
     }
 
@@ -2428,10 +2470,19 @@ bool LLMInferenceSpecDecodeRuntime::appendPrefillEmbeds(SpecDecodeInferenceConte
     {
         LOG_ERROR("appendPrefillEmbeds: executePrefillStep failed at chunkLen=%d, audioIndexBase=%d",
             chunkLen, audioIndexBase);
+        mLastAppendStatus = AppendPrefillStatus::kPrefillFailed;
         return false;
     }
 
+    mLastAppendStatus = AppendPrefillStatus::kOk;
     return true;
+}
+
+// M2: trivial accessor for the engine-config max KV capacity. Defined out-of-line
+// to keep the header free of engine-config dependencies.
+int32_t LLMInferenceSpecDecodeRuntime::getMaxKvCacheCapacity() const noexcept
+{
+    return mBaseEngineConfig.maxKVCacheCapacity;
 }
 
 bool LLMInferenceSpecDecodeRuntime::genAndSaveSystemPromptKVCache(
