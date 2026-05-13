@@ -503,7 +503,7 @@ int32_t clampMaxGenerateLengthForKVCapacity(std::vector<int32_t> const& effectiv
 }
 
 rt::Tensor generateMultimodalIndices(rt::Tensor const& inputIds, std::optional<int32_t> audioTokenId,
-    std::optional<int32_t> imageTokenId, int32_t vocabSize)
+    std::optional<int32_t> imageTokenId, int32_t vocabSize, int32_t audioIndexBase)
 {
     auto const shape = inputIds.getShape();
     check::check(shape.getNumDims() == 2, "inputIds must be 2D tensor");
@@ -515,7 +515,13 @@ rt::Tensor generateMultimodalIndices(rt::Tensor const& inputIds, std::optional<i
     int32_t const* inputIdsPtr = inputIds.dataPointer<int32_t>();
     int32_t* indicesPtr = multimodalIndices.dataPointer<int32_t>();
 
-    int32_t audioIndex = 0;
+    // audioIndexBase != 0 supports chunked-prefill streaming: the embedding kernel
+    // (cpp/kernels/embeddingKernels/embeddingKernels.cu:413) reads
+    // audioEmbeds[multimodalIdx * hiddenSize] directly, so encoding the cumulative
+    // offset into multimodalIdx lets the kernel index a cumulative audioEmbeds
+    // tensor without any kernel-signature change. Default 0 preserves one-shot
+    // behavior bit-exactly.
+    int32_t audioIndex = audioIndexBase;
     int32_t imageIndex = 0;
 
     for (int64_t b = 0; b < batchSize; ++b)

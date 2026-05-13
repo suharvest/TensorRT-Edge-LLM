@@ -326,10 +326,16 @@ int32_t clampMaxGenerateLengthForKVCapacity(std::vector<int32_t> const& effectiv
  * @param audioTokenId Special token ID for audio, or std::nullopt if no audio
  * @param imageTokenId Special token ID for image, or std::nullopt if no image
  * @param vocabSize Vocabulary size (tokens >= vocabSize are treated as image tokens)
+ * @param audioIndexBase Starting offset for audio embedding indexing. Default 0
+ *        preserves single-shot prefill semantics. For chunked/streaming prefill,
+ *        callers pass the cumulative count of audio rows consumed by prior chunks
+ *        so the kernel reads the correct row of a cumulative audioEmbeds tensor
+ *        (kernel reads `audioEmbeds[multimodalIdx * hiddenSize]`,
+ *        cpp/kernels/embeddingKernels/embeddingKernels.cu:413).
  * @return multimodalIndices tensor on CPU [batchSize, seqLen]
  */
 rt::Tensor generateMultimodalIndices(rt::Tensor const& inputIds, std::optional<int32_t> audioTokenId,
-    std::optional<int32_t> imageTokenId, int32_t vocabSize);
+    std::optional<int32_t> imageTokenId, int32_t vocabSize, int32_t audioIndexBase = 0);
 
 } // namespace rt
 } // namespace trt_edgellm
