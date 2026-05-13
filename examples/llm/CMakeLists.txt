@@ -62,3 +62,15 @@ target_include_directories(
   spike_m2_session_lifecycle PRIVATE ${COMMON_INCLUDE_DIRS}
                                       ${CMAKE_SOURCE_DIR}/examples/utils)
 add_cross_build_link_options(spike_m2_session_lifecycle)
+
+# Streaming-ASR M3.5 acceptance test (design doc §13b): audio runner split
+# correctness — encodeMelChunk on full mel vs three chunk-aligned splits
+# must produce bit-exact identical audio embeddings.
+add_executable(spike_m35_audio_runner_split spike_m35_audio_runner_split.cpp)
+target_link_libraries(spike_m35_audio_runner_split PRIVATE edgellmCore
+                                                            exampleUtils
+                                                            commonLibraryExt)
+target_include_directories(
+  spike_m35_audio_runner_split PRIVATE ${COMMON_INCLUDE_DIRS}
+                                        ${CMAKE_SOURCE_DIR}/examples/utils)
+add_cross_build_link_options(spike_m35_audio_runner_split)
