@@ -74,7 +74,11 @@ class SamplingParams:
     top_k: int = 50
     max_tokens: int = 2048
     enable_thinking: bool = False
+    save_system_prompt_kv_cache: bool = False
+    lora_weights_name: str = ""
     disable_spec_decode: bool = False
+    formatted_system_prompt: str = ""
+    formatted_complete_request: str = ""
 
 
 @dataclass
@@ -206,7 +210,10 @@ def _import_runtime():
     search_dirs = [
         project_root / "experimental" / "pybind" / "build",
         project_root / "build" / "pybind",
+        project_root / "build_container" / "pybind",
     ]
+    if os.environ.get("EDGELLM_PYBIND_DIR"):
+        search_dirs.insert(0, Path(os.environ["EDGELLM_PYBIND_DIR"]))
     search_dirs.extend(project_root.glob("build/lib.*"))
     for cand_dir in search_dirs:
         if not cand_dir.is_dir():
@@ -278,6 +285,7 @@ class LLM:
         max_kv_cache_capacity: int = 8192,
         use_trt_native_ops: bool = False,
         eagle_engine_dir: str = "",
+        model_id: str = "",
         draft_top_k: int = 10,
         draft_step: int = 6,
         verify_tree_size: int = 60,
@@ -288,12 +296,13 @@ class LLM:
                 "Exactly one of 'model', 'onnx_dir', or 'engine_dir' "
                 "must be provided.")
 
-        self._model_id = (model or os.path.basename(onnx_dir)
+        self._model_id = (model_id or model or os.path.basename(onnx_dir)
                           or os.path.basename(engine_dir))
         self._eagle_engine_dir = eagle_engine_dir
         self._draft_top_k = draft_top_k
         self._draft_step = draft_step
         self._verify_tree_size = verify_tree_size
+        self._chat_template: Optional[Dict[str, Any]] = None
 
         if engine_dir:
             self._init_from_engine(engine_dir, visual_engine_dir)
@@ -650,6 +659,10 @@ class LLM:
             request.apply_chat_template = True
             request.add_generation_prompt = True
             request.enable_thinking = params.enable_thinking
+            self._attach_formatted_request(request, params)
+            request.save_system_prompt_kv_cache = (
+                params.save_system_prompt_kv_cache)
+            request.lora_weights_name = params.lora_weights_name
             request.disable_spec_decode = params.disable_spec_decode
 
             response = self._runtime.handle_request(request)
@@ -709,6 +722,10 @@ class LLM:
         request.apply_chat_template = True
         request.add_generation_prompt = True
         request.enable_thinking = params.enable_thinking
+        self._attach_formatted_request(request, params)
+        request.save_system_prompt_kv_cache = (
+            params.save_system_prompt_kv_cache)
+        request.lora_weights_name = params.lora_weights_name
         request.disable_spec_decode = params.disable_spec_decode
 
         _FINISH_REASON_MAP = {
@@ -766,6 +783,138 @@ class LLM:
         from .api_server import run_server
 
         run_server(self, host=host, port=port)
+
+    def save_system_prompt_kv_cache(
+        self,
+        formatted_system_prompt: str,
+        lora_weights_name: str = "",
+    ) -> bool:
+        """Pre-generate and cache KV states for a formatted system prompt."""
+        return bool(
+            self._runtime.save_system_prompt_kv_cache(
+                formatted_system_prompt,
+                lora_weights_name,
+            ))
+
+    def format_system_prompt(self, system_prompt: str) -> str:
+        """Format a raw system prompt using processed_chat_template.json."""
+        template = self._load_chat_template()
+        system_role = template.get("roles", {}).get("system", {})
+        prefix = system_role.get("prefix", "")
+        suffix = system_role.get("suffix", "")
+        return f"{prefix}{system_prompt}{suffix}"
+
+    def format_messages(
+        self,
+        messages: List[Dict[str, Any]],
+        *,
+        add_generation_prompt: bool = False,
+        enable_thinking: bool = False,
+    ) -> str:
+        """Format OpenAI-style text messages using processed_chat_template.json."""
+        template = self._load_chat_template()
+        roles = template.get("roles", {})
+        chunks = []
+        for message in messages:
+            role = message.get("role", "")
+            role_template = roles.get(role)
+            if role_template is None:
+                raise ValueError(f"Unknown role in chat template: {role}")
+            chunks.append(role_template.get("prefix", ""))
+            chunks.append(_message_content_to_text(message))
+            chunks.append(role_template.get("suffix", ""))
+        if add_generation_prompt:
+            if enable_thinking and template.get("generation_prompt_thinking"):
+                chunks.append(template["generation_prompt_thinking"])
+            else:
+                chunks.append(template.get("generation_prompt", ""))
+        return "".join(chunks)
+
+    def format_system_prompt_from_messages(
+        self,
+        messages: List[Dict[str, Any]],
+    ) -> str:
+        """Extract the leading system message and format it for KV cache."""
+        if not messages or messages[0].get("role") != "system":
+            return ""
+        content = messages[0].get("content", "")
+        if isinstance(content, str):
+            system_prompt = content
+        elif isinstance(content, list):
+            parts = []
+            for item in content:
+                if isinstance(item, str):
+                    parts.append(item)
+                elif isinstance(item, dict) and item.get("type") == "text":
+                    parts.append(item.get("text", ""))
+            system_prompt = "".join(parts)
+        else:
+            system_prompt = ""
+        return self.format_system_prompt(system_prompt)
+
+    def make_prefix_formatted_request(
+        self,
+        prefix_messages: List[Dict[str, Any]],
+        suffix_messages: List[Dict[str, Any]],
+        *,
+        enable_thinking: bool = False,
+    ) -> Dict[str, str]:
+        """Build a formatted prefix-cache request from message segments."""
+        formatted_prefix = self.format_messages(
+            prefix_messages,
+            add_generation_prompt=False,
+            enable_thinking=enable_thinking,
+        )
+        formatted_suffix = self.format_messages(
+            suffix_messages,
+            add_generation_prompt=True,
+            enable_thinking=enable_thinking,
+        )
+        return {
+            "formatted_system_prompt": formatted_prefix,
+            "formatted_complete_request": formatted_prefix + formatted_suffix,
+        }
+
+    def _load_chat_template(self) -> Dict[str, Any]:
+        """Load processed_chat_template.json from the active engine/model dir."""
+        if self._chat_template is not None:
+            return self._chat_template
+        template_path = Path(self._model_dir) / "processed_chat_template.json"
+        if not template_path.is_file():
+            raise FileNotFoundError(
+                f"processed_chat_template.json not found in {self._model_dir}")
+        with template_path.open() as f:
+            self._chat_template = json.load(f)
+        return self._chat_template
+
+    def set_profiling_enabled(self, enabled: bool) -> None:
+        """Enable or disable runtime profiling counters."""
+        self._rt.set_profiling_enabled(enabled)
+
+    def get_profiling_enabled(self) -> bool:
+        """Return whether runtime profiling counters are enabled."""
+        return bool(self._rt.get_profiling_enabled())
+
+    def get_prefill_metrics(self) -> Dict[str, int]:
+        """Return accumulated prefill cache metrics."""
+        metrics = self._runtime.get_prefill_metrics()
+        return {
+            "reused_tokens": int(metrics.reused_tokens),
+            "computed_tokens": int(metrics.computed_tokens),
+        }
+
+    def _attach_formatted_request(
+        self,
+        request: Any,
+        params: SamplingParams,
+    ) -> None:
+        """Attach preformatted request text when prefix-cache mode is used."""
+        if not params.formatted_complete_request:
+            return
+        formatted = self._rt.FormattedRequest()
+        formatted.formatted_system_prompt = params.formatted_system_prompt
+        formatted.formatted_complete_request = params.formatted_complete_request
+        request.formatted_requests = [formatted]
 
     # ------------------------------------------------------------------
     # Properties
@@ -826,6 +975,25 @@ def _convert_messages_to_cpp(rt_module, messages: List[Dict[str, Any]]):
         cpp_msg.contents = contents_list
         cpp_messages.append(cpp_msg)
     return cpp_messages
+
+
+def _message_content_to_text(message: Dict[str, Any]) -> str:
+    """Return the text-only content used by prefix-cache formatting."""
+    content = message.get("content", "")
+    if isinstance(content, str):
+        return content
+    if isinstance(content, list):
+        parts = []
+        for item in content:
+            if isinstance(item, str):
+                parts.append(item)
+            elif isinstance(item, dict) and item.get("type", "text") == "text":
+                parts.append(item.get("text", ""))
+            else:
+                raise ValueError(
+                    "Prefix cache formatting currently supports text content only")
+        return "".join(parts)
+    raise ValueError("Prefix cache formatting currently supports text content only")
 
 
 def _load_image_buffers(rt_module, messages: List[Dict[str, Any]]):

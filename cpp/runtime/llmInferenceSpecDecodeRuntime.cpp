@@ -556,13 +556,20 @@ bool LLMInferenceSpecDecodeRuntime::handleRequest(LLMGenerationRequest const& re
 
     int32_t maxGenerateLength = request.maxGenerateLength;
 
-    // Apply chat template for all requests (common for both multimodal and non-multimodal)
-    request.formattedRequests.resize(activeBatchSize);
-    for (int32_t i = 0; i < activeBatchSize; ++i)
+    // Apply chat template for all requests unless the caller provided fully formatted prompts.
+    bool const hasPreformattedRequests
+        = static_cast<int32_t>(request.formattedRequests.size()) == activeBatchSize
+        && std::all_of(request.formattedRequests.begin(), request.formattedRequests.end(),
+            [](auto const& formatted) { return !formatted.formattedCompleteRequest.empty(); });
+    if (!hasPreformattedRequests)
     {
-        // Apply chat template to populate both formatted system prompt and full formatted prompt
-        mTokenizer->applyChatTemplate(request.requests[i], request.formattedRequests[i], request.applyChatTemplate,
-            request.addGenerationPrompt, request.enableThinking);
+        request.formattedRequests.resize(activeBatchSize);
+        for (int32_t i = 0; i < activeBatchSize; ++i)
+        {
+            // Apply chat template to populate both formatted system prompt and full formatted prompt
+            mTokenizer->applyChatTemplate(request.requests[i], request.formattedRequests[i], request.applyChatTemplate,
+                request.addGenerationPrompt, request.enableThinking);
+        }
     }
 
     SpecDecodeInferenceContext context;

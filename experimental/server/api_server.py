@@ -25,6 +25,9 @@ Usage (standalone)::
     python -m experimental.server \\
         --model Qwen/Qwen3-1.7B --port 8000
 
+    python -m experimental.server \\
+        --engine-dir /path/to/llm_engine --port 8000
+
 Usage (from LLM object)::
 
     from experimental.server import LLM
@@ -92,6 +95,62 @@ def _create_app(llm_instance):
             }],
         }
 
+    @app.get("/metrics")
+    def metrics():
+        return {
+            "profiling_enabled": llm_instance.get_profiling_enabled(),
+            "prefill": llm_instance.get_prefill_metrics(),
+        }
+
+    @app.post("/v1/cache/system_prompt")
+    def cache_system_prompt(body: Dict[str, Any]):
+        if body.get("formatted_system_prompt"):
+            prompt = body["formatted_system_prompt"]
+        elif body.get("prompt"):
+            prompt = body["prompt"]
+        elif body.get("system_prompt") is not None:
+            try:
+                prompt = llm_instance.format_system_prompt(
+                    body.get("system_prompt", ""))
+            except Exception as exc:
+                logger.exception("System prompt formatting failed")
+                return JSONResponse(status_code=500,
+                                    content={"error": str(exc)})
+        elif body.get("messages"):
+            try:
+                prompt = llm_instance.format_system_prompt_from_messages(
+                    body["messages"])
+            except Exception as exc:
+                logger.exception("System prompt formatting failed")
+                return JSONResponse(status_code=500,
+                                    content={"error": str(exc)})
+        else:
+            prompt = ""
+        if not prompt:
+            return JSONResponse(
+                status_code=400,
+                content={
+                    "error":
+                    "formatted_system_prompt, prompt, system_prompt, or "
+                    "messages with a leading system message is required"
+                },
+            )
+        lora_weights_name = body.get("lora_weights_name",
+                                     body.get("lora_name", ""))
+        try:
+            cached = llm_instance.save_system_prompt_kv_cache(
+                prompt,
+                lora_weights_name,
+            )
+        except Exception as exc:
+            logger.exception("System prompt cache warmup failed")
+            return JSONResponse(status_code=500, content={"error": str(exc)})
+        return {
+            "object": "cache.system_prompt",
+            "cached": cached,
+            "lora_weights_name": lora_weights_name,
+        }
+
     @app.post("/v1/chat/completions")
     def chat_completions(body: Dict[str, Any]):
         messages = body.get("messages", [])
@@ -105,7 +164,14 @@ def _create_app(llm_instance):
         max_tokens = body.get("max_tokens", 2048)
         stream = body.get("stream", False)
         enable_thinking = body.get("enable_thinking", False)
+        save_system_prompt_kv_cache = body.get(
+            "save_system_prompt_kv_cache", body.get("cache_prompt", False))
+        save_prefix_cache = body.get("save_prefix_cache", False)
+        prefix_cache = body.get("prefix_cache", save_prefix_cache)
+        lora_weights_name = body.get("lora_weights_name",
+                                     body.get("lora_name", ""))
         disable_spec_decode = body.get("disable_spec_decode", False)
+        return_cache_metrics = body.get("return_cache_metrics", False)
 
         rt = llm_instance._rt
         from .engine import _convert_messages_to_cpp, _load_image_buffers
@@ -131,9 +197,36 @@ def _create_app(llm_instance):
         request.apply_chat_template = True
         request.add_generation_prompt = True
         request.enable_thinking = enable_thinking
+        request.save_system_prompt_kv_cache = (
+            save_system_prompt_kv_cache or save_prefix_cache)
+        request.lora_weights_name = lora_weights_name
         request.disable_spec_decode = disable_spec_decode
 
+        formatted_prefix = ""
+        formatted_complete = ""
+        if prefix_cache:
+            try:
+                formatted = _build_prefix_formatted_request(
+                    llm_instance,
+                    body,
+                    messages,
+                    enable_thinking,
+                )
+                formatted_prefix = formatted["formatted_system_prompt"]
+                formatted_complete = formatted["formatted_complete_request"]
+                formatted_request = rt.FormattedRequest()
+                formatted_request.formatted_system_prompt = formatted_prefix
+                formatted_request.formatted_complete_request = formatted_complete
+                request.formatted_requests = [formatted_request]
+            except Exception as exc:
+                logger.exception("Prefix cache formatting failed")
+                return JSONResponse(status_code=400,
+                                    content={"error": str(exc)})
+
         response_id = f"chatcmpl-{uuid.uuid4().hex[:12]}"
+        before_metrics = (
+            llm_instance.get_prefill_metrics()
+            if return_cache_metrics else None)
 
         if stream:
             from .engine import SamplingParams
@@ -144,7 +237,12 @@ def _create_app(llm_instance):
                 top_k=top_k,
                 max_tokens=max_tokens,
                 enable_thinking=enable_thinking,
+                save_system_prompt_kv_cache=(
+                    save_system_prompt_kv_cache or save_prefix_cache),
+                lora_weights_name=lora_weights_name,
                 disable_spec_decode=disable_spec_decode,
+                formatted_system_prompt=formatted_prefix,
+                formatted_complete_request=formatted_complete,
             )
 
             return StreamingResponse(
@@ -172,6 +270,9 @@ def _create_app(llm_instance):
         output_text = raw_text.replace(IM_END_TOKEN, "")
         output_ids = response.output_ids[0] if response.output_ids else []
         completion_tokens = len(output_ids)
+        after_metrics = (
+            llm_instance.get_prefill_metrics()
+            if return_cache_metrics else None)
 
         reasoning, answer = _split_reasoning_and_content(output_text)
 
@@ -181,7 +282,7 @@ def _create_app(llm_instance):
         message_body["content"] = (
             (answer if answer is not None else reasoning) or "")
 
-        return {
+        result = {
             "id":
             response_id,
             "object":
@@ -195,8 +296,52 @@ def _create_app(llm_instance):
                 "completion_tokens": completion_tokens,
             },
         }
+        if before_metrics is not None and after_metrics is not None:
+            result["cache_metrics"] = {
+                "prefill": {
+                    "reused_tokens": after_metrics["reused_tokens"]
+                    - before_metrics["reused_tokens"],
+                    "computed_tokens": after_metrics["computed_tokens"]
+                    - before_metrics["computed_tokens"],
+                }
+            }
+        return result
 
     return app
+
+
+def _build_prefix_formatted_request(
+    llm_instance,
+    body: Dict[str, Any],
+    messages,
+    enable_thinking: bool,
+) -> Dict[str, str]:
+    """Build formatted prefix and complete request for prefix-cache mode."""
+    if body.get("formatted_prefix") and body.get("formatted_complete_request"):
+        return {
+            "formatted_system_prompt": body["formatted_prefix"],
+            "formatted_complete_request": body["formatted_complete_request"],
+        }
+
+    if body.get("prefix_messages") is not None:
+        prefix_messages = body["prefix_messages"]
+        suffix_messages = messages
+    else:
+        if len(messages) < 2:
+            raise ValueError(
+                "prefix_cache requires prefix_messages or at least two messages")
+        prefix_messages = messages[:-1]
+        suffix_messages = messages[-1:]
+
+    if not isinstance(prefix_messages, list) or not isinstance(
+            suffix_messages, list):
+        raise ValueError("prefix_messages and messages must be arrays")
+
+    return llm_instance.make_prefix_formatted_request(
+        prefix_messages,
+        suffix_messages,
+        enable_thinking=enable_thinking,
+    )
 
 
 class _ThinkingStateMachine:
@@ -320,8 +465,33 @@ def main():
         description="TensorRT Edge-LLM OpenAI-compatible server")
     parser.add_argument(
         "--model",
-        required=True,
+        default="",
         help="HuggingFace model ID or local checkpoint path",
+    )
+    parser.add_argument(
+        "--onnx-dir",
+        default="",
+        help="Existing LLM ONNX directory; build engine then serve",
+    )
+    parser.add_argument(
+        "--visual-onnx-dir",
+        default="",
+        help="Existing visual ONNX directory for VLM serving",
+    )
+    parser.add_argument(
+        "--engine-dir",
+        default="",
+        help="Existing LLM engine directory; load directly",
+    )
+    parser.add_argument(
+        "--visual-engine-dir",
+        default="",
+        help="Existing visual engine directory for VLM serving",
+    )
+    parser.add_argument(
+        "--served-model-name",
+        default="",
+        help="Model id returned by /v1/models and chat completions",
     )
     parser.add_argument("--host", default="0.0.0.0", help="Bind address")
     parser.add_argument("--port", type=int, default=8000, help="Bind port")
@@ -354,6 +524,12 @@ def main():
         default="",
         help="Pre-built speculative decoding engine dir (EAGLE or MTP)",
     )
+    parser.add_argument(
+        "--enable-profiling",
+        action="store_true",
+        default=False,
+        help="Enable runtime metrics such as prefill cache reuse counters",
+    )
     parser.add_argument("--draft-top-k",
                         type=int,
                         default=10,
@@ -372,15 +548,22 @@ def main():
 
     llm = LLM(
         model=args.model,
+        onnx_dir=args.onnx_dir,
+        visual_onnx_dir=args.visual_onnx_dir,
+        engine_dir=args.engine_dir,
+        visual_engine_dir=args.visual_engine_dir,
         max_input_len=args.max_input_len,
         max_batch_size=args.max_batch_size,
         max_kv_cache_capacity=args.max_kv_cache_capacity,
         use_trt_native_ops=args.use_trt_native_ops,
         eagle_engine_dir=args.spec_decode_engine_dir,
+        model_id=args.served_model_name,
         draft_top_k=args.draft_top_k,
         draft_step=args.draft_step,
         verify_tree_size=args.verify_tree_size,
     )
+    if args.enable_profiling:
+        llm.set_profiling_enabled(True)
     llm.serve(host=args.host, port=args.port)
 
 
