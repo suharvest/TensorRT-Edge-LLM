@@ -1,0 +1,20 @@
+{
+  "input_file": "/tmp/tts_min_stateful_en/input.json",
+  "responses": [
+    {
+      "audio_duration_ms": 3760,
+      "audio_file": "/tmp/tts_min_stateful_en/audio_req0.wav",
+      "audio_sample_rate": 24000,
+      "audio_samples": 90240,
+      "messages": [
+        {
+          "content": "Hello, today is a really nice day.",
+          "role": "user"
+        }
+      ],
+      "output_text": "",
+      "request_idx": 0,
+      "rvq_file": "/tmp/tts_min_stateful_en/rvq_req0.safetensors"
+    }
+  ]
+}
