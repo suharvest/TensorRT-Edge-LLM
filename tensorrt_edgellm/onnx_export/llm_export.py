@@ -47,10 +47,12 @@ from typing import Any, Dict, Optional
 import torch
 import torch.nn as nn
 
-from ..quantization.quantization_utils import \
-    enable_huggingface_checkpointing_patch
-
-enable_huggingface_checkpointing_patch()
+try:
+    from ..quantization.quantization_utils import \
+        enable_huggingface_checkpointing_patch
+    enable_huggingface_checkpointing_patch()
+except ImportError:
+    pass
 
 from ..chat_templates import (get_template_path, process_chat_template,
                               validate_chat_template)
