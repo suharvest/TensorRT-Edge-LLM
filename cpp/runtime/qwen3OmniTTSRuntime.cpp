@@ -1097,12 +1097,13 @@ public:
 
         int32_t const profiles = mEngine->getNbOptimizationProfiles();
         mHasDualProfiles = profiles >= 2;
+        mMaxInputSeqLen = 1;
         if (mHasDualProfiles)
         {
             auto maxShape = mEngine->getProfileShape(mEmbedsName.c_str(), 0, nvinfer1::OptProfileSelector::kMAX);
             if (maxShape.nbDims >= 3 && maxShape.d[1] > 0)
             {
-                mMaxSeqLen = std::min(mMaxSeqLen, static_cast<int32_t>(maxShape.d[1]));
+                mMaxInputSeqLen = static_cast<int32_t>(maxShape.d[1]);
             }
             mPrefillContext.reset(mEngine->createExecutionContext());
             mDecodeContext.reset(mEngine->createExecutionContext());
@@ -1116,8 +1117,14 @@ public:
             auto maxShape = mEngine->getProfileShape(mEmbedsName.c_str(), 0, nvinfer1::OptProfileSelector::kMAX);
             if (maxShape.nbDims >= 3 && maxShape.d[1] > 0)
             {
-                mMaxSeqLen = std::min(mMaxSeqLen, static_cast<int32_t>(maxShape.d[1]));
+                mMaxInputSeqLen = static_cast<int32_t>(maxShape.d[1]);
             }
+        }
+        int32_t const decodeProfile = mHasDualProfiles ? 1 : 0;
+        auto kvMaxShape = mEngine->getProfileShape("past_key_0", decodeProfile, nvinfer1::OptProfileSelector::kMAX);
+        if (kvMaxShape.nbDims >= 4 && kvMaxShape.d[2] > 0)
+        {
+            mMaxSeqLen = std::min(mMaxSeqLen, static_cast<int32_t>(kvMaxShape.d[2]));
         }
 
         for (int32_t i = 0; i < mConfig.numDecoderLayers; ++i)
@@ -1129,7 +1136,8 @@ public:
         }
 
         allocateBuffers();
-        LOG_INFO("Qwen3-TTS explicit-KV Talker enabled: %s, maxSeq=%d", enginePath.string().c_str(), mMaxSeqLen);
+        LOG_INFO("Qwen3-TTS explicit-KV Talker enabled: %s, maxInputSeq=%d, maxKVSeq=%d", enginePath.string().c_str(),
+            mMaxInputSeqLen, mMaxSeqLen);
     }
 
     int32_t maxSeqLen() const
@@ -1148,6 +1156,31 @@ public:
         if (seqLen <= 0 || seqLen > mMaxSeqLen)
         {
             LOG_ERROR("Qwen3-TTS direct Talker prefill seqLen out of range: %d (max %d)", seqLen, mMaxSeqLen);
+            return false;
+        }
+        if (seqLen > mMaxInputSeqLen && mMaxInputSeqLen == 1)
+        {
+            std::vector<float> token(inputEmbeds.begin(), inputEmbeds.begin() + mConfig.hiddenSize);
+            if (!prefill(token, 1, outputLogits, outputHiddenStates))
+            {
+                return false;
+            }
+            for (int32_t i = 1; i < seqLen; ++i)
+            {
+                std::copy(inputEmbeds.begin() + static_cast<std::ptrdiff_t>(i) * mConfig.hiddenSize,
+                    inputEmbeds.begin() + static_cast<std::ptrdiff_t>(i + 1) * mConfig.hiddenSize, token.begin());
+                if (!decode(token, outputLogits, outputHiddenStates))
+                {
+                    LOG_ERROR("Qwen3-TTS direct Talker iterative prefill failed at token %d", i);
+                    return false;
+                }
+            }
+            return true;
+        }
+        if (seqLen > mMaxInputSeqLen)
+        {
+            LOG_ERROR(
+                "Qwen3-TTS direct Talker prefill input seqLen out of range: %d (max input %d)", seqLen, mMaxInputSeqLen);
             return false;
         }
         resetProfiles();
@@ -1386,6 +1419,7 @@ private:
 
     LLMEngineRunnerConfig mConfig;
     int32_t mMaxSeqLen{};
+    int32_t mMaxInputSeqLen{};
     int32_t mSeqLen{0};
     int32_t mParity{0};
     cudaStream_t mStream{};
@@ -2209,10 +2243,8 @@ bool Qwen3OmniTTSRuntime::projectToTalkerInput(
     // Fused kernel: build complete non-streaming prefill buffer
     check::check(output.reshape({outputSeqLen, hiddenSize}), "Tensor reshape failed");
     kernel::invokeAssistantPreamble(mProjectedBuffer, mTtsPadEmbed, mTtsBosEmbed, mTtsEosEmbed, mTalkerEmbeddingTable,
-        mTalkerConfig.codecThinkId, mTalkerConfig.codecThinkBosId,
-        langId, mTalkerConfig.codecThinkEosId,
-        mTalkerConfig.codecPadId, mTalkerConfig.codecBosId,
-        output, stream);
+        mTalkerConfig.codecThinkId, mTalkerConfig.codecThinkBosId, mTalkerConfig.codecThinkEosId, langId,
+        mTalkerConfig.codecPadId, mTalkerConfig.codecBosId, static_cast<int32_t>(N), output, stream);
 
     return true;
 }
@@ -3188,11 +3220,8 @@ bool Qwen3OmniTTSRuntime::computeResidualConnection(
         addend = mTtsPadEmbed.dataPointer<__half>();
     }
 
-    int32_t const activeGroups = mQwen3TTSCodePredictorEngine
-        ? getQwen3TTSActiveCodePredictorGroups()
-        : talker_constants::kNumRvqLayers;
     kernel::invokeResidualConnection(mCodecHiddensBuffer, mTalkerEmbeddingTable, mCodePredictorEmbeddingTables[14],
-        codes[0], codes[15], activeGroups, addend, outputResidual, stream);
+        codes[0], codes[15], addend, outputResidual, stream);
 
     return true;
 }

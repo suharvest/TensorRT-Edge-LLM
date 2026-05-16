@@ -425,14 +425,16 @@ int main(int argc, char** argv)
         if (requestStatus && code2wavRunner && !talkerResp.rvqCodes.empty())
         {
             // Transpose [frames][layers] → [layers][frames]
-            size_t const numFrames = talkerResp.rvqCodes.size();
+            size_t const kCode2WavMinFrames = 50;
+            size_t const numFrames = std::max(talkerResp.rvqCodes.size(), kCode2WavMinFrames);
             size_t const numLayers = talkerResp.rvqCodes[0].size();
             std::vector<std::vector<int32_t>> transposed(numLayers, std::vector<int32_t>(numFrames));
             for (size_t f = 0; f < numFrames; ++f)
             {
+                auto const& frame = talkerResp.rvqCodes[std::min(f, talkerResp.rvqCodes.size() - 1)];
                 for (size_t l = 0; l < numLayers; ++l)
                 {
-                    transposed[l][f] = talkerResp.rvqCodes[f][l];
+                    transposed[l][f] = frame[l];
                 }
             }
 

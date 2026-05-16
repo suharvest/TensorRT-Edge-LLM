@@ -243,6 +243,9 @@ public:
         rt::Tensor const& baseTreeDecodingMask, rt::Tensor& outputLogits, rt::Tensor& outputHiddenStates,
         std::string const& loraWeightsName, cudaStream_t stream);
 
+    //! @brief Get the dtype of an arbitrary engine tensor by name.
+    nvinfer1::DataType getTensorDataType(std::string const& name) const;
+
     //! Key to uniquely identify a captured CUDA graph for the decoding step
     using DecodingGraphKey = std::tuple<int64_t, uintptr_t, uintptr_t, std::string>;
 
