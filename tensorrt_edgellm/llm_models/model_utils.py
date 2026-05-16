@@ -30,8 +30,15 @@ from typing import List, Optional, Tuple, Union
 
 import torch
 import torch.nn as nn
-from modelopt.torch.quantization.utils import is_quantized_linear
 from safetensors.torch import safe_open
+
+def _is_quantized_linear(module):
+    """Check if the module is a quantized linear layer (ModelOpt)."""
+    try:
+        from modelopt.torch.quantization.utils import is_quantized_linear
+        return is_quantized_linear(module)
+    except ImportError:
+        return False
 from transformers import (AutoConfig, AutoModelForCausalLM,
                           AutoModelForImageTextToText, AutoProcessor,
                           AutoTokenizer, PretrainedConfig, PreTrainedModel,
@@ -45,7 +52,7 @@ def is_nvfp4_linear(module: nn.Module) -> bool:
     """Check if the module is a quantized linear layer with NVFP4 quantization. The test is designed for identification purpose only, not designed to be comprehensive.
     Adapted from TensorRT Model Optimizer: https://github.com/NVIDIA/TensorRT-Model-Optimizer/blob/main/modelopt/torch/_deploy/utils/torch_onnx.py
     """
-    if is_quantized_linear(module):
+    if _is_quantized_linear(module):
         return module.input_quantizer.block_sizes is not None and module.input_quantizer.block_sizes.get(
             "scale_bits", None) == (4, 3)
     return False
