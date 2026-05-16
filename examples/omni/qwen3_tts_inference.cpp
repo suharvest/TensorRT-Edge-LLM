@@ -24,6 +24,7 @@
 #include "common/trtUtils.h"
 #include "memoryMonitor.h"
 #include "multimodal/code2WavRunner.h"
+#include "multimodal/statefulCode2WavRunner.h"
 #include "profileFormatter.h"
 #include "profiling/metrics.h"
 #include "profiling/nvtx_wrapper.h"
@@ -339,6 +340,7 @@ int main(int argc, char** argv)
 
     // Initialize Code2Wav Runner
     std::unique_ptr<Code2WavRunner> code2wavRunner;
+    std::unique_ptr<StatefulCode2WavRunner> statefulCode2wavRunner;
     std::filesystem::path const code2wavDir = args.code2wavEngineDir.empty()
         ? std::filesystem::path(args.talkerEngineDir).parent_path() / "code2wav"
         : std::filesystem::path(args.code2wavEngineDir);
@@ -348,7 +350,14 @@ int main(int argc, char** argv)
         LOG_INFO("Initializing Code2Wav Runner from %s...", code2wavDir.string().c_str());
         try
         {
-            code2wavRunner = std::make_unique<Code2WavRunner>(code2wavDir.string(), stream);
+            if (std::filesystem::exists(code2wavDir / "code2wav_stateful.engine"))
+            {
+                statefulCode2wavRunner = std::make_unique<StatefulCode2WavRunner>(code2wavDir.string(), stream);
+            }
+            else
+            {
+                code2wavRunner = std::make_unique<Code2WavRunner>(code2wavDir.string(), stream);
+            }
             LOG_INFO("Code2Wav Runner initialized");
         }
         catch (std::exception const& e)
@@ -422,25 +431,32 @@ int main(int argc, char** argv)
         // Run Code2Wav
         rt::audioUtils::AudioData audioOutput;
         bool hasAudio = false;
-        if (requestStatus && code2wavRunner && !talkerResp.rvqCodes.empty())
+        if (requestStatus && (code2wavRunner || statefulCode2wavRunner) && !talkerResp.rvqCodes.empty())
         {
-            // Transpose [frames][layers] → [layers][frames]
-            size_t const kCode2WavMinFrames = 50;
-            size_t const numFrames = std::max(talkerResp.rvqCodes.size(), kCode2WavMinFrames);
+            // Transpose [frames][layers] to [layers][frames].
+            size_t const numFrames = talkerResp.rvqCodes.size();
             size_t const numLayers = talkerResp.rvqCodes[0].size();
             std::vector<std::vector<int32_t>> transposed(numLayers, std::vector<int32_t>(numFrames));
             for (size_t f = 0; f < numFrames; ++f)
             {
-                auto const& frame = talkerResp.rvqCodes[std::min(f, talkerResp.rvqCodes.size() - 1)];
+                auto const& frame = talkerResp.rvqCodes[f];
                 for (size_t l = 0; l < numLayers; ++l)
                 {
                     transposed[l][f] = frame[l];
                 }
             }
 
-            if (code2wavRunner->generateWaveform(transposed, audioOutput, stream))
+            if (statefulCode2wavRunner)
             {
-                hasAudio = true;
+                hasAudio = statefulCode2wavRunner->generateWaveform(transposed, audioOutput, stream);
+            }
+            else
+            {
+                hasAudio = code2wavRunner->generateWaveform(transposed, audioOutput, stream);
+            }
+
+            if (hasAudio)
+            {
                 if (!args.outputAudioDir.empty())
                 {
                     std::string filename = format::fmtstr("audio_req%zu.wav", requestIdx);
