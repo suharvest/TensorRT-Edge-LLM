@@ -68,12 +68,95 @@ python -m experimental.server \
   --port 8000
 ```
 
+Load an existing engine without export or build:
+
+```bash
+python -m experimental.server \
+  --engine-dir /path/to/llm_engine \
+  --served-model-name Qwen/Qwen3-4B-AWQ \
+  --port 8000
+```
+
 Query:
 
 ```bash
 curl -sN http://localhost:8000/v1/chat/completions \
   -H "Content-Type: application/json" \
   -d '{"messages": [{"role": "user", "content": "Hello!"}], "max_tokens": 128}'
+```
+
+Save and reuse system-prompt KV cache:
+
+```bash
+curl -sN http://localhost:8000/v1/chat/completions \
+  -H "Content-Type: application/json" \
+  -d '{
+    "messages": [
+      {"role": "system", "content": "You are a concise assistant."},
+      {"role": "user", "content": "Hello!"}
+    ],
+    "max_tokens": 128,
+    "save_system_prompt_kv_cache": true,
+    "return_cache_metrics": true
+  }'
+```
+
+Warm a formatted system prompt without generating a chat completion:
+
+```bash
+curl -sN http://localhost:8000/v1/cache/system_prompt \
+  -H "Content-Type: application/json" \
+  -d '{"formatted_system_prompt":"<|im_start|>system\nYou are a concise assistant.<|im_end|>\n"}'
+```
+
+The same endpoint can format a raw system prompt using the engine directory's
+`processed_chat_template.json`:
+
+```bash
+curl -sN http://localhost:8000/v1/cache/system_prompt \
+  -H "Content-Type: application/json" \
+  -d '{"system_prompt":"You are a concise assistant."}'
+```
+
+Save and reuse an arbitrary text prefix, such as a multi-turn conversation
+history. With `save_prefix_cache`, the server caches all messages except the
+last message as the reusable prefix. Later requests with the same prefix can
+use `prefix_cache`:
+
+```bash
+curl -sN http://localhost:8000/v1/chat/completions \
+  -H "Content-Type: application/json" \
+  -d '{
+    "messages": [
+      {"role": "system", "content": "You are a concise assistant."},
+      {"role": "user", "content": "What is TensorRT Edge-LLM?"},
+      {"role": "assistant", "content": "It is a TensorRT accelerated edge LLM runtime."},
+      {"role": "user", "content": "How does it reduce latency?"}
+    ],
+    "max_tokens": 128,
+    "save_prefix_cache": true,
+    "return_cache_metrics": true
+  }'
+
+curl -sN http://localhost:8000/v1/chat/completions \
+  -H "Content-Type: application/json" \
+  -d '{
+    "messages": [
+      {"role": "system", "content": "You are a concise assistant."},
+      {"role": "user", "content": "What is TensorRT Edge-LLM?"},
+      {"role": "assistant", "content": "It is a TensorRT accelerated edge LLM runtime."},
+      {"role": "user", "content": "What should I monitor first?"}
+    ],
+    "max_tokens": 128,
+    "prefix_cache": true,
+    "return_cache_metrics": true
+  }'
+```
+
+Inspect accumulated prefill cache counters:
+
+```bash
+curl -sN http://localhost:8000/metrics
 ```
 
 Streaming query:
@@ -132,9 +215,15 @@ outputs = llm.generate(
 | `GET` | `/health` | Health check |
 | `GET` | `/v1/models` | List models |
 | `POST` | `/v1/chat/completions` | Chat completions with optional SSE streaming |
+| `POST` | `/v1/cache/system_prompt` | Warm formatted system-prompt KV cache |
+| `GET` | `/metrics` | Runtime metrics, including prefill cache counters |
 
 ## Notes
 
 - Chat templates are applied in the C++ runtime, not in Python.
 - Thinking output is returned in `reasoning`; final answer text is returned in `content`.
 - Supported finish reasons are `stop`, `length`, `cancelled`, and `error`.
+- System-prompt KV cache is an in-memory runtime cache. It accelerates repeated
+  prefixes for the lifetime of the server process; it is not persistent across
+  server restarts.
+- Prefix-cache mode currently supports text-only OpenAI-style messages.

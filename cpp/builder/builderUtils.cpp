@@ -266,6 +266,22 @@ std::unique_ptr<nvinfer1::IBuilderConfig> createBuilderConfig(nvinfer1::IBuilder
     config->setFlag(nvinfer1::BuilderFlag::kMONITOR_MEMORY);
 #endif
 
+    // Limit workspace memory pool to avoid OOM on memory-constrained devices
+    // (e.g. Jetson Orin NX with 15 GB unified memory).  TRT tactic profiling
+    // otherwise requests 2-3.5 GB of workspace, which + weight memory > total.
+    config->setMemoryPoolLimit(nvinfer1::MemoryPoolType::kWORKSPACE, 4ULL << 30);  // 4 GiB
+
+    // Stream weights instead of loading all into GPU memory at once (TRT 10+).
+    // On unified-memory Jetson this avoids pinning the full ONNX weight buffer.
+    config->setFlag(nvinfer1::BuilderFlag::kWEIGHT_STREAMING);
+
+    // Limit tactics to cuBLAS / cuBLAS-LT to reduce profiling memory pressure.
+    // Full tactic set includes cuDNN / edge-mask convolution tactics that
+    // require 2+ GiB of scratch space, which is infeasible on 15 GB Orin NX.
+    auto tacticSources = 1U << static_cast<int>(nvinfer1::TacticSource::kCUBLAS)
+                       | 1U << static_cast<int>(nvinfer1::TacticSource::kCUBLAS_LT);
+    config->setTacticSources(tacticSources);
+
     return config;
 }
 
