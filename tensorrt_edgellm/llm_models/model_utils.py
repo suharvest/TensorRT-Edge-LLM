@@ -716,8 +716,10 @@ def load_hf_model(
         raise ValueError(f"Unsupported dtype: {dtype}")
     device = torch.device(device)
 
-    # Alpamayo loads tokenizer internally; AutoTokenizer.from_pretrained does not work for alpamayo_r1.
-    if not _is_alpamayo_1_model(model_dir):
+    # Alpamayo and Qwen3-TTS load tokenizer internally (custom tokenizers not
+    # registered in transformers AutoTokenizer mapping).
+    tokenizer = None
+    if not _is_alpamayo_1_model(model_dir) and not _is_qwen3_tts_model(model_dir):
         tokenizer = AutoTokenizer.from_pretrained(model_dir,
                                                   trust_remote_code=True)
 
@@ -853,10 +855,11 @@ def load_hf_model(
             f"skipped {skipped_quantized_modules} GPTQ quantized modules.")
 
     # Set tokenizer padding token if needed
-    if tokenizer.pad_token != "<unk>":
-        tokenizer.pad_token = tokenizer.eos_token
-    if tokenizer.pad_token is None:
-        tokenizer.pad_token = tokenizer.eos_token
+    if tokenizer is not None:
+        if tokenizer.pad_token != "<unk>":
+            tokenizer.pad_token = tokenizer.eos_token
+        if tokenizer.pad_token is None:
+            tokenizer.pad_token = tokenizer.eos_token
 
     # Try to load processor if available
     processor = None
