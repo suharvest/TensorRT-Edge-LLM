@@ -252,6 +252,8 @@ def _create_app(llm_instance):
                     params,
                     response_id,
                     enable_thinking,
+                    before_metrics,
+                    return_cache_metrics,
                 ),
                 media_type="text/event-stream",
                 headers={
@@ -296,15 +298,9 @@ def _create_app(llm_instance):
                 "completion_tokens": completion_tokens,
             },
         }
-        if before_metrics is not None and after_metrics is not None:
-            result["cache_metrics"] = {
-                "prefill": {
-                    "reused_tokens": after_metrics["reused_tokens"]
-                    - before_metrics["reused_tokens"],
-                    "computed_tokens": after_metrics["computed_tokens"]
-                    - before_metrics["computed_tokens"],
-                }
-            }
+        cache_metrics = _cache_metrics_delta(before_metrics, after_metrics)
+        if cache_metrics is not None:
+            result["cache_metrics"] = cache_metrics
         return result
 
     return app
@@ -401,8 +397,22 @@ class _ThinkingStateMachine:
             self._buf = ""
 
 
+def _cache_metrics_delta(before_metrics, after_metrics):
+    if before_metrics is None or after_metrics is None:
+        return None
+    return {
+        "prefill": {
+            "reused_tokens": after_metrics["reused_tokens"]
+            - before_metrics["reused_tokens"],
+            "computed_tokens": after_metrics["computed_tokens"]
+            - before_metrics["computed_tokens"],
+        }
+    }
+
+
 def _generate_stream_sse(llm_instance, messages, params, response_id,
-                         enable_thinking):
+                         enable_thinking, before_metrics=None,
+                         return_cache_metrics: bool = False):
     """Yield real SSE chunks via StreamChannel streaming."""
     yield _sse_chunk(response_id, {"role": "assistant"})
 
@@ -423,17 +433,29 @@ def _generate_stream_sse(llm_instance, messages, params, response_id,
     for field, text in sm.flush():
         yield _sse_chunk(response_id, {field: text})
 
-    yield _sse_chunk(response_id, {}, finish_reason=finish_reason or "stop")
+    after_metrics = (
+        llm_instance.get_prefill_metrics()
+        if return_cache_metrics else None)
+    cache_metrics = _cache_metrics_delta(before_metrics, after_metrics)
+    yield _sse_chunk(
+        response_id,
+        {},
+        finish_reason=finish_reason or "stop",
+        cache_metrics=cache_metrics,
+    )
     yield "data: [DONE]\n\n"
 
 
 def _sse_chunk(response_id: str,
                delta: dict,
-               finish_reason: Optional[str] = None):
+               finish_reason: Optional[str] = None,
+               cache_metrics: Optional[Dict[str, Any]] = None):
     choice: Dict[str, Any] = {"delta": delta, "index": 0}
     if finish_reason:
         choice["finish_reason"] = finish_reason
     payload = {"id": response_id, "choices": [choice]}
+    if cache_metrics is not None:
+        payload["cache_metrics"] = cache_metrics
     return f"data: {json.dumps(payload)}\n\n"
 
 
