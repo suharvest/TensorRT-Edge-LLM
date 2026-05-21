@@ -36,8 +36,11 @@ Usage (from LLM object)::
 """
 
 import argparse
+import asyncio
 import json
 import logging
+import queue as _queue
+import threading
 import uuid
 from typing import Any, Dict, Optional
 
@@ -62,7 +65,7 @@ def _split_reasoning_and_content(text: str):
 def _create_app(llm_instance):
     """Create a FastAPI app backed by the given LLM instance."""
     try:
-        from fastapi import FastAPI
+        from fastapi import FastAPI, Request
         from fastapi.responses import JSONResponse, StreamingResponse
     except ImportError as exc:
         raise RuntimeError("FastAPI is required for the server. "
@@ -152,7 +155,7 @@ def _create_app(llm_instance):
         }
 
     @app.post("/v1/chat/completions")
-    def chat_completions(body: Dict[str, Any]):
+    def chat_completions(body: Dict[str, Any], request: Request):
         messages = body.get("messages", [])
         if not messages:
             return JSONResponse(status_code=400,
@@ -186,21 +189,25 @@ def _create_app(llm_instance):
 
         image_buffers = _load_image_buffers(rt, messages)
 
-        request = rt.LLMGenerationRequest()
+        # NOTE: do NOT shadow the FastAPI ``request`` parameter (line 158).
+        # The disconnect watcher in _generate_stream_sse needs the original
+        # Starlette Request to poll is_disconnected(); rebinding the name
+        # here would silently break the watcher.
+        trt_request = rt.LLMGenerationRequest()
         req = rt.Request(messages=cpp_messages)
         req.image_buffers = image_buffers
-        request.requests = [req]
-        request.temperature = temperature
-        request.top_p = top_p
-        request.top_k = top_k
-        request.max_generate_length = max_tokens
-        request.apply_chat_template = True
-        request.add_generation_prompt = True
-        request.enable_thinking = enable_thinking
-        request.save_system_prompt_kv_cache = (
+        trt_request.requests = [req]
+        trt_request.temperature = temperature
+        trt_request.top_p = top_p
+        trt_request.top_k = top_k
+        trt_request.max_generate_length = max_tokens
+        trt_request.apply_chat_template = True
+        trt_request.add_generation_prompt = True
+        trt_request.enable_thinking = enable_thinking
+        trt_request.save_system_prompt_kv_cache = (
             save_system_prompt_kv_cache or save_prefix_cache)
-        request.lora_weights_name = lora_weights_name
-        request.disable_spec_decode = disable_spec_decode
+        trt_request.lora_weights_name = lora_weights_name
+        trt_request.disable_spec_decode = disable_spec_decode
 
         formatted_prefix = ""
         formatted_complete = ""
@@ -217,7 +224,7 @@ def _create_app(llm_instance):
                 formatted_request = rt.FormattedRequest()
                 formatted_request.formatted_system_prompt = formatted_prefix
                 formatted_request.formatted_complete_request = formatted_complete
-                request.formatted_requests = [formatted_request]
+                trt_request.formatted_requests = [formatted_request]
             except Exception as exc:
                 logger.exception("Prefix cache formatting failed")
                 return JSONResponse(status_code=400,
@@ -247,6 +254,7 @@ def _create_app(llm_instance):
 
             return StreamingResponse(
                 _generate_stream_sse(
+                    request,                # FastAPI Request for disconnect watcher
                     llm_instance,
                     messages,
                     params,
@@ -263,7 +271,7 @@ def _create_app(llm_instance):
             )
 
         try:
-            response = llm_instance._runtime.handle_request(request)
+            response = llm_instance._runtime.handle_request(trt_request)
         except Exception as exc:
             logger.exception("Inference failed")
             return JSONResponse(status_code=500, content={"error": str(exc)})
@@ -410,26 +418,152 @@ def _cache_metrics_delta(before_metrics, after_metrics):
     }
 
 
-def _generate_stream_sse(llm_instance, messages, params, response_id,
-                         enable_thinking, before_metrics=None,
-                         return_cache_metrics: bool = False):
-    """Yield real SSE chunks via StreamChannel streaming."""
+async def _generate_stream_sse(request, llm_instance, messages, params,
+                               response_id, enable_thinking,
+                               before_metrics=None,
+                               return_cache_metrics: bool = False):
+    """Yield real SSE chunks via StreamChannel streaming.
+
+    Runs the synchronous ``generate_stream`` iteration in a background
+    thread and forwards chunks via a thread-safe queue. A concurrent
+    asyncio task polls ``request.is_disconnected()``; when the HTTP
+    client drops the connection mid-stream (voice-agent barge-in is the
+    canonical trigger) the watcher sets a stop flag, the drain thread
+    breaks out of the ``for`` loop on the next chunk boundary and calls
+    ``gen.close()`` from inside the same thread — which raises
+    GeneratorExit at engine.py's ``yield`` and runs the ``finally``:
+    ``channel.cancel()`` propagates the cancel into the TRT runtime, the
+    C++ worker returns within hundreds of ms, and ``worker.join()``
+    completes. Without this, the worker keeps generating tokens on the
+    single engine context after every disconnect and the *next*
+    /v1/chat/completions request crashes the engine with::
+
+        [TensorRT] Error Code 1: Myelin (Called with an already loaded
+        binary graph.)
+    """
     yield _sse_chunk(response_id, {"role": "assistant"})
 
     sm = _ThinkingStateMachine(enable_thinking)
     finish_reason: Optional[str] = None
 
+    gen = llm_instance.generate_stream(messages, params)
+    # Unbounded queue: an LLM turn produces at most max_tokens chunks,
+    # each ~50 bytes — bounded in practice by the engine's max_seq_len,
+    # which is what the length-guard middleware already enforces. A
+    # bounded Queue would let drain block on put() after the consumer
+    # disconnects, and stop_flag would never be observed in time.
+    chunk_q: _queue.Queue = _queue.Queue()
+    stop_flag = threading.Event()
+    disconnected = False
+
+    def _drain():
+        try:
+            for delta in gen:
+                if stop_flag.is_set():
+                    break
+                chunk_q.put_nowait(("delta", delta))
+                if stop_flag.is_set():
+                    break
+        except Exception as exc:  # noqa: BLE001
+            try:
+                chunk_q.put_nowait(("error", exc))
+            except _queue.Full:  # pragma: no cover - unbounded queue
+                pass
+        finally:
+            # close() from the same thread as next() — safe (no
+            # "generator already executing" race) and guarantees
+            # engine.py's finally runs even on the natural exit path.
+            try:
+                gen.close()
+            except Exception:  # pragma: no cover - cleanup must not raise
+                pass
+            try:
+                chunk_q.put_nowait(("done", None))
+            except _queue.Full:  # pragma: no cover - unbounded queue
+                pass
+
+    drain_thread = threading.Thread(
+        target=_drain, daemon=True, name="sse-drain")
+    drain_thread.start()
+
+    loop = asyncio.get_running_loop()
+
+    async def _watch_disconnect():
+        nonlocal disconnected
+        # Poll every 100 ms — well below per-token latency, so the
+        # drain thread sees the stop flag within a single chunk
+        # boundary after the client drops. Cancel latency after
+        # ``stop_flag`` is set is bounded by ``StreamChannel.wait_pop``'s
+        # 200 ms timeout in engine.py:752, so total disconnect→TRT-cancel
+        # is at worst ~300 ms.
+        while not stop_flag.is_set():
+            try:
+                if await request.is_disconnected():
+                    disconnected = True
+                    stop_flag.set()
+                    logger.info(
+                        "client disconnected mid-stream; cancelling LLM "
+                        "generation (response_id=%s)", response_id)
+                    return
+            except asyncio.CancelledError:
+                # The outer task got cancelled (normal shutdown path
+                # when streaming finishes naturally) — let it propagate
+                # so the watcher stops cleanly.
+                raise
+            except (ConnectionResetError, OSError, RuntimeError):
+                # Network-layer errors during is_disconnected() probing
+                # are themselves a strong signal the peer is gone.
+                # Treat as disconnected rather than spinning.
+                disconnected = True
+                stop_flag.set()
+                logger.info(
+                    "client probe raised network error; treating as "
+                    "disconnected (response_id=%s)", response_id)
+                return
+            # Other exceptions (notably AttributeError from wrong-type
+            # ``request`` shadowing the FastAPI parameter — see the
+            # comment at chat_completions where trt_request is named to
+            # NOT collide with the FastAPI parameter) are programming
+            # errors we want surfaced, NOT swallowed.
+            await asyncio.sleep(0.1)
+
+    watcher = asyncio.create_task(_watch_disconnect())
+
     try:
-        for delta in llm_instance.generate_stream(messages, params):
+        while True:
+            try:
+                kind, val = await loop.run_in_executor(None, chunk_q.get)
+            except asyncio.CancelledError:
+                stop_flag.set()
+                raise
+            if kind == "done":
+                break
+            if kind == "error":
+                logger.error("Streaming inference failed: %r", val)
+                finish_reason = "error"
+                break
+            delta = val
             if delta.text:
                 for field, text in sm.feed(delta.text):
                     yield _sse_chunk(response_id, {field: text})
             if delta.finished:
                 finish_reason = delta.finish_reason or "stop"
-    except Exception:
-        logger.exception("Streaming inference failed")
-        finish_reason = "error"
+            if disconnected:
+                break
+    finally:
+        stop_flag.set()
+        watcher.cancel()
+        try:
+            await watcher
+        except (asyncio.CancelledError, Exception):  # noqa: BLE001
+            pass
 
+    if disconnected and finish_reason is None:
+        finish_reason = "cancelled"
+
+    # If the client disconnected, downstream send() will fail anyway —
+    # still yield the trailing frames so a graceful close (e.g. server
+    # shutdown) drains the SSE protocol cleanly.
     for field, text in sm.flush():
         yield _sse_chunk(response_id, {field: text})
 
