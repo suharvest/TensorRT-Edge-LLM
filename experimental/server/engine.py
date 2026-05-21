@@ -764,7 +764,23 @@ class LLM:
                 if chunk.finished:
                     break
         finally:
-            worker.join(timeout=5.0)
+            # If the consumer closes us early (HTTP client disconnect,
+            # voice-agent barge-in) the generator's GeneratorExit lands
+            # here. Without an explicit channel.cancel() the C++ worker
+            # keeps tokenising on the TRT runtime — which (a) wastes GPU
+            # cycles and (b) holds the engine context, so the very next
+            # /v1/chat/completions request races the still-running
+            # worker and crashes with "Myelin: already loaded binary
+            # graph". Cancelling the channel signals the runtime to
+            # return ASAP; worker.join then completes quickly. The
+            # 30 s ceiling is just a safety net — under normal cancel
+            # propagation handle_request returns within hundreds of ms.
+            try:
+                if not channel.is_finished():
+                    channel.cancel()
+            except Exception:  # pragma: no cover - cancel must never raise
+                pass
+            worker.join(timeout=30.0)
 
         if error_holder[0] is not None:
             raise error_holder[0]
