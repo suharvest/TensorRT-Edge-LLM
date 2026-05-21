@@ -438,6 +438,35 @@ std::vector<float> synthesizeStatefulChunk(
     }
     return audioToFloatSamples(audioOutput);
 }
+
+// Serializes stdout writes so concurrent emitters (future Phase 3 scheduler)
+// cannot interleave JSON lines. Even at N=1 this is harmless and centralizes
+// the per-event envelope so Phase 1 protocol additions ("request_id") stay
+// consistent across every emit site.
+std::mutex coutMutex;
+
+// Phase 1 protocol helper (see docs/specs/tts-worker-concurrency.md §4.3).
+// Stamps every stdout event with both "request_id" and "id" fields holding
+// the same value, then writes one JSON line under coutMutex. The dual field
+// is intentional: "id" stays for back-compat with older Python clients that
+// may rely on it; "request_id" is the new demux key for the future scheduler.
+// For events emitted outside a request scope (currently only the "ready"
+// event), pass requestId="__worker__".
+void emitEvent(std::string const& requestId, std::string const& kind, Json payload)
+{
+    payload["event"] = kind;
+    payload["request_id"] = requestId;
+    // Preserve "id" as an alias. If the caller already set it (chunk/done
+    // build their JSON with "id" inline), keep that value; otherwise mirror
+    // request_id so every line carries both fields.
+    if (!payload.contains("id"))
+    {
+        payload["id"] = requestId;
+    }
+    std::string const line = payload.dump();
+    std::lock_guard<std::mutex> lock(coutMutex);
+    std::cout << line << std::endl;
+}
 } // namespace
 
 int main(int argc, char** argv)
@@ -550,7 +579,7 @@ int main(int argc, char** argv)
     double const initMs
         = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - initStart).count();
     logMemTag("worker_before_ready");
-    std::cout << Json{{"event", "ready"}, {"init_ms", initMs}}.dump() << std::endl;
+    emitEvent("__worker__", "ready", Json{{"init_ms", initMs}});
     logMemTag("worker_after_ready");
 
     std::string line;
@@ -563,10 +592,18 @@ int main(int argc, char** argv)
 
         Json response;
         auto const requestStart = std::chrono::steady_clock::now();
+        // Lifted above the try{} so the catch block can stamp the failing
+        // request's id onto the error event via emitEvent(). If JSON parse
+        // fails before we extract "id", fall back to "__worker__".
+        std::string id = "__worker__";
         try
         {
             Json item = Json::parse(line);
-            std::string const id = item.value("id", "");
+            id = item.value("id", "");
+            if (id.empty())
+            {
+                id = "__worker__";
+            }
             bool const streamOutput = item.value("stream", false);
             bool const streamOnly = item.value("stream_only", false);
             bool const asyncCode2Wav = item.value("async_code2wav", false);
@@ -624,7 +661,6 @@ int main(int argc, char** argv)
                                   std::vector<int16_t> const& pcm, double code2wavMs,
                                   std::chrono::steady_clock::time_point chunkEnd, int32_t sampleRate) {
                 Json chunk = Json{{"id", id},
-                    {"event", "chunk"},
                     {"ok", true},
                     {"chunk_index", outputChunkIndex},
                     {"chunk_format", chunkFormat},
@@ -651,7 +687,7 @@ int main(int argc, char** argv)
                     }
                     chunk["chunk_file"] = chunkPath.string();
                 }
-                std::cout << chunk.dump() << std::endl;
+                emitEvent(id, "chunk", std::move(chunk));
             };
 
             auto emitChunk = [&](bool isFinal) {
@@ -913,7 +949,6 @@ int main(int argc, char** argv)
                 double const audioSeconds = static_cast<double>(streamedSamples) / sampleRate;
                 double const totalMs = std::chrono::duration<double, std::milli>(doneAt - requestStart).count();
                 response = Json{{"id", id},
-                    {"event", "done"},
                     {"ok", true},
                     {"stream_only", true},
                     {"frames", talkerResponse.numFrames},
@@ -943,7 +978,7 @@ int main(int argc, char** argv)
                             : 0.0},
                     {"total_ms", totalMs},
                     {"rtf", audioSeconds > 0.0 ? totalMs / 1000.0 / audioSeconds : 0.0}};
-                std::cout << response.dump() << std::endl;
+                emitEvent(id, "done", std::move(response));
                 continue;
             }
 
@@ -971,7 +1006,6 @@ int main(int argc, char** argv)
             double const audioSeconds = static_cast<double>(samples) / audioOutput.sampleRate;
             double const totalMs = std::chrono::duration<double, std::milli>(wavEnd - requestStart).count();
             response = Json{{"id", id},
-                {"event", "done"},
                 {"ok", true},
                 {"output_file", outputFile},
                 {"frames", talkerResponse.numFrames},
@@ -985,9 +1019,11 @@ int main(int argc, char** argv)
         }
         catch (std::exception const& e)
         {
-            response = Json{{"event", "error"}, {"ok", false}, {"error", e.what()}};
+            response = Json{{"ok", false}, {"error", e.what()}};
+            emitEvent(id, "error", std::move(response));
+            continue;
         }
-        std::cout << response.dump() << std::endl;
+        emitEvent(id, "done", std::move(response));
     }
 
     asyncCode2wavRunner.reset();
