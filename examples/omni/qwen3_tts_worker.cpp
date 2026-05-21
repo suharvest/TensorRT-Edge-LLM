@@ -8,9 +8,11 @@
 #include "common/logger.h"
 #include "common/trtUtils.h"
 #include "multimodal/code2WavRunner.h"
+#include "multimodal/statefulCode2WavRunner.h"
 #include "runtime/llmRuntimeUtils.h"
 #include "runtime/qwen3OmniTTSRuntime.h"
 #include <algorithm>
+#include <array>
 #include <chrono>
 #include <cmath>
 #include <condition_variable>
@@ -316,6 +318,59 @@ bool savePcm16(std::string const& filepath, std::vector<int16_t> const& samples)
     return static_cast<bool>(file);
 }
 
+std::vector<uint8_t> base64Decode(std::string const& input)
+{
+    std::array<int8_t, 256> table{};
+    table.fill(-1);
+    for (int i = 0; i < 26; ++i)
+    {
+        table[static_cast<uint8_t>('A' + i)] = i;
+        table[static_cast<uint8_t>('a' + i)] = i + 26;
+    }
+    for (int i = 0; i < 10; ++i)
+    {
+        table[static_cast<uint8_t>('0' + i)] = i + 52;
+    }
+    table[static_cast<uint8_t>('+')] = 62;
+    table[static_cast<uint8_t>('/')] = 63;
+
+    std::vector<uint8_t> out;
+    out.reserve(input.size() * 3 / 4);
+    int val = 0;
+    int bits = -8;
+    for (unsigned char c : input)
+    {
+        if (c == '=')
+        {
+            break;
+        }
+        int8_t decoded = table[c];
+        if (decoded < 0)
+        {
+            continue;
+        }
+        val = (val << 6) + decoded;
+        bits += 6;
+        if (bits >= 0)
+        {
+            out.push_back(static_cast<uint8_t>((val >> bits) & 0xFF));
+            bits -= 8;
+        }
+    }
+    return out;
+}
+
+std::vector<float> float32VectorFromBytes(std::vector<uint8_t> const& bytes)
+{
+    if (bytes.size() % sizeof(float) != 0)
+    {
+        throw std::runtime_error("speaker_embedding_b64 size is not a float32 vector");
+    }
+    std::vector<float> values(bytes.size() / sizeof(float));
+    std::memcpy(values.data(), bytes.data(), bytes.size());
+    return values;
+}
+
 Qwen3OmniTTSRuntime::TalkerGenerationRequest buildRequest(Json const& item)
 {
     Qwen3OmniTTSRuntime::TalkerGenerationRequest req;
@@ -330,6 +385,15 @@ Qwen3OmniTTSRuntime::TalkerGenerationRequest buildRequest(Json const& item)
     req.predictorTopP = item.value("predictor_top_p", 0.0f);
     req.language = item.value("language", "");
     req.speakerName = item.value("speaker", "");
+    req.speakerId = item.value("speaker_id", -1);
+    if (item.contains("speaker_embedding_b64") && item["speaker_embedding_b64"].is_string())
+    {
+        req.speakerEmbedding = float32VectorFromBytes(base64Decode(item["speaker_embedding_b64"].get<std::string>()));
+    }
+    if (!req.speakerEmbedding.empty() && (req.speakerId >= 0 || !req.speakerName.empty()))
+    {
+        throw std::runtime_error("speaker_embedding_b64 cannot be combined with speaker or speaker_id");
+    }
 
     Message msg;
     msg.role = "user";
@@ -362,6 +426,47 @@ std::vector<float> synthesizeWindow(
     }
     return std::vector<float>(samples.begin() + skipSamples, samples.end());
 }
+
+std::vector<float> synthesizeStatefulChunk(
+    StatefulCode2WavRunner& code2wavRunner, std::vector<std::vector<int32_t>> const& chunkCodes, bool isFinal,
+    cudaStream_t stream)
+{
+    rt::audioUtils::AudioData audioOutput;
+    if (!code2wavRunner.generateChunk(chunkCodes, isFinal, audioOutput, stream))
+    {
+        throw std::runtime_error("Stateful Code2Wav chunk generation failed");
+    }
+    return audioToFloatSamples(audioOutput);
+}
+
+// Serializes stdout writes so concurrent emitters (future Phase 3 scheduler)
+// cannot interleave JSON lines. Even at N=1 this is harmless and centralizes
+// the per-event envelope so Phase 1 protocol additions ("request_id") stay
+// consistent across every emit site.
+std::mutex coutMutex;
+
+// Phase 1 protocol helper (see docs/specs/tts-worker-concurrency.md §4.3).
+// Stamps every stdout event with both "request_id" and "id" fields holding
+// the same value, then writes one JSON line under coutMutex. The dual field
+// is intentional: "id" stays for back-compat with older Python clients that
+// may rely on it; "request_id" is the new demux key for the future scheduler.
+// For events emitted outside a request scope (currently only the "ready"
+// event), pass requestId="__worker__".
+void emitEvent(std::string const& requestId, std::string const& kind, Json payload)
+{
+    payload["event"] = kind;
+    payload["request_id"] = requestId;
+    // Preserve "id" as an alias. If the caller already set it (chunk/done
+    // build their JSON with "id" inline), keep that value; otherwise mirror
+    // request_id so every line carries both fields.
+    if (!payload.contains("id"))
+    {
+        payload["id"] = requestId;
+    }
+    std::string const line = payload.dump();
+    std::lock_guard<std::mutex> lock(coutMutex);
+    std::cout << line << std::endl;
+}
 } // namespace
 
 int main(int argc, char** argv)
@@ -385,9 +490,14 @@ int main(int argc, char** argv)
 
     std::unique_ptr<Qwen3OmniTTSRuntime> ttsRuntime;
     std::unique_ptr<Code2WavRunner> code2wavRunner;
+    std::unique_ptr<StatefulCode2WavRunner> statefulCode2wavRunner;
     cudaStream_t asyncCode2WavStream{};
     std::unique_ptr<Code2WavRunner> asyncCode2wavRunner;
     bool const lazyCode2Wav = envIsOne("EDGE_LLM_TTS_LAZY_CODE2WAV");
+    bool const statefulCode2Wav = envIsOne("EDGE_LLM_TTS_STATEFUL_CODE2WAV");
+    std::string const statefulCode2WavEngineDir = std::getenv("EDGE_LLM_TTS_STATEFUL_CODE2WAV_ENGINE_DIR") != nullptr
+        ? std::string(std::getenv("EDGE_LLM_TTS_STATEFUL_CODE2WAV_ENGINE_DIR"))
+        : args.code2wavEngineDir;
     int32_t const code2WavContextFrameCap = envIntOr("EDGE_LLM_TTS_CODE2WAV_CONTEXT_FRAMES", -1);
     auto getAsyncCode2WavRunner = [&]() -> Code2WavRunner& {
         if (!asyncCode2wavRunner)
@@ -423,7 +533,13 @@ int main(int argc, char** argv)
         ttsRuntime = std::make_unique<Qwen3OmniTTSRuntime>(
             args.talkerEngineDir, args.codePredictorEngineDir, args.tokenizerDir, stream, runtimeOptions);
         logMemTag("worker_after_tts_runtime");
-        if (lazyCode2Wav)
+        if (statefulCode2Wav)
+        {
+            logMemTag("worker_before_stateful_code2wav");
+            statefulCode2wavRunner = std::make_unique<StatefulCode2WavRunner>(statefulCode2WavEngineDir, stream);
+            logMemTag("worker_after_stateful_code2wav");
+        }
+        else if (lazyCode2Wav)
         {
             logMemTag("worker_skip_code2wav_lazy");
         }
@@ -463,7 +579,7 @@ int main(int argc, char** argv)
     double const initMs
         = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - initStart).count();
     logMemTag("worker_before_ready");
-    std::cout << Json{{"event", "ready"}, {"init_ms", initMs}}.dump() << std::endl;
+    emitEvent("__worker__", "ready", Json{{"init_ms", initMs}});
     logMemTag("worker_after_ready");
 
     std::string line;
@@ -476,10 +592,18 @@ int main(int argc, char** argv)
 
         Json response;
         auto const requestStart = std::chrono::steady_clock::now();
+        // Lifted above the try{} so the catch block can stamp the failing
+        // request's id onto the error event via emitEvent(). If JSON parse
+        // fails before we extract "id", fall back to "__worker__".
+        std::string id = "__worker__";
         try
         {
             Json item = Json::parse(line);
-            std::string const id = item.value("id", "");
+            id = item.value("id", "");
+            if (id.empty())
+            {
+                id = "__worker__";
+            }
             bool const streamOutput = item.value("stream", false);
             bool const streamOnly = item.value("stream_only", false);
             bool const asyncCode2Wav = item.value("async_code2wav", false);
@@ -502,6 +626,14 @@ int main(int argc, char** argv)
             if (chunkTransport != "base64" && chunkTransport != "file")
             {
                 throw std::runtime_error("Unsupported chunk_transport: " + chunkTransport);
+            }
+            if (statefulCode2Wav && asyncCode2Wav)
+            {
+                throw std::runtime_error("Stateful Code2Wav does not support async_code2wav yet");
+            }
+            if (statefulCode2Wav && !streamOutput)
+            {
+                throw std::runtime_error("Stateful Code2Wav currently requires stream=true");
             }
 
             auto request = buildRequest(item);
@@ -529,7 +661,6 @@ int main(int argc, char** argv)
                                   std::vector<int16_t> const& pcm, double code2wavMs,
                                   std::chrono::steady_clock::time_point chunkEnd, int32_t sampleRate) {
                 Json chunk = Json{{"id", id},
-                    {"event", "chunk"},
                     {"ok", true},
                     {"chunk_index", outputChunkIndex},
                     {"chunk_format", chunkFormat},
@@ -556,13 +687,57 @@ int main(int argc, char** argv)
                     }
                     chunk["chunk_file"] = chunkPath.string();
                 }
-                std::cout << chunk.dump() << std::endl;
+                emitEvent(id, "chunk", std::move(chunk));
             };
 
             auto emitChunk = [&](bool isFinal) {
                 int32_t const totalFrames = static_cast<int32_t>(streamedFrames.size());
                 if (totalFrames <= lastEmittedFrames)
                 {
+                    return;
+                }
+
+                if (statefulCode2Wav)
+                {
+                    if (!statefulCode2wavRunner)
+                    {
+                        logMemTag("worker_before_stateful_code2wav");
+                        statefulCode2wavRunner
+                            = std::make_unique<StatefulCode2WavRunner>(statefulCode2WavEngineDir, stream);
+                        logMemTag("worker_after_stateful_code2wav");
+                    }
+                    auto const chunkCodes = transposeFrameWindow(
+                        streamedFrames, static_cast<size_t>(lastEmittedFrames), static_cast<size_t>(totalFrames));
+                    auto const chunkStart = std::chrono::steady_clock::now();
+                    logMemTag(isFinal ? "worker_before_stateful_code2wav_final_chunk"
+                                      : "worker_before_stateful_code2wav_chunk");
+                    auto samples = synthesizeStatefulChunk(*statefulCode2wavRunner, chunkCodes, isFinal, stream);
+                    auto const chunkEnd = std::chrono::steady_clock::now();
+                    logMemTag(isFinal ? "worker_after_stateful_code2wav_final_chunk"
+                                      : "worker_after_stateful_code2wav_chunk");
+                    if (samples.empty())
+                    {
+                        lastEmittedFrames = totalFrames;
+                        scheduleNextChunk();
+                        return;
+                    }
+                    if (chunkIndex == 0)
+                    {
+                        firstChunkAt = chunkEnd;
+                    }
+
+                    auto pcm = floatSamplesToPcm16(samples);
+                    streamedSamples += static_cast<int64_t>(pcm.size());
+                    double const code2wavMs = std::chrono::duration<double, std::milli>(chunkEnd - chunkStart).count();
+                    streamedCode2WavMs += code2wavMs;
+                    code2wavInputFrames += static_cast<int64_t>(chunkCodes.empty() ? 0 : chunkCodes[0].size());
+
+                    writeChunk(chunkIndex, isFinal, totalFrames, pcm, code2wavMs, chunkEnd,
+                        statefulCode2wavRunner->getConfig().sampleRate);
+
+                    lastEmittedFrames = totalFrames;
+                    scheduleNextChunk();
+                    ++chunkIndex;
                     return;
                 }
 
@@ -615,6 +790,10 @@ int main(int argc, char** argv)
             auto const genStart = std::chrono::steady_clock::now();
             bool ok = false;
             std::chrono::steady_clock::time_point genEnd{};
+            if (statefulCode2Wav && statefulCode2wavRunner)
+            {
+                statefulCode2wavRunner->reset(stream);
+            }
             if (streamOutput && asyncCode2Wav)
             {
                 Code2WavRunner& asyncRunner = getAsyncCode2WavRunner();
@@ -765,11 +944,11 @@ int main(int argc, char** argv)
             if (streamOnly)
             {
                 auto const doneAt = std::chrono::steady_clock::now();
-                int32_t const sampleRate = code2wavRunner->getConfig().sampleRate;
+                int32_t const sampleRate
+                    = statefulCode2Wav ? statefulCode2wavRunner->getConfig().sampleRate : code2wavRunner->getConfig().sampleRate;
                 double const audioSeconds = static_cast<double>(streamedSamples) / sampleRate;
                 double const totalMs = std::chrono::duration<double, std::milli>(doneAt - requestStart).count();
                 response = Json{{"id", id},
-                    {"event", "done"},
                     {"ok", true},
                     {"stream_only", true},
                     {"frames", talkerResponse.numFrames},
@@ -777,11 +956,15 @@ int main(int argc, char** argv)
                     {"sample_rate", sampleRate},
                     {"audio_s", audioSeconds},
                     {"async_code2wav", asyncCode2Wav},
+                    {"stateful_code2wav", statefulCode2Wav},
                     {"adaptive_chunks", adaptiveChunks},
                     {"chunk_frames", chunkFrames},
                     {"chunk_growth_frames", chunkGrowthFrames},
                     {"max_chunk_frames", maxChunkFrames},
                     {"chunk_count", chunkIndex},
+                    {"audio_complete", true},
+                    {"final_chunk_index", chunkIndex > 0 ? chunkIndex - 1 : -1},
+                    {"last_chunk_was_final", chunkIndex > 0 && lastEmittedFrames == talkerResponse.numFrames},
                     {"code2wav_input_frames", code2wavInputFrames},
                     {"code2wav_context_frames", code2wavContextFrames},
                     {"code2wav_context_ratio",
@@ -795,7 +978,7 @@ int main(int argc, char** argv)
                             : 0.0},
                     {"total_ms", totalMs},
                     {"rtf", audioSeconds > 0.0 ? totalMs / 1000.0 / audioSeconds : 0.0}};
-                std::cout << response.dump() << std::endl;
+                emitEvent(id, "done", std::move(response));
                 continue;
             }
 
@@ -823,7 +1006,6 @@ int main(int argc, char** argv)
             double const audioSeconds = static_cast<double>(samples) / audioOutput.sampleRate;
             double const totalMs = std::chrono::duration<double, std::milli>(wavEnd - requestStart).count();
             response = Json{{"id", id},
-                {"event", "done"},
                 {"ok", true},
                 {"output_file", outputFile},
                 {"frames", talkerResponse.numFrames},
@@ -837,9 +1019,11 @@ int main(int argc, char** argv)
         }
         catch (std::exception const& e)
         {
-            response = Json{{"event", "error"}, {"ok", false}, {"error", e.what()}};
+            response = Json{{"ok", false}, {"error", e.what()}};
+            emitEvent(id, "error", std::move(response));
+            continue;
         }
-        std::cout << response.dump() << std::endl;
+        emitEvent(id, "done", std::move(response));
     }
 
     asyncCode2wavRunner.reset();
