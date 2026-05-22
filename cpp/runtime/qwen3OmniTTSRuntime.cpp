@@ -36,6 +36,8 @@
 #include <cmath>
 #include <condition_variable>
 #include <cstdlib>
+#include <thread>
+#include <unordered_map>
 #include <cuda_runtime.h>
 #include <cstring>
 #include <filesystem>
@@ -1004,6 +1006,15 @@ public:
         // pooled slot when the caller didn't supply one, recurse, release.
         if (slot == nullptr)
         {
+            // [Phase B C6 finding #2] Prefer a request-scoped active slot if
+            // beginRequest() was called by the runtime — keeps prefill+decode
+            // on the SAME slot for the duration of this logical request.
+            auto* active = getActiveSlot();
+            if (active != nullptr)
+            {
+                return generate(hidden, primaryEmbedding, activeGroups, topK, topP, temperature, residualCodes,
+                    stream, prefillCtxOverride, decodeCtxOverride, active);
+            }
             auto* pooled = acquirePoolSlot();
             if (pooled == nullptr)
             {
@@ -1050,6 +1061,12 @@ public:
         // [Phase 3b-A] Activate the slot path at N=1 — see generate() above.
         if (slot == nullptr)
         {
+            auto* active = getActiveSlot();
+            if (active != nullptr)
+            {
+                return generateDeviceHidden(hiddenDevice, primaryEmbedding, activeGroups, topK, topP, temperature,
+                    residualCodes, stream, prefillCtxOverride, decodeCtxOverride, active);
+            }
             auto* pooled = acquirePoolSlot();
             if (pooled == nullptr)
             {
@@ -1946,6 +1963,47 @@ private:
         }
         mSlotPoolCv.notify_one();
     }
+
+    // [Phase B C6 finding #2] Thread-keyed active-slot table so that
+    // beginRequest()/endRequest() can hold a single slot across the
+    // full prefill+decode chain of one logical request. Previously
+    // prefill/decode each acquired+released a slot, allowing two
+    // concurrent requests to play musical chairs with KV state.
+    std::mutex mActiveSlotMu;
+    std::unordered_map<std::thread::id, Qwen3OmniTTSRuntime::CodePredictorSlot*> mActiveSlots;
+
+public:
+    void beginRequest()
+    {
+        auto* slot = acquirePoolSlot();
+        if (slot == nullptr) return;
+        auto tid = std::this_thread::get_id();
+        std::lock_guard<std::mutex> lk(mActiveSlotMu);
+        mActiveSlots[tid] = slot;
+    }
+
+    void endRequest()
+    {
+        auto tid = std::this_thread::get_id();
+        Qwen3OmniTTSRuntime::CodePredictorSlot* slot = nullptr;
+        {
+            std::lock_guard<std::mutex> lk(mActiveSlotMu);
+            auto it = mActiveSlots.find(tid);
+            if (it == mActiveSlots.end()) return;
+            slot = it->second;
+            mActiveSlots.erase(it);
+        }
+        releasePoolSlot(slot);
+    }
+
+private:
+    Qwen3OmniTTSRuntime::CodePredictorSlot* getActiveSlot()
+    {
+        auto tid = std::this_thread::get_id();
+        std::lock_guard<std::mutex> lk(mActiveSlotMu);
+        auto it = mActiveSlots.find(tid);
+        return (it != mActiveSlots.end()) ? it->second : nullptr;
+    }
 };
 
 class Qwen3OmniTTSRuntime::Qwen3TTSTalkerEngine
@@ -2289,6 +2347,12 @@ public:
         // caller explicitly overrides — matching Phase 3a Iter6 semantics.
         if (slot == nullptr)
         {
+            // [Phase B C6 finding #2] Use active slot if beginRequest() set one.
+            auto* active = getActiveSlot();
+            if (active != nullptr)
+            {
+                return prefill(inputEmbeds, seqLen, outputLogits, outputHiddenStates, stream, ctxOverride, active);
+            }
             auto* pooled = acquirePoolSlot();
             if (pooled == nullptr)
             {
@@ -2429,6 +2493,12 @@ public:
         // buffers — not the engine globals.
         if (slot == nullptr)
         {
+            auto* active = getActiveSlot();
+            if (active != nullptr)
+            {
+                return prefillWithPromptCache(
+                    inputEmbeds, seqLen, outputLogits, outputHiddenStates, stream, ctxOverride, active);
+            }
             auto* pooled = acquirePoolSlot();
             if (pooled == nullptr)
             {
@@ -2479,6 +2549,11 @@ public:
         // [Phase 3b-A] Activate the slot path at N=1 — see prefill().
         if (slot == nullptr)
         {
+            auto* active = getActiveSlot();
+            if (active != nullptr)
+            {
+                return decode(inputEmbed, outputLogits, outputHiddenStates, stream, ctxOverride, active);
+            }
             auto* pooled = acquirePoolSlot();
             if (pooled == nullptr)
             {
@@ -2990,6 +3065,44 @@ private:
             mFreeSlots.push_back(slot);
         }
         mSlotPoolCv.notify_one();
+    }
+
+    // [Phase B C6 finding #2] Thread-keyed active-slot table (see CP
+    // engine for rationale).
+    std::mutex mActiveSlotMu;
+    std::unordered_map<std::thread::id, Qwen3OmniTTSRuntime::TalkerSlot*> mActiveSlots;
+
+public:
+    void beginRequest()
+    {
+        auto* slot = acquirePoolSlot();
+        if (slot == nullptr) return;
+        auto tid = std::this_thread::get_id();
+        std::lock_guard<std::mutex> lk(mActiveSlotMu);
+        mActiveSlots[tid] = slot;
+    }
+
+    void endRequest()
+    {
+        auto tid = std::this_thread::get_id();
+        Qwen3OmniTTSRuntime::TalkerSlot* slot = nullptr;
+        {
+            std::lock_guard<std::mutex> lk(mActiveSlotMu);
+            auto it = mActiveSlots.find(tid);
+            if (it == mActiveSlots.end()) return;
+            slot = it->second;
+            mActiveSlots.erase(it);
+        }
+        releasePoolSlot(slot);
+    }
+
+private:
+    Qwen3OmniTTSRuntime::TalkerSlot* getActiveSlot()
+    {
+        auto tid = std::this_thread::get_id();
+        std::lock_guard<std::mutex> lk(mActiveSlotMu);
+        auto it = mActiveSlots.find(tid);
+        return (it != mActiveSlots.end()) ? it->second : nullptr;
     }
 };
 
@@ -4444,6 +4557,27 @@ bool Qwen3OmniTTSRuntime::handleAudioGeneration(TalkerGenerationRequest const& r
     response.rvqCodes.clear();
     response.numFrames = 0;
     response.success = false;
+
+    // [Phase B C6 finding #2] Acquire slot ONCE for the whole request so that
+    // prefill + every decode step share the same KV cache, prompt cache, and
+    // owned TRT execution contexts. RAII guard releases on any exit path.
+    struct EnginesRequestGuard {
+        Qwen3TTSTalkerEngine* talker;
+        Qwen3TTSCodePredictorEngine* cp;
+        ~EnginesRequestGuard() {
+            if (cp) cp->endRequest();
+            if (talker) talker->endRequest();
+        }
+    };
+    EnginesRequestGuard reqGuard{};
+    if (mQwen3TTSTalkerEngine) {
+        mQwen3TTSTalkerEngine->beginRequest();
+        reqGuard.talker = mQwen3TTSTalkerEngine.get();
+    }
+    if (mQwen3TTSCodePredictorEngine) {
+        mQwen3TTSCodePredictorEngine->beginRequest();
+        reqGuard.cp = mQwen3TTSCodePredictorEngine.get();
+    }
 
     // [Phase B C1] Per-request codec hiddens buffer for the residual connection.
     // Previously this was a runtime-global member (`mCodecHiddensBuffer`) which
