@@ -447,16 +447,85 @@ std::vector<float> synthesizeStatefulChunk(
 // ("request_id") stay consistent across every emit site.
 std::mutex coutMutex;
 
-// Phase 3b-B-2: Code2Wav singletons (Code2WavRunner / StatefulCode2WavRunner /
-// the lazy async Code2WavRunner) are still process-global. Per the concurrency
-// spec §4.1 they should eventually become per-slot like the LLM engine pool,
-// but that's Phase 3b-B-3's job. As a Phase 3b-B-2 simplification we serialize
-// ALL access to these runners (both lazy init and inference calls) behind a
-// single mutex. This means Code2Wav vocoding cannot overlap across in-flight
-// requests, but the talker + code-predictor LLM work CAN, which is where the
-// bulk of TTFA latency lives. At N=1 the mutex is uncontended and adds only a
-// few microseconds per acquire, well below MD5/perf gate sensitivity.
-std::mutex code2WavMutex;
+// Phase 3b-B-4 part-2: Code2Wav runners are now per-slot (mirroring the
+// engine SlotPool capacity). Each in-flight request acquires a Code2Wav
+// slot index from Code2WavSlotPool below and uses the matching per-slot
+// runner; runners no longer share a singleton or a mutex. With
+// OVS_TTS_WORKER_CONCURRENCY=N we instantiate N (Stateful)Code2WavRunner
+// objects, each with its own CUDA stream so kernels actually overlap on
+// the GPU instead of serializing on a shared stream. The old
+// the prior process-wide Code2Wav mutex (Phase 3b-B-2) has been removed — concurrency is bounded
+// by the slot pool itself and each slot's runner is touched by exactly
+// one worker thread at a time.
+//
+// Counted index pool: blocks acquire() until a free slot exists. Capacity
+// matches the dispatcher's readConcurrencyEnv() so there's always a slot
+// for any thread the dispatcher hands a request to (no extra waiting).
+class Code2WavSlotPool
+{
+public:
+    explicit Code2WavSlotPool(size_t capacity) : mCapacity(capacity)
+    {
+        mFree.reserve(capacity);
+        for (size_t i = 0; i < capacity; ++i)
+        {
+            mFree.push_back(static_cast<int>(capacity - 1 - i)); // pop from back -> 0,1,2...
+        }
+    }
+
+    size_t capacity() const
+    {
+        return mCapacity;
+    }
+
+    int acquire()
+    {
+        std::unique_lock<std::mutex> lk(mMu);
+        mCv.wait(lk, [&]() { return !mFree.empty(); });
+        int idx = mFree.back();
+        mFree.pop_back();
+        return idx;
+    }
+
+    void release(int idx)
+    {
+        {
+            std::lock_guard<std::mutex> lk(mMu);
+            mFree.push_back(idx);
+        }
+        mCv.notify_one();
+    }
+
+private:
+    size_t mCapacity;
+    std::vector<int> mFree;
+    std::mutex mMu;
+    std::condition_variable mCv;
+};
+
+// RAII handle so an exception inside handleRequest can't leak a slot.
+class Code2WavSlotGuard
+{
+public:
+    Code2WavSlotGuard(Code2WavSlotPool& pool, int idx) : mPool(pool), mIdx(idx) {}
+    ~Code2WavSlotGuard()
+    {
+        if (mIdx >= 0)
+        {
+            mPool.release(mIdx);
+        }
+    }
+    Code2WavSlotGuard(Code2WavSlotGuard const&) = delete;
+    Code2WavSlotGuard& operator=(Code2WavSlotGuard const&) = delete;
+    int index() const
+    {
+        return mIdx;
+    }
+
+private:
+    Code2WavSlotPool& mPool;
+    int mIdx;
+};
 
 // Phase 3b-B-2: worker-side concurrency env reader. Mirrors the engine-side
 // readTtsWorkerConcurrencyEnv() in cpp/runtime/qwen3OmniTTSRuntime.cpp (Phase
@@ -543,33 +612,73 @@ int main(int argc, char** argv)
     logMemTag("worker_after_cuda_stream");
 
     std::unique_ptr<Qwen3OmniTTSRuntime> ttsRuntime;
-    std::unique_ptr<Code2WavRunner> code2wavRunner;
-    std::unique_ptr<StatefulCode2WavRunner> statefulCode2wavRunner;
-    cudaStream_t asyncCode2WavStream{};
-    std::unique_ptr<Code2WavRunner> asyncCode2wavRunner;
+    // Phase 3b-B-4 part-2: per-slot Code2Wav runners. Vectors are sized to
+    // the dispatcher concurrency below; index 0 is constructed eagerly during
+    // init (preserving single-client behaviour and the original lazy-init
+    // log tags), and slots [1..N-1] are constructed lazily on first use by a
+    // higher slot index. Each per-slot runner owns its own CUDA stream so
+    // GPU kernels actually overlap instead of serializing on the shared
+    // main `stream` (which is reserved for the talker + code-predictor).
+    std::vector<std::unique_ptr<Code2WavRunner>> code2wavRunners;
+    std::vector<std::unique_ptr<StatefulCode2WavRunner>> statefulCode2wavRunners;
+    std::vector<std::unique_ptr<Code2WavRunner>> asyncCode2wavRunners;
+    std::vector<cudaStream_t> code2wavStreams;       // streams for sync runners (slot 0 reuses main `stream`)
+    std::vector<cudaStream_t> asyncCode2wavStreams;  // dedicated streams for the async branch
+    // Per-slot lazy-init guards (each slot constructed at most once). At
+    // capacity 1 these contend with nothing; at N>1 they only contend during
+    // a single one-shot init per slot, never on hot paths.
+    std::vector<std::mutex> code2wavSlotInitMu; // sized later
+    std::vector<std::mutex> statefulCode2wavSlotInitMu;
+    std::vector<std::mutex> asyncCode2wavSlotInitMu;
     bool const lazyCode2Wav = envIsOne("EDGE_LLM_TTS_LAZY_CODE2WAV");
     bool const statefulCode2Wav = envIsOne("EDGE_LLM_TTS_STATEFUL_CODE2WAV");
     std::string const statefulCode2WavEngineDir = std::getenv("EDGE_LLM_TTS_STATEFUL_CODE2WAV_ENGINE_DIR") != nullptr
         ? std::string(std::getenv("EDGE_LLM_TTS_STATEFUL_CODE2WAV_ENGINE_DIR"))
         : args.code2wavEngineDir;
     int32_t const code2WavContextFrameCap = envIntOr("EDGE_LLM_TTS_CODE2WAV_CONTEXT_FRAMES", -1);
-    auto getAsyncCode2WavRunner = [&]() -> Code2WavRunner& {
-        // Phase 3b-B-2: serialize lazy init of the async Code2Wav runner +
-        // its CUDA stream. Caller is still responsible for locking
-        // code2WavMutex around the actual generateWaveform() call on the
-        // returned reference (see the async branch in main loop).
-        std::lock_guard<std::mutex> c2wLock(code2WavMutex);
-        if (!asyncCode2wavRunner)
+    // Helper: lazy-init the async Code2Wav runner + its CUDA stream for slot
+    // `slot`. Each slot has its own mutex so concurrent first-uses of
+    // distinct slots don't serialize. Once initialized, the slot's runner is
+    // reused on every subsequent acquisition of that slot index.
+    auto getAsyncCode2WavRunner = [&](int slot) -> Code2WavRunner& {
+        std::lock_guard<std::mutex> lk(asyncCode2wavSlotInitMu[slot]);
+        if (!asyncCode2wavRunners[slot])
         {
             logMemTag("worker_before_async_code2wav_stream");
-            CUDA_CHECK(cudaStreamCreate(&asyncCode2WavStream));
+            CUDA_CHECK(cudaStreamCreate(&asyncCode2wavStreams[slot]));
             logMemTag("worker_after_async_code2wav_stream");
             logMemTag("worker_before_async_code2wav");
-            asyncCode2wavRunner = std::make_unique<Code2WavRunner>(args.code2wavEngineDir, asyncCode2WavStream);
+            asyncCode2wavRunners[slot]
+                = std::make_unique<Code2WavRunner>(args.code2wavEngineDir, asyncCode2wavStreams[slot]);
             logMemTag("worker_after_async_code2wav");
         }
-        return *asyncCode2wavRunner;
+        return *asyncCode2wavRunners[slot];
     };
+    // Phase 3b-B-4 part-2: read worker concurrency early so we can size the
+    // per-slot Code2Wav vectors before the init try{} runs. The same env
+    // (OVS_TTS_WORKER_CONCURRENCY) drives both this and the engine SlotPools
+    // so dispatcher capacity == per-engine slot count by construction.
+    size_t const concurrency = readConcurrencyEnv();
+    LOG_INFO("[Worker] startup capacity sync: dispatcher=%zu, talker/code-predictor SlotPool capacity reads "
+             "the same OVS_TTS_WORKER_CONCURRENCY env (see engine ctor logs above)",
+        concurrency);
+    code2wavRunners.resize(concurrency);
+    statefulCode2wavRunners.resize(concurrency);
+    asyncCode2wavRunners.resize(concurrency);
+    code2wavStreams.assign(concurrency, cudaStream_t{});
+    asyncCode2wavStreams.assign(concurrency, cudaStream_t{});
+    std::vector<std::mutex> tmpA(concurrency);
+    std::vector<std::mutex> tmpB(concurrency);
+    std::vector<std::mutex> tmpC(concurrency);
+    code2wavSlotInitMu.swap(tmpA);
+    statefulCode2wavSlotInitMu.swap(tmpB);
+    asyncCode2wavSlotInitMu.swap(tmpC);
+    Code2WavSlotPool code2wavSlotPool(concurrency);
+    // Slot 0 reuses the main `stream` to preserve byte-equivalent N=1 init
+    // ordering (same CUDA stream as Phase 3b-B-2). Slots >=1 get their own
+    // dedicated stream so kernels overlap on the GPU rather than serializing.
+    code2wavStreams[0] = stream;
+
     auto const initStart = std::chrono::steady_clock::now();
     try
     {
@@ -592,10 +701,14 @@ int main(int argc, char** argv)
         ttsRuntime = std::make_unique<Qwen3OmniTTSRuntime>(
             args.talkerEngineDir, args.codePredictorEngineDir, args.tokenizerDir, stream, runtimeOptions);
         logMemTag("worker_after_tts_runtime");
+        // Phase 3b-B-4 part-2: eager-init slot 0 only (matches the prior
+        // single-runner init). Slots >=1 init lazily on first acquisition by
+        // a concurrent request — keeps cold-start VRAM unchanged at N=1 and
+        // only pays the cost when concurrency actually picks up.
         if (statefulCode2Wav)
         {
             logMemTag("worker_before_stateful_code2wav");
-            statefulCode2wavRunner = std::make_unique<StatefulCode2WavRunner>(statefulCode2WavEngineDir, stream);
+            statefulCode2wavRunners[0] = std::make_unique<StatefulCode2WavRunner>(statefulCode2WavEngineDir, stream);
             logMemTag("worker_after_stateful_code2wav");
         }
         else if (lazyCode2Wav)
@@ -605,7 +718,7 @@ int main(int argc, char** argv)
         else
         {
             logMemTag("worker_before_code2wav");
-            code2wavRunner = std::make_unique<Code2WavRunner>(args.code2wavEngineDir, stream);
+            code2wavRunners[0] = std::make_unique<Code2WavRunner>(args.code2wavEngineDir, stream);
             logMemTag("worker_after_code2wav");
         }
         if (std::getenv("EDGE_LLM_TTS_CUDA_GRAPH") == nullptr
@@ -628,9 +741,19 @@ int main(int argc, char** argv)
         logMemTag("worker_init_error");
         std::cerr << e.what() << std::endl;
         CUDA_CHECK(cudaStreamDestroy(stream));
-        if (asyncCode2WavStream)
+        for (auto& s : asyncCode2wavStreams)
         {
-            CUDA_CHECK(cudaStreamDestroy(asyncCode2WavStream));
+            if (s)
+            {
+                CUDA_CHECK(cudaStreamDestroy(s));
+            }
+        }
+        for (size_t i = 1; i < code2wavStreams.size(); ++i)
+        {
+            if (code2wavStreams[i])
+            {
+                CUDA_CHECK(cudaStreamDestroy(code2wavStreams[i]));
+            }
         }
         return EXIT_FAILURE;
     }
@@ -641,20 +764,10 @@ int main(int argc, char** argv)
     emitEvent("__worker__", "ready", Json{{"init_ms", initMs}});
     logMemTag("worker_after_ready");
 
-    // Phase 3b-B-2: worker-level request dispatcher. The original loop ran
-    // requests inline on the stdin reader thread, serializing the whole
-    // talker -> code-predictor -> Code2Wav pipeline at N=1. Now each request
-    // is handed to a worker std::thread bounded by readConcurrencyEnv()
-    // (clamped [1,8], default 1). Code2Wav is still serialized internally
-    // via code2WavMutex; only the talker + code-predictor LLM stages and the
-    // JSON / chunk framing run truly concurrently. The SlotPools inside the
-    // engine runtime (Phase 3b-B-1) share the same env, so dispatcher
-    // capacity == per-engine slot count by construction.
-    size_t const concurrency = readConcurrencyEnv();
-    LOG_INFO("[Worker] startup capacity sync: dispatcher=%zu, talker/code-predictor SlotPool capacity reads "
-             "the same OVS_TTS_WORKER_CONCURRENCY env (see engine ctor logs above)",
-        concurrency);
-
+    // Phase 3b-B-4 part-2: worker-level request dispatcher. Each request is
+    // handed to a worker std::thread bounded by `concurrency` (read above).
+    // Code2Wav is now per-slot (Code2WavSlotPool + per-slot runners), so the
+    // talker + code-predictor + Code2Wav stages all overlap across requests.
     std::list<std::thread> workers;
     std::mutex workersMu;
     std::condition_variable workersCv;
@@ -672,6 +785,26 @@ int main(int argc, char** argv)
         // fails before we extract "id", fall back to "__worker__".
         std::string id = "__worker__";
         std::string const& line = reqLine;
+        // Phase 3b-B-4 part-2: acquire a Code2Wav slot for the lifetime of
+        // the request. The pool is sized to match dispatcher concurrency, so
+        // at steady state acquire() never blocks; it only orders init when
+        // two requests race for the same fresh slot. The RAII guard releases
+        // the slot when the request handler returns OR throws.
+        int const c2wSlot = code2wavSlotPool.acquire();
+        Code2WavSlotGuard c2wGuard(code2wavSlotPool, c2wSlot);
+        // Lazy-init this slot's CUDA stream if it's a non-zero slot. Slot 0
+        // reuses the main `stream` (set above) for byte-equivalence at N=1.
+        if (c2wSlot != 0 && code2wavStreams[c2wSlot] == cudaStream_t{})
+        {
+            std::lock_guard<std::mutex> lk(code2wavSlotInitMu[c2wSlot]);
+            if (code2wavStreams[c2wSlot] == cudaStream_t{})
+            {
+                cudaStream_t s{};
+                CUDA_CHECK(cudaStreamCreate(&s));
+                code2wavStreams[c2wSlot] = s;
+            }
+        }
+        cudaStream_t const c2wStream = code2wavStreams[c2wSlot];
         try
         {
             Json item = Json::parse(line);
@@ -775,21 +908,29 @@ int main(int argc, char** argv)
 
                 if (statefulCode2Wav)
                 {
-                    // Phase 3b-B-2: serialize Code2Wav across in-flight requests.
-                    std::lock_guard<std::mutex> c2wLock(code2WavMutex);
-                    if (!statefulCode2wavRunner)
+                    // Phase 3b-B-4 part-2: per-slot stateful runner. Each
+                    // slot is touched by exactly one in-flight request at a
+                    // time (Code2WavSlotPool acquires above), so no mutex is
+                    // needed around the runner itself. Slot-init mutex only
+                    // serializes the first-ever construction of THIS slot.
+                    if (!statefulCode2wavRunners[c2wSlot])
                     {
-                        logMemTag("worker_before_stateful_code2wav");
-                        statefulCode2wavRunner
-                            = std::make_unique<StatefulCode2WavRunner>(statefulCode2WavEngineDir, stream);
-                        logMemTag("worker_after_stateful_code2wav");
+                        std::lock_guard<std::mutex> lk(statefulCode2wavSlotInitMu[c2wSlot]);
+                        if (!statefulCode2wavRunners[c2wSlot])
+                        {
+                            logMemTag("worker_before_stateful_code2wav");
+                            statefulCode2wavRunners[c2wSlot]
+                                = std::make_unique<StatefulCode2WavRunner>(statefulCode2WavEngineDir, c2wStream);
+                            logMemTag("worker_after_stateful_code2wav");
+                        }
                     }
+                    auto& runner = *statefulCode2wavRunners[c2wSlot];
                     auto const chunkCodes = transposeFrameWindow(
                         streamedFrames, static_cast<size_t>(lastEmittedFrames), static_cast<size_t>(totalFrames));
                     auto const chunkStart = std::chrono::steady_clock::now();
                     logMemTag(isFinal ? "worker_before_stateful_code2wav_final_chunk"
                                       : "worker_before_stateful_code2wav_chunk");
-                    auto samples = synthesizeStatefulChunk(*statefulCode2wavRunner, chunkCodes, isFinal, stream);
+                    auto samples = synthesizeStatefulChunk(runner, chunkCodes, isFinal, c2wStream);
                     auto const chunkEnd = std::chrono::steady_clock::now();
                     logMemTag(isFinal ? "worker_after_stateful_code2wav_final_chunk"
                                       : "worker_after_stateful_code2wav_chunk");
@@ -811,7 +952,7 @@ int main(int argc, char** argv)
                     code2wavInputFrames += static_cast<int64_t>(chunkCodes.empty() ? 0 : chunkCodes[0].size());
 
                     writeChunk(chunkIndex, isFinal, totalFrames, pcm, code2wavMs, chunkEnd,
-                        statefulCode2wavRunner->getConfig().sampleRate);
+                        runner.getConfig().sampleRate);
 
                     lastEmittedFrames = totalFrames;
                     scheduleNextChunk();
@@ -819,16 +960,20 @@ int main(int argc, char** argv)
                     return;
                 }
 
-                // Phase 3b-B-2: serialize Code2Wav across in-flight requests
-                // (lazy init + inference call on the shared runner).
-                std::lock_guard<std::mutex> c2wLock(code2WavMutex);
-                if (!code2wavRunner)
+                // Phase 3b-B-4 part-2: per-slot sync Code2Wav runner.
+                if (!code2wavRunners[c2wSlot])
                 {
-                    logMemTag("worker_before_lazy_code2wav");
-                    code2wavRunner = std::make_unique<Code2WavRunner>(args.code2wavEngineDir, stream);
-                    logMemTag("worker_after_lazy_code2wav");
+                    std::lock_guard<std::mutex> lk(code2wavSlotInitMu[c2wSlot]);
+                    if (!code2wavRunners[c2wSlot])
+                    {
+                        logMemTag("worker_before_lazy_code2wav");
+                        code2wavRunners[c2wSlot]
+                            = std::make_unique<Code2WavRunner>(args.code2wavEngineDir, c2wStream);
+                        logMemTag("worker_after_lazy_code2wav");
+                    }
                 }
-                int32_t const naturalLeftContext = code2wavRunner->getConfig().leftContextSize;
+                auto& runner = *code2wavRunners[c2wSlot];
+                int32_t const naturalLeftContext = runner.getConfig().leftContextSize;
                 int32_t const leftContext = code2WavContextFrameCap >= 0
                     ? std::min(naturalLeftContext, code2WavContextFrameCap)
                     : naturalLeftContext;
@@ -839,7 +984,7 @@ int main(int argc, char** argv)
 
                 auto const chunkStart = std::chrono::steady_clock::now();
                 logMemTag(isFinal ? "worker_before_code2wav_final_chunk" : "worker_before_code2wav_chunk");
-                auto samples = synthesizeWindow(*code2wavRunner, windowCodes, skipContextFrames, stream);
+                auto samples = synthesizeWindow(runner, windowCodes, skipContextFrames, c2wStream);
                 auto const chunkEnd = std::chrono::steady_clock::now();
                 logMemTag(isFinal ? "worker_after_code2wav_final_chunk" : "worker_after_code2wav_chunk");
                 if (samples.empty())
@@ -860,8 +1005,7 @@ int main(int argc, char** argv)
                 code2wavInputFrames += static_cast<int64_t>(windowCodes.empty() ? 0 : windowCodes[0].size());
                 code2wavContextFrames += static_cast<int64_t>(std::max(0, skipContextFrames));
 
-                writeChunk(chunkIndex, isFinal, totalFrames, pcm, code2wavMs, chunkEnd,
-                    code2wavRunner->getConfig().sampleRate);
+                writeChunk(chunkIndex, isFinal, totalFrames, pcm, code2wavMs, chunkEnd, runner.getConfig().sampleRate);
 
                 lastEmittedFrames = totalFrames;
                 scheduleNextChunk();
@@ -871,16 +1015,16 @@ int main(int argc, char** argv)
             auto const genStart = std::chrono::steady_clock::now();
             bool ok = false;
             std::chrono::steady_clock::time_point genEnd{};
-            if (statefulCode2Wav && statefulCode2wavRunner)
+            if (statefulCode2Wav && statefulCode2wavRunners[c2wSlot])
             {
-                // Phase 3b-B-2: lock around reset() — touches the shared
-                // stateful runner's internal context cache.
-                std::lock_guard<std::mutex> c2wLock(code2WavMutex);
-                statefulCode2wavRunner->reset(stream);
+                // Phase 3b-B-4 part-2: per-slot reset — no cross-slot
+                // sharing, no mutex required.
+                statefulCode2wavRunners[c2wSlot]->reset(c2wStream);
             }
             if (streamOutput && asyncCode2Wav)
             {
-                Code2WavRunner& asyncRunner = getAsyncCode2WavRunner();
+                Code2WavRunner& asyncRunner = getAsyncCode2WavRunner(c2wSlot);
+                cudaStream_t const asyncSlotStream = asyncCode2wavStreams[c2wSlot];
                 std::mutex streamMutex;
                 std::condition_variable streamCv;
                 bool generationDone = false;
@@ -943,14 +1087,11 @@ int main(int argc, char** argv)
                             }
 
                             auto const chunkStart = std::chrono::steady_clock::now();
-                            std::vector<float> samples;
-                            {
-                                // Phase 3b-B-2: serialize async Code2Wav
-                                // inference across in-flight requests.
-                                std::lock_guard<std::mutex> c2wLock(code2WavMutex);
-                                samples = synthesizeWindow(
-                                    asyncRunner, windowCodes, skipContextFrames, asyncCode2WavStream);
-                            }
+                            // Phase 3b-B-4 part-2: per-slot async runner +
+                            // its dedicated CUDA stream; no cross-request
+                            // sharing, so no mutex.
+                            std::vector<float> samples
+                                = synthesizeWindow(asyncRunner, windowCodes, skipContextFrames, asyncSlotStream);
                             auto const chunkEnd = std::chrono::steady_clock::now();
                             double const code2wavMs
                                 = std::chrono::duration<double, std::milli>(chunkEnd - chunkStart).count();
@@ -1034,15 +1175,12 @@ int main(int argc, char** argv)
             if (streamOnly)
             {
                 auto const doneAt = std::chrono::steady_clock::now();
-                // Phase 3b-B-2: sampleRate read goes through the shared
-                // runner pointers; lock briefly to pair with the writer
-                // sections that lazy-init those pointers above.
-                int32_t sampleRate;
-                {
-                    std::lock_guard<std::mutex> c2wLock(code2WavMutex);
-                    sampleRate = statefulCode2Wav ? statefulCode2wavRunner->getConfig().sampleRate
-                                                  : code2wavRunner->getConfig().sampleRate;
-                }
+                // Phase 3b-B-4 part-2: read from THIS request's slot runner
+                // (always populated by emitChunk above when streamOnly).
+                int32_t const sampleRate = statefulCode2Wav
+                    ? statefulCode2wavRunners[c2wSlot]->getConfig().sampleRate
+                    : (asyncCode2Wav ? asyncCode2wavRunners[c2wSlot]->getConfig().sampleRate
+                                     : code2wavRunners[c2wSlot]->getConfig().sampleRate);
                 double const audioSeconds = static_cast<double>(streamedSamples) / sampleRate;
                 double const totalMs = std::chrono::duration<double, std::milli>(doneAt - requestStart).count();
                 response = Json{{"id", id},
@@ -1083,18 +1221,21 @@ int main(int argc, char** argv)
             auto const wavStart = std::chrono::steady_clock::now();
             std::chrono::steady_clock::time_point wavEnd;
             {
-                // Phase 3b-B-2: serialize Code2Wav full-waveform path
-                // (non-streaming branch) — lazy init + generateWaveform on
-                // the shared runner.
-                std::lock_guard<std::mutex> c2wLock(code2WavMutex);
-                if (!code2wavRunner)
+                // Phase 3b-B-4 part-2: per-slot full-waveform Code2Wav path.
+                if (!code2wavRunners[c2wSlot])
                 {
-                    logMemTag("worker_before_lazy_code2wav");
-                    code2wavRunner = std::make_unique<Code2WavRunner>(args.code2wavEngineDir, stream);
-                    logMemTag("worker_after_lazy_code2wav");
+                    std::lock_guard<std::mutex> lk(code2wavSlotInitMu[c2wSlot]);
+                    if (!code2wavRunners[c2wSlot])
+                    {
+                        logMemTag("worker_before_lazy_code2wav");
+                        code2wavRunners[c2wSlot]
+                            = std::make_unique<Code2WavRunner>(args.code2wavEngineDir, c2wStream);
+                        logMemTag("worker_after_lazy_code2wav");
+                    }
                 }
                 logMemTag("worker_before_code2wav_full");
-                if (!code2wavRunner->generateWaveform(transposeCodes(talkerResponse.rvqCodes), audioOutput, stream))
+                if (!code2wavRunners[c2wSlot]->generateWaveform(
+                        transposeCodes(talkerResponse.rvqCodes), audioOutput, c2wStream))
                 {
                     throw std::runtime_error("Code2Wav failed");
                 }
@@ -1134,8 +1275,8 @@ int main(int argc, char** argv)
     // At concurrency=1 this matches the pre-refactor behaviour modulo the
     // extra thread::create+join overhead per request (a few hundred us,
     // amortized over multi-second TTS requests). At N>1 talker / code-pred
-    // stages overlap across requests; Code2Wav is still serialized via
-    // code2WavMutex (Phase 3b-B-3 will lift that with per-slot runners).
+    // AND Code2Wav stages all overlap (Phase 3b-B-4 part-2 per-slot Code2Wav
+    // runners + per-slot CUDA streams).
     std::string line;
     while (std::getline(std::cin, line))
     {
@@ -1185,10 +1326,35 @@ int main(int argc, char** argv)
         }
     }
 
-    asyncCode2wavRunner.reset();
-    if (asyncCode2WavStream)
+    // Phase 3b-B-4 part-2: tear down per-slot runners and their dedicated
+    // CUDA streams. Runners reset() first (so device buffers free before
+    // their stream is destroyed); then streams destroyed (skip slot 0 — it
+    // reused the main `stream`, freed below).
+    for (auto& r : asyncCode2wavRunners)
     {
-        CUDA_CHECK(cudaStreamDestroy(asyncCode2WavStream));
+        r.reset();
+    }
+    for (auto& r : code2wavRunners)
+    {
+        r.reset();
+    }
+    for (auto& r : statefulCode2wavRunners)
+    {
+        r.reset();
+    }
+    for (auto& s : asyncCode2wavStreams)
+    {
+        if (s)
+        {
+            CUDA_CHECK(cudaStreamDestroy(s));
+        }
+    }
+    for (size_t i = 1; i < code2wavStreams.size(); ++i)
+    {
+        if (code2wavStreams[i])
+        {
+            CUDA_CHECK(cudaStreamDestroy(code2wavStreams[i]));
+        }
     }
     CUDA_CHECK(cudaStreamDestroy(stream));
     return EXIT_SUCCESS;
