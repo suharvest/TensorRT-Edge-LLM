@@ -808,69 +808,116 @@ public:
         destroyDecodeCudaGraphs();
     }
 
+    //! [Phase 2 must-fix 3] Create a paired (prefill, decode) execution context set
+    //! bound to this engine. CP requires both contexts per generate call (prefill on
+    //! profile 0 for the 2-token warmup, decode on profile 1 for residual groups),
+    //! so a single factory ctx is structurally insufficient. Phase 3 will use one
+    //! such pair per request slot. Returns {nullptr, nullptr} on failure.
+    std::pair<std::unique_ptr<nvinfer1::IExecutionContext>, std::unique_ptr<nvinfer1::IExecutionContext>>
+    createExecutionContextPair()
+    {
+        std::pair<std::unique_ptr<nvinfer1::IExecutionContext>, std::unique_ptr<nvinfer1::IExecutionContext>> out{
+            nullptr, nullptr};
+        if (!mEngine)
+        {
+            return out;
+        }
+        out.first.reset(mEngine->createExecutionContext());
+        out.second.reset(mEngine->createExecutionContext());
+        if (out.first && out.second && mEngine->getNbOptimizationProfiles() >= 2)
+        {
+            out.first->setOptimizationProfileAsync(0, mStream);
+            out.second->setOptimizationProfileAsync(1, mStream);
+            CUDA_CHECK(cudaStreamSynchronize(mStream));
+        }
+        return out;
+    }
+
     void resetSampling()
     {
         mRng.seed(makeQwen3TTSSamplingSeed(0x5157454E));
     }
 
     bool generate(std::vector<float> const& hidden, std::vector<float> const& primaryEmbedding, int32_t activeGroups,
-        int32_t topK, float topP, float temperature, std::vector<int32_t>& residualCodes)
+        int32_t topK, float topP, float temperature, std::vector<int32_t>& residualCodes,
+        cudaStream_t stream = nullptr, nvinfer1::IExecutionContext* prefillCtxOverride = nullptr,
+        nvinfer1::IExecutionContext* decodeCtxOverride = nullptr)
     {
+        // Phase 2 must-fix 2: resolve per-invocation stream + dual ctx overrides.
+        cudaStream_t const s = (stream != nullptr) ? stream : mStream;
         residualCodes.assign(static_cast<size_t>(mNumGroups), 0);
         if (!mHasPastLength)
         {
-            zeroKV();
+            zeroKV(s);
         }
 
         size_t const bytes = static_cast<size_t>(mHiddenSize) * sizeof(float);
         auto const inputCopyStart = Clock::now();
-        CUDA_CHECK(cudaMemcpyAsync(mDeviceEmbeds.get(), hidden.data(), bytes, cudaMemcpyHostToDevice, mStream));
+        CUDA_CHECK(cudaMemcpyAsync(mDeviceEmbeds.get(), hidden.data(), bytes, cudaMemcpyHostToDevice, s));
         CUDA_CHECK(cudaMemcpyAsync(static_cast<char*>(mDeviceEmbeds.get()) + bytes, primaryEmbedding.data(), bytes,
-            cudaMemcpyHostToDevice, mStream));
+            cudaMemcpyHostToDevice, s));
         profileAdd(mProfileInputCopyMs, inputCopyStart);
         if (mProfile)
         {
             ++mProfileHostHiddenFrames;
         }
-        return generatePreparedInputs(activeGroups, topK, topP, temperature, residualCodes);
+        return generatePreparedInputs(
+            activeGroups, topK, topP, temperature, residualCodes, s, prefillCtxOverride, decodeCtxOverride);
     }
 
     bool generateDeviceHidden(float const* hiddenDevice, std::vector<float> const& primaryEmbedding,
-        int32_t activeGroups, int32_t topK, float topP, float temperature, std::vector<int32_t>& residualCodes)
+        int32_t activeGroups, int32_t topK, float topP, float temperature, std::vector<int32_t>& residualCodes,
+        cudaStream_t stream = nullptr, nvinfer1::IExecutionContext* prefillCtxOverride = nullptr,
+        nvinfer1::IExecutionContext* decodeCtxOverride = nullptr)
     {
+        // Phase 2 must-fix 2: resolve per-invocation stream + dual ctx overrides.
+        cudaStream_t const s = (stream != nullptr) ? stream : mStream;
         residualCodes.assign(static_cast<size_t>(mNumGroups), 0);
         if (!mHasPastLength)
         {
-            zeroKV();
+            zeroKV(s);
         }
 
         size_t const bytes = static_cast<size_t>(mHiddenSize) * sizeof(float);
         auto const inputCopyStart = Clock::now();
-        CUDA_CHECK(cudaMemcpyAsync(mDeviceEmbeds.get(), hiddenDevice, bytes, cudaMemcpyDeviceToDevice, mStream));
+        CUDA_CHECK(cudaMemcpyAsync(mDeviceEmbeds.get(), hiddenDevice, bytes, cudaMemcpyDeviceToDevice, s));
         CUDA_CHECK(cudaMemcpyAsync(static_cast<char*>(mDeviceEmbeds.get()) + bytes, primaryEmbedding.data(), bytes,
-            cudaMemcpyHostToDevice, mStream));
+            cudaMemcpyHostToDevice, s));
         profileAdd(mProfileInputCopyMs, inputCopyStart);
         if (mProfile)
         {
             ++mProfileDeviceHiddenFrames;
         }
-        return generatePreparedInputs(activeGroups, topK, topP, temperature, residualCodes);
+        return generatePreparedInputs(
+            activeGroups, topK, topP, temperature, residualCodes, s, prefillCtxOverride, decodeCtxOverride);
     }
 
 private:
     bool generatePreparedInputs(
-        int32_t activeGroups, int32_t topK, float topP, float temperature, std::vector<int32_t>& residualCodes)
+        int32_t activeGroups, int32_t topK, float topP, float temperature, std::vector<int32_t>& residualCodes,
+        cudaStream_t stream = nullptr, nvinfer1::IExecutionContext* prefillCtxOverride = nullptr,
+        nvinfer1::IExecutionContext* decodeCtxOverride = nullptr)
     {
+        // Phase 2 must-fix 2: resolve per-invocation stream + dual ctx overrides for the
+        // entire CP generate frame. Every helper call below forwards `s` so KV memset,
+        // logits copy, sampling kernels, and TRT enqueueV3 all share one ordering domain.
+        cudaStream_t const s = (stream != nullptr) ? stream : mStream;
+        nvinfer1::IExecutionContext* prefill = (prefillCtxOverride != nullptr) ? prefillCtxOverride : mPrefillContext.get();
+        nvinfer1::IExecutionContext* decode = (decodeCtxOverride != nullptr) ? decodeCtxOverride : mDecodeContext.get();
+        bool const useDecodeCudaGraph = mUseDecodeCudaGraph && (decodeCtxOverride == nullptr) && (stream == nullptr);
+        // CUDA graphs were captured against mDecodeContext + mStream. When the caller
+        // supplies its own slot context/stream, the captured graph cannot be reused, so
+        // we transparently fall back to direct enqueueV3 on the override ctx/stream.
+
         auto const frameStart = Clock::now();
         size_t const bytes = static_cast<size_t>(mHiddenSize) * sizeof(float);
         int64_t const prefillCachePositions[2] = {0, 1};
         CUDA_CHECK(cudaMemcpyAsync(mDeviceCachePosition.get(), prefillCachePositions, sizeof(prefillCachePositions),
-            cudaMemcpyHostToDevice, mStream));
+            cudaMemcpyHostToDevice, s));
 
         auto const prefillSetupStart = Clock::now();
-        nvinfer1::IExecutionContext* prefill = mPrefillContext.get();
-        setScalar(mDeviceGenStep.get(), 0);
-        setScalar(mDevicePastLength.get(), 0);
+        setScalar(mDeviceGenStep.get(), 0, s);
+        setScalar(mDevicePastLength.get(), 0, s);
         prefill->setInputShape("inputs_embeds", nvinfer1::Dims3{1, 2, mHiddenSize});
         prefill->setTensorAddress("inputs_embeds", mDeviceEmbeds.get());
         prefill->setInputShape("cache_position", nvinfer1::Dims{1, {2}});
@@ -894,26 +941,25 @@ private:
         }
         prefill->setTensorAddress(mLogitsName.c_str(), mDeviceLogits.get());
         profileAdd(mProfilePrefillSetupMs, prefillSetupStart);
-        if (!prefill->enqueueV3(mStream))
+        if (!prefill->enqueueV3(s))
         {
             LOG_ERROR("Qwen3-TTS CodePredictor prefill failed");
             return false;
         }
         if (mUseGpuGreedy)
         {
-            sampleDeviceLogitsGreedyToDevice(0);
+            sampleDeviceLogitsGreedyToDevice(0, s);
         }
         else if (mUseGpuSampling)
         {
-            sampleDeviceLogitsTopKTopPToDevice(0, topK, topP, temperature);
+            sampleDeviceLogitsTopKTopPToDevice(0, topK, topP, temperature, s);
         }
         else
         {
-            residualCodes[0] = sampleDeviceLogits(0, topK, topP, temperature);
+            residualCodes[0] = sampleDeviceLogits(0, topK, topP, temperature, s);
         }
 
-        nvinfer1::IExecutionContext* decode = mDecodeContext.get();
-        if (!mUseDecodeCudaGraph)
+        if (!useDecodeCudaGraph)
         {
             decode->setInputShape("inputs_embeds", nvinfer1::Dims3{1, 1, mHiddenSize});
             decode->setTensorAddress("inputs_embeds", mDeviceEmbeds.get());
@@ -936,26 +982,26 @@ private:
         for (int32_t j = 1; j < groupsToGenerate; ++j)
         {
             auto const embedStart = Clock::now();
-            if (mUseDecodeCudaGraph)
+            if (useDecodeCudaGraph)
             {
                 CUDA_CHECK(cudaMemcpyAsync(static_cast<int32_t*>(mDeviceSelectedTokens.get()) + j - 1,
-                    &residualCodes[j - 1], sizeof(int32_t), cudaMemcpyHostToDevice, mStream));
+                    &residualCodes[j - 1], sizeof(int32_t), cudaMemcpyHostToDevice, s));
             }
             else if (mUseGpuGreedy || mUseGpuSampling)
             {
                 kernel::qwen3TtsCpGatherEmbedding(static_cast<float const*>(mDeviceEmbeddingTable.get()), mCodebookSize,
                     mHiddenSize, j - 1, static_cast<int32_t const*>(mDeviceSelectedTokens.get()),
-                    static_cast<float*>(mDeviceEmbeds.get()), mStream);
+                    static_cast<float*>(mDeviceEmbeds.get()), s);
             }
             else if (mUseDeviceEmbeddingTable)
             {
                 CUDA_CHECK(cudaMemcpyAsync(mDeviceEmbeds.get(), embeddingDevice(j - 1, residualCodes[j - 1]), bytes,
-                    cudaMemcpyDeviceToDevice, mStream));
+                    cudaMemcpyDeviceToDevice, s));
             }
             else
             {
                 CUDA_CHECK(cudaMemcpyAsync(mDeviceEmbeds.get(), embedding(j - 1, residualCodes[j - 1]), bytes,
-                    cudaMemcpyHostToDevice, mStream));
+                    cudaMemcpyHostToDevice, s));
             }
             profileAdd(mProfileEmbedCopyMs, embedStart);
             if (mProfile)
@@ -965,36 +1011,36 @@ private:
 
             auto const decodeSetupStart = Clock::now();
             int64_t const actualPast = j + 1;
-            if (!mUseDecodeCudaGraph)
+            if (!useDecodeCudaGraph)
             {
-                setScalar(mDeviceGenStep.get(), j);
-                setScalar(mDevicePastLength.get(), actualPast);
+                setScalar(mDeviceGenStep.get(), j, s);
+                setScalar(mDevicePastLength.get(), actualPast, s);
                 CUDA_CHECK(cudaMemcpyAsync(
-                    mDeviceCachePosition.get(), &actualPast, sizeof(int64_t), cudaMemcpyHostToDevice, mStream));
-                bindDecodeContext(j, actualPast, *read, *write, mDeviceGenStep.get(), mDevicePastLength.get(),
+                    mDeviceCachePosition.get(), &actualPast, sizeof(int64_t), cudaMemcpyHostToDevice, s));
+                bindDecodeContext(decode, j, actualPast, *read, *write, mDeviceGenStep.get(), mDevicePastLength.get(),
                     mDeviceCachePosition.get());
             }
             profileAdd(mProfileDecodeSetupMs, decodeSetupStart);
             bool decodeOk = false;
-            if (mUseDecodeCudaGraph)
+            if (useDecodeCudaGraph)
             {
                 decodeOk = launchDecodeCudaGraph(j, *read, *write);
                 if (!decodeOk)
                 {
                     LOG_WARNING("Qwen3-TTS CP decode CUDA graph disabled; falling back to normal decode");
                     mUseDecodeCudaGraph = false;
-                    setScalar(mDeviceGenStep.get(), j);
-                    setScalar(mDevicePastLength.get(), actualPast);
+                    setScalar(mDeviceGenStep.get(), j, s);
+                    setScalar(mDevicePastLength.get(), actualPast, s);
                     CUDA_CHECK(cudaMemcpyAsync(
-                        mDeviceCachePosition.get(), &actualPast, sizeof(int64_t), cudaMemcpyHostToDevice, mStream));
-                    bindDecodeContext(j, actualPast, *read, *write, mDeviceGenStep.get(), mDevicePastLength.get(),
-                        mDeviceCachePosition.get());
-                    decodeOk = decode->enqueueV3(mStream);
+                        mDeviceCachePosition.get(), &actualPast, sizeof(int64_t), cudaMemcpyHostToDevice, s));
+                    bindDecodeContext(decode, j, actualPast, *read, *write, mDeviceGenStep.get(),
+                        mDevicePastLength.get(), mDeviceCachePosition.get());
+                    decodeOk = decode->enqueueV3(s);
                 }
             }
             else
             {
-                decodeOk = decode->enqueueV3(mStream);
+                decodeOk = decode->enqueueV3(s);
             }
             if (!decodeOk)
             {
@@ -1003,15 +1049,15 @@ private:
             }
             if (mUseGpuGreedy)
             {
-                sampleDeviceLogitsGreedyToDevice(j);
+                sampleDeviceLogitsGreedyToDevice(j, s);
             }
             else if (mUseGpuSampling)
             {
-                sampleDeviceLogitsTopKTopPToDevice(j, topK, topP, temperature);
+                sampleDeviceLogitsTopKTopPToDevice(j, topK, topP, temperature, s);
             }
             else
             {
-                residualCodes[j] = sampleDeviceLogits(j, topK, topP, temperature);
+                residualCodes[j] = sampleDeviceLogits(j, topK, topP, temperature, s);
             }
             std::swap(read, write);
         }
@@ -1019,8 +1065,8 @@ private:
         {
             auto const waitStart = Clock::now();
             CUDA_CHECK(cudaMemcpyAsync(residualCodes.data(), mDeviceSelectedTokens.get(),
-                static_cast<size_t>(groupsToGenerate) * sizeof(int32_t), cudaMemcpyDeviceToHost, mStream));
-            CUDA_CHECK(cudaStreamSynchronize(mStream));
+                static_cast<size_t>(groupsToGenerate) * sizeof(int32_t), cudaMemcpyDeviceToHost, s));
+            CUDA_CHECK(cudaStreamSynchronize(s));
             profileAdd(mProfileSampleWaitMs, waitStart);
         }
         if (mProfile)
@@ -1128,16 +1174,18 @@ private:
         return static_cast<char const*>(mDeviceEmbeddingTable.get()) + offset;
     }
 
-    void zeroKV()
+    void zeroKV(cudaStream_t stream = nullptr)
     {
+        // Phase 2 must-fix 2: honor caller-supplied stream.
+        cudaStream_t const s = (stream != nullptr) ? stream : mStream;
         size_t const kvBytes = static_cast<size_t>(mNumHeads) * 32 * mHeadDim * mKVElementSize;
         for (auto const& p : mKVA)
         {
-            CUDA_CHECK(cudaMemsetAsync(p.get(), 0, kvBytes, mStream));
+            CUDA_CHECK(cudaMemsetAsync(p.get(), 0, kvBytes, s));
         }
         for (auto const& p : mKVB)
         {
-            CUDA_CHECK(cudaMemsetAsync(p.get(), 0, kvBytes, mStream));
+            CUDA_CHECK(cudaMemsetAsync(p.get(), 0, kvBytes, s));
         }
     }
 
@@ -1152,15 +1200,20 @@ private:
         }
     }
 
-    void setScalar(void* devicePtr, int64_t value)
+    void setScalar(void* devicePtr, int64_t value, cudaStream_t stream = nullptr)
     {
-        CUDA_CHECK(cudaMemcpyAsync(devicePtr, &value, sizeof(int64_t), cudaMemcpyHostToDevice, mStream));
+        // Phase 2 must-fix 2: honor caller-supplied stream.
+        cudaStream_t const s = (stream != nullptr) ? stream : mStream;
+        CUDA_CHECK(cudaMemcpyAsync(devicePtr, &value, sizeof(int64_t), cudaMemcpyHostToDevice, s));
     }
 
-    void bindDecodeContext(int32_t group, int64_t actualPast, std::vector<DeviceBuffer> const& read,
-        std::vector<DeviceBuffer> const& write, void* genStepPtr, void* pastLengthPtr, void* cachePositionPtr)
+    // Phase 2 must-fix 2: take an explicit decode-context pointer so callers can supply
+    // a per-slot context. Old single-arg overload retained for CUDA-graph capture path
+    // (which is intentionally pinned to mDecodeContext).
+    void bindDecodeContext(nvinfer1::IExecutionContext* decode, int32_t group, int64_t actualPast,
+        std::vector<DeviceBuffer> const& read, std::vector<DeviceBuffer> const& write, void* genStepPtr,
+        void* pastLengthPtr, void* cachePositionPtr)
     {
-        nvinfer1::IExecutionContext* decode = mDecodeContext.get();
         decode->setInputShape("inputs_embeds", nvinfer1::Dims3{1, 1, mHiddenSize});
         decode->setTensorAddress("inputs_embeds", mDeviceEmbeds.get());
         decode->setInputShape("cache_position", nvinfer1::Dims{1, {1}});
@@ -1219,7 +1272,8 @@ private:
         auto* genStepPtr = static_cast<char*>(mDeviceDecodeGenSteps.get()) + static_cast<size_t>(group) * sizeof(int64_t);
         auto* pastLengthPtr
             = static_cast<char*>(mDeviceDecodePastLengths.get()) + static_cast<size_t>(group) * sizeof(int64_t);
-        bindDecodeContext(group, actualPast, read, write, genStepPtr, pastLengthPtr, pastLengthPtr);
+        bindDecodeContext(
+            mDecodeContext.get(), group, actualPast, read, write, genStepPtr, pastLengthPtr, pastLengthPtr);
 
         cudaGraph_t graph = nullptr;
         cudaGraphExec_t graphExec = nullptr;
@@ -1317,29 +1371,37 @@ private:
             mProfileSampleCpuMs / groups);
     }
 
-    int32_t sampleDeviceLogits(int32_t group, int32_t topK, float topP, float temperature)
+    int32_t sampleDeviceLogits(int32_t group, int32_t topK, float topP, float temperature, cudaStream_t stream = nullptr)
     {
+        // Phase 2 must-fix 2: honor caller-supplied stream.
+        cudaStream_t const s = (stream != nullptr) ? stream : mStream;
         auto const waitStart = Clock::now();
         size_t const offset = mLogitsName == "logits_all" ? static_cast<size_t>(group) * mCodebookSize : 0;
+        // Phase 2 must-fix (codex round 3): each branch owns its own sync.
+        // Previously a second unconditional cudaStreamSynchronize at the end
+        // fired every decode step even though the bf16/half branch already
+        // synced at line ~1394 before the host conversion loop. Removing
+        // the duplicate halves the per-step host-side wait in the
+        // common bf16 case.
         if (mLogitsElementSize == sizeof(float))
         {
             CUDA_CHECK(cudaMemcpyAsync(mSampleLogits.data(),
                 static_cast<char*>(mDeviceLogits.get()) + offset * sizeof(float),
-                mSampleLogits.size() * sizeof(float), cudaMemcpyDeviceToHost, mStream));
+                mSampleLogits.size() * sizeof(float), cudaMemcpyDeviceToHost, s));
+            CUDA_CHECK(cudaStreamSynchronize(s));
         }
         else
         {
             CUDA_CHECK(cudaMemcpyAsync(mSampleRaw.data(),
                 static_cast<char*>(mDeviceLogits.get()) + offset * mLogitsElementSize,
-                mSampleRaw.size() * mLogitsElementSize, cudaMemcpyDeviceToHost, mStream));
-            CUDA_CHECK(cudaStreamSynchronize(mStream));
+                mSampleRaw.size() * mLogitsElementSize, cudaMemcpyDeviceToHost, s));
+            CUDA_CHECK(cudaStreamSynchronize(s));
             for (size_t i = 0; i < mSampleRaw.size(); ++i)
             {
                 uint32_t bits = mLogitsAreBf16 ? (static_cast<uint32_t>(mSampleRaw[i]) << 16) : halfToFloatBits(mSampleRaw[i]);
                 std::memcpy(&mSampleLogits[i], &bits, sizeof(float));
             }
         }
-        CUDA_CHECK(cudaStreamSynchronize(mStream));
         profileAdd(mProfileSampleWaitMs, waitStart);
 
         auto const cpuStart = Clock::now();
@@ -1424,15 +1486,20 @@ private:
         return token;
     }
 
-    void sampleDeviceLogitsGreedyToDevice(int32_t group)
+    void sampleDeviceLogitsGreedyToDevice(int32_t group, cudaStream_t stream = nullptr)
     {
+        // Phase 2 must-fix 2: honor caller-supplied stream.
+        cudaStream_t const s = (stream != nullptr) ? stream : mStream;
         size_t const offset = mLogitsName == "logits_all" ? static_cast<size_t>(group) * mCodebookSize : 0;
         kernel::qwen3TtsCpArgmax(static_cast<float const*>(mDeviceLogits.get()) + offset, mCodebookSize, 0,
-            static_cast<int32_t*>(mDeviceSelectedTokens.get()) + group, mStream);
+            static_cast<int32_t*>(mDeviceSelectedTokens.get()) + group, s);
     }
 
-    void sampleDeviceLogitsTopKTopPToDevice(int32_t group, int32_t topK, float topP, float temperature)
+    void sampleDeviceLogitsTopKTopPToDevice(
+        int32_t group, int32_t topK, float topP, float temperature, cudaStream_t stream = nullptr)
     {
+        // Phase 2 must-fix 2: honor caller-supplied stream.
+        cudaStream_t const s = (stream != nullptr) ? stream : mStream;
         int32_t const effectiveTopK = topK > 0 ? std::min(topK, mCodebookSize) : mCodebookSize;
         float const effectiveTopP = (topP > 0.0f && topP <= 1.0f) ? topP : 1.0f;
         float const effectiveTemperature = temperature > 1e-6f ? temperature : 0.9f;
@@ -1445,7 +1512,7 @@ private:
         rt::Tensor workspace(
             mDeviceSamplingWorkspace.get(), {static_cast<int64_t>(mGpuSamplingWorkspaceBytes)}, rt::DeviceType::kGPU,
             nvinfer1::DataType::kINT8);
-        topKtopPSamplingFromLogits(logits, selected, params, workspace, mStream, mGpuSamplingSeed, mGpuSamplingOffset++);
+        topKtopPSamplingFromLogits(logits, selected, params, workspace, s, mGpuSamplingSeed, mGpuSamplingOffset++);
     }
 
     int32_t mHiddenSize{};
@@ -1680,8 +1747,29 @@ public:
         return nvinfer1::DataType::kFLOAT;
     }
 
+    //! [Phase 2 hook] Create a fresh execution context for this engine.
+    //! Returned context shares engine weights but has its own CUDA state. Phase 3
+    //! will use one such context per request slot. Returns nullptr on failure.
+    std::unique_ptr<nvinfer1::IExecutionContext> createExecutionContext()
+    {
+        if (!mEngine)
+        {
+            return nullptr;
+        }
+        std::unique_ptr<nvinfer1::IExecutionContext> ctx{mEngine->createExecutionContext()};
+        if (ctx && mHasDualProfiles)
+        {
+            // Match the default-context convention. Phase 3 will pick prefill vs decode
+            // profile per request based on which slot operation is in flight.
+            ctx->setOptimizationProfileAsync(1, mStream);
+            CUDA_CHECK(cudaStreamSynchronize(mStream));
+        }
+        return ctx;
+    }
+
     bool prefill(std::vector<float> const& inputEmbeds, int32_t seqLen, rt::Tensor& outputLogits,
-        rt::Tensor& outputHiddenStates)
+        rt::Tensor& outputHiddenStates, cudaStream_t stream = nullptr,
+        nvinfer1::IExecutionContext* ctxOverride = nullptr)
     {
         if (seqLen <= 0)
         {
@@ -1695,7 +1783,7 @@ public:
                 LOG_INFO("Qwen3-TTS direct Talker using iterative prefill: seqLen=%d", seqLen);
                 size_t const hidden = static_cast<size_t>(mConfig.hiddenSize);
                 std::vector<float> step(inputEmbeds.begin(), inputEmbeds.begin() + hidden);
-                if (!prefill(step, 1, outputLogits, outputHiddenStates))
+                if (!prefill(step, 1, outputLogits, outputHiddenStates, stream, ctxOverride))
                 {
                     return false;
                 }
@@ -1703,7 +1791,7 @@ public:
                 {
                     auto const begin = inputEmbeds.begin() + static_cast<size_t>(pos) * hidden;
                     step.assign(begin, begin + hidden);
-                    if (!decode(step, outputLogits, outputHiddenStates))
+                    if (!decode(step, outputLogits, outputHiddenStates, stream, ctxOverride))
                     {
                         LOG_ERROR("Qwen3-TTS direct Talker iterative prefill failed at token %d/%d", pos + 1, seqLen);
                         return false;
@@ -1714,12 +1802,17 @@ public:
             LOG_ERROR("Qwen3-TTS direct Talker prefill seqLen out of range: %d (max %d)", seqLen, mMaxSeqLen);
             return false;
         }
+        // Phase 2 must-fix 1: resolve per-invocation stream BEFORE reset() so that
+        // reset's KV-memset runs on the same stream as the prefill enqueue below.
+        cudaStream_t const s = (stream != nullptr) ? stream : mStream;
+        nvinfer1::IExecutionContext* ctx = (ctxOverride != nullptr)
+            ? ctxOverride
+            : (mHasDualProfiles ? mPrefillContext.get() : mDecodeContext.get());
         resetProfiles();
-        reset();
+        reset(s);
 
-        nvinfer1::IExecutionContext* ctx = mHasDualProfiles ? mPrefillContext.get() : mDecodeContext.get();
         CUDA_CHECK(cudaMemcpyAsync(mDeviceEmbeds.get(), inputEmbeds.data(),
-            static_cast<size_t>(seqLen) * mConfig.hiddenSize * sizeof(float), cudaMemcpyHostToDevice, mStream));
+            static_cast<size_t>(seqLen) * mConfig.hiddenSize * sizeof(float), cudaMemcpyHostToDevice, s));
 
         ctx->setInputShape(mEmbedsName.c_str(), nvinfer1::Dims3{1, seqLen, mConfig.hiddenSize});
         ctx->setTensorAddress(mEmbedsName.c_str(), mDeviceEmbeds.get());
@@ -1730,7 +1823,7 @@ public:
         }
         if (mHasPositionIds)
         {
-            fillPositions(seqLen);
+            fillPositions(seqLen, s);
             ctx->setInputShape("position_ids", nvinfer1::Dims2{1, seqLen});
             ctx->setTensorAddress("position_ids", mDevicePositionIds.get());
         }
@@ -1750,44 +1843,45 @@ public:
         {
             ctx->setTensorAddress("last_hidden", mDeviceHidden.get());
         }
-        if (!ctx->enqueueV3(mStream))
+        if (!ctx->enqueueV3(s))
         {
             LOG_ERROR("Qwen3-TTS direct Talker prefill failed");
             return false;
         }
 
         std::vector<float> logits(static_cast<size_t>(seqLen) * mConfig.vocabSize);
-        copyDeviceToFloat(mDeviceLogits.get(), mLogitsType, logits.data(), logits.size());
+        copyDeviceToFloat(mDeviceLogits.get(), mLogitsType, logits.data(), logits.size(), s);
         CUDA_CHECK(cudaMemcpyAsync(outputLogits.rawPointer(), logits.data() + static_cast<size_t>(seqLen - 1) * mConfig.vocabSize,
-            static_cast<size_t>(mConfig.vocabSize) * sizeof(float), cudaMemcpyHostToDevice, mStream));
+            static_cast<size_t>(mConfig.vocabSize) * sizeof(float), cudaMemcpyHostToDevice, s));
 
         if (mHasLastHidden)
         {
             std::vector<float> hidden(static_cast<size_t>(seqLen) * mConfig.hiddenSize);
-            copyDeviceToFloat(mDeviceHidden.get(), mHiddenType, hidden.data(), hidden.size());
+            copyDeviceToFloat(mDeviceHidden.get(), mHiddenType, hidden.data(), hidden.size(), s);
             check::check(outputHiddenStates.reshape({1, seqLen, mConfig.hiddenSize}), "Tensor reshape failed");
             CUDA_CHECK(cudaMemcpyAsync(outputHiddenStates.rawPointer(), hidden.data(),
-                hidden.size() * sizeof(float), cudaMemcpyHostToDevice, mStream));
+                hidden.size() * sizeof(float), cudaMemcpyHostToDevice, s));
         }
-        CUDA_CHECK(cudaStreamSynchronize(mStream));
+        CUDA_CHECK(cudaStreamSynchronize(s));
         mSeqLen = seqLen;
         mParity = 1;
         return true;
     }
 
     bool prefillWithPromptCache(std::vector<float> const& inputEmbeds, int32_t seqLen,
-        rt::Tensor& outputLogits, rt::Tensor& outputHiddenStates)
+        rt::Tensor& outputLogits, rt::Tensor& outputHiddenStates, cudaStream_t stream = nullptr,
+        nvinfer1::IExecutionContext* ctxOverride = nullptr)
     {
         if (seqLen <= 0 || seqLen > mMaxSeqLen)
         {
-            return prefill(inputEmbeds, seqLen, outputLogits, outputHiddenStates);
+            return prefill(inputEmbeds, seqLen, outputLogits, outputHiddenStates, stream, ctxOverride);
         }
 
         uint64_t const promptKey = hashPrompt(inputEmbeds, seqLen);
         if (!mPromptCacheValid || mPromptCacheKey != promptKey || mPromptCacheLen != seqLen)
         {
             LOG_INFO("Qwen3-TTS Talker prompt KV cache miss: seqLen=%d", seqLen);
-            if (!prefill(inputEmbeds, seqLen, outputLogits, outputHiddenStates))
+            if (!prefill(inputEmbeds, seqLen, outputLogits, outputHiddenStates, stream, ctxOverride))
             {
                 return false;
             }
@@ -1801,7 +1895,8 @@ public:
         return true;
     }
 
-    bool decode(std::vector<float> const& inputEmbed, rt::Tensor& outputLogits, rt::Tensor& outputHiddenStates)
+    bool decode(std::vector<float> const& inputEmbed, rt::Tensor& outputLogits, rt::Tensor& outputHiddenStates,
+        cudaStream_t stream = nullptr, nvinfer1::IExecutionContext* ctxOverride = nullptr)
     {
         if (mSeqLen <= 0 || mSeqLen >= mMaxKVSeqLen)
         {
@@ -1809,10 +1904,12 @@ public:
             return false;
         }
 
-        nvinfer1::IExecutionContext* ctx = mHasDualProfiles ? mDecodeContext.get() : mDecodeContext.get();
+        // Phase 2: resolve per-invocation stream and execution context, falling back to defaults.
+        cudaStream_t const s = (stream != nullptr) ? stream : mStream;
+        nvinfer1::IExecutionContext* ctx = (ctxOverride != nullptr) ? ctxOverride : mDecodeContext.get();
         CUDA_CHECK(cudaMemcpyAsync(
             mDeviceEmbeds.get(), inputEmbed.data(), static_cast<size_t>(mConfig.hiddenSize) * sizeof(float),
-            cudaMemcpyHostToDevice, mStream));
+            cudaMemcpyHostToDevice, s));
 
         auto& read = (mParity == 0) ? mKVA : mKVB;
         auto& write = (mParity == 0) ? mKVB : mKVA;
@@ -1826,7 +1923,7 @@ public:
         if (mHasPositionIds)
         {
             int64_t const position = mSeqLen;
-            CUDA_CHECK(cudaMemcpyAsync(mDevicePositionIds.get(), &position, sizeof(int64_t), cudaMemcpyHostToDevice, mStream));
+            CUDA_CHECK(cudaMemcpyAsync(mDevicePositionIds.get(), &position, sizeof(int64_t), cudaMemcpyHostToDevice, s));
             ctx->setInputShape("position_ids", nvinfer1::Dims2{1, 1});
             ctx->setTensorAddress("position_ids", mDevicePositionIds.get());
         }
@@ -1845,26 +1942,26 @@ public:
         {
             ctx->setTensorAddress("last_hidden", mDeviceHidden.get());
         }
-        if (!ctx->enqueueV3(mStream))
+        if (!ctx->enqueueV3(s))
         {
             LOG_ERROR("Qwen3-TTS direct Talker decode failed");
             return false;
         }
 
         std::vector<float> logits(static_cast<size_t>(mConfig.vocabSize));
-        copyDeviceToFloat(mDeviceLogits.get(), mLogitsType, logits.data(), logits.size());
+        copyDeviceToFloat(mDeviceLogits.get(), mLogitsType, logits.data(), logits.size(), s);
         CUDA_CHECK(cudaMemcpyAsync(
-            outputLogits.rawPointer(), logits.data(), logits.size() * sizeof(float), cudaMemcpyHostToDevice, mStream));
+            outputLogits.rawPointer(), logits.data(), logits.size() * sizeof(float), cudaMemcpyHostToDevice, s));
 
         if (mHasLastHidden)
         {
             std::vector<float> hidden(static_cast<size_t>(mConfig.hiddenSize));
-            copyDeviceToFloat(mDeviceHidden.get(), mHiddenType, hidden.data(), hidden.size());
+            copyDeviceToFloat(mDeviceHidden.get(), mHiddenType, hidden.data(), hidden.size(), s);
             check::check(outputHiddenStates.reshape({1, 1, mConfig.hiddenSize}), "Tensor reshape failed");
             CUDA_CHECK(cudaMemcpyAsync(outputHiddenStates.rawPointer(), hidden.data(), hidden.size() * sizeof(float),
-                cudaMemcpyHostToDevice, mStream));
+                cudaMemcpyHostToDevice, s));
         }
-        CUDA_CHECK(cudaStreamSynchronize(mStream));
+        CUDA_CHECK(cudaStreamSynchronize(s));
         ++mSeqLen;
         mParity ^= 1;
         return true;
@@ -1923,17 +2020,20 @@ private:
         }
     }
 
-    void reset()
+    void reset(cudaStream_t stream = nullptr)
     {
+        // Phase 2 must-fix 1: honor caller-supplied stream so reset's KV-memset
+        // is ordered with prefill's downstream H2D/enqueue on the same stream.
+        cudaStream_t const s = (stream != nullptr) ? stream : mStream;
         mSeqLen = 0;
         mParity = 0;
         for (auto const& p : mKVA)
         {
-            CUDA_CHECK(cudaMemsetAsync(p.get(), 0, p.bytes(), mStream));
+            CUDA_CHECK(cudaMemsetAsync(p.get(), 0, p.bytes(), s));
         }
         for (auto const& p : mKVB)
         {
-            CUDA_CHECK(cudaMemsetAsync(p.get(), 0, p.bytes(), mStream));
+            CUDA_CHECK(cudaMemsetAsync(p.get(), 0, p.bytes(), s));
         }
     }
 
@@ -2031,25 +2131,34 @@ private:
         }
     }
 
-    void fillPositions(int32_t seqLen)
+    // Phase 2 must-fix (codex round 3): accept a per-invocation stream so
+    // these helpers no longer pin to mStream. Silent regression at N=1
+    // (s == mStream via nullptr fallback) but mandatory before Phase 3
+    // gives callers non-null overrides — otherwise prefill/decode would
+    // enqueue on the slot stream while the position copy stays on
+    // mStream, creating a cross-stream data race.
+    void fillPositions(int32_t seqLen, cudaStream_t stream = nullptr)
     {
+        cudaStream_t const s = (stream != nullptr) ? stream : mStream;
         std::vector<int64_t> positions(static_cast<size_t>(seqLen));
         std::iota(positions.begin(), positions.end(), 0);
         CUDA_CHECK(cudaMemcpyAsync(
-            mDevicePositionIds.get(), positions.data(), positions.size() * sizeof(int64_t), cudaMemcpyHostToDevice, mStream));
+            mDevicePositionIds.get(), positions.data(), positions.size() * sizeof(int64_t), cudaMemcpyHostToDevice, s));
     }
 
-    void copyDeviceToFloat(void const* devicePtr, nvinfer1::DataType dtype, float* hostPtr, size_t elements)
+    void copyDeviceToFloat(void const* devicePtr, nvinfer1::DataType dtype, float* hostPtr, size_t elements,
+        cudaStream_t stream = nullptr)
     {
+        cudaStream_t const s = (stream != nullptr) ? stream : mStream;
         if (dtype == nvinfer1::DataType::kFLOAT)
         {
-            CUDA_CHECK(cudaMemcpyAsync(hostPtr, devicePtr, elements * sizeof(float), cudaMemcpyDeviceToHost, mStream));
-            CUDA_CHECK(cudaStreamSynchronize(mStream));
+            CUDA_CHECK(cudaMemcpyAsync(hostPtr, devicePtr, elements * sizeof(float), cudaMemcpyDeviceToHost, s));
+            CUDA_CHECK(cudaStreamSynchronize(s));
             return;
         }
         std::vector<uint16_t> raw(elements);
-        CUDA_CHECK(cudaMemcpyAsync(raw.data(), devicePtr, elements * sizeof(uint16_t), cudaMemcpyDeviceToHost, mStream));
-        CUDA_CHECK(cudaStreamSynchronize(mStream));
+        CUDA_CHECK(cudaMemcpyAsync(raw.data(), devicePtr, elements * sizeof(uint16_t), cudaMemcpyDeviceToHost, s));
+        CUDA_CHECK(cudaStreamSynchronize(s));
         for (size_t i = 0; i < elements; ++i)
         {
             uint32_t const bits = dtype == nvinfer1::DataType::kBF16 ? (static_cast<uint32_t>(raw[i]) << 16)
@@ -4361,6 +4470,36 @@ int32_t Qwen3OmniTTSRuntime::getSpeakerIdByName(std::string const& speakerName) 
     LOG_WARNING(
         "Speaker '%s' not found, using default speaker ID %d", speakerName.c_str(), mTalkerConfig.defaultSpeakerId);
     return mTalkerConfig.defaultSpeakerId;
+}
+
+// ========== Phase 2 hooks: per-request execution context factories ==========
+//
+// These return fresh execution contexts that share engine weights but have
+// independent CUDA state. Phase 2 ships them as compile-tested scaffolding only —
+// the default per-engine contexts continue to serve every current call site.
+// Phase 3 (slot pool) will pair these with per-slot CUDA streams and KV cache
+// to enable concurrent N>1 inference.
+
+std::unique_ptr<nvinfer1::IExecutionContext> Qwen3OmniTTSRuntime::createTalkerExecutionContext()
+{
+    if (!mQwen3TTSTalkerEngine)
+    {
+        LOG_WARNING("createTalkerExecutionContext: explicit-KV Talker engine not loaded; returning nullptr");
+        return nullptr;
+    }
+    return mQwen3TTSTalkerEngine->createExecutionContext();
+}
+
+std::pair<std::unique_ptr<nvinfer1::IExecutionContext>, std::unique_ptr<nvinfer1::IExecutionContext>>
+Qwen3OmniTTSRuntime::createCodePredictorExecutionContextPair()
+{
+    if (!mUseQwen3TTSCodePredictorEngine || !mQwen3TTSCodePredictorEngine)
+    {
+        LOG_WARNING(
+            "createCodePredictorExecutionContextPair: native Qwen3-TTS CP engine not enabled; returning {nullptr,nullptr}");
+        return {nullptr, nullptr};
+    }
+    return mQwen3TTSCodePredictorEngine->createExecutionContextPair();
 }
 
 } // namespace rt

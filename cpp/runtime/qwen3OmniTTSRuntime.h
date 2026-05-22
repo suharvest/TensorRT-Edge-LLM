@@ -22,11 +22,13 @@
 #include "runtime/llmEngineRunner.h"
 #include "runtime/llmRuntimeUtils.h"
 #include "tokenizer/tokenizer.h"
+#include <NvInferRuntime.h>
 #include <filesystem>
 #include <functional>
 #include <memory>
 #include <string>
 #include <unordered_map>
+#include <utility>
 #include <vector>
 
 namespace trt_edgellm
@@ -216,6 +218,40 @@ public:
      * @return Speaker ID, or default speaker ID if not found
      */
     int32_t getSpeakerIdByName(std::string const& speakerName) const;
+
+    /*!
+     * @brief [Phase 2 hook] Create a fresh execution context bound to the loaded Talker engine.
+     *
+     * Returned context shares engine weights but has independent CUDA state and
+     * optimization-profile selection. Phase 3 will pair this with a per-slot CUDA stream
+     * and KV cache to enable concurrent N>1 inference. Phase 2 ships the hook only; the
+     * default per-instance contexts continue to serve all current call sites.
+     *
+     * NOTE: Talker uses a single context that switches between prefill (profile 0) and
+     * decode (profile 1) at runtime via setOptimizationProfileAsync — a single factory
+     * ctx is sufficient as long as Phase 3 also switches profiles per call. This is
+     * unlike the CP engine which requires a paired (prefill, decode) ctx set (see
+     * @ref createCodePredictorExecutionContextPair).
+     *
+     * @return Owning pointer to a fresh execution context, or nullptr if the Talker engine
+     *         is not loaded (e.g. wrong backend selected).
+     */
+    std::unique_ptr<nvinfer1::IExecutionContext> createTalkerExecutionContext();
+
+    /*!
+     * @brief [Phase 2 must-fix 3] Create a paired (prefill, decode) execution context set
+     *        bound to the loaded native Qwen3-TTS CodePredictor engine.
+     *
+     * CP generate-path uses BOTH a prefill ctx (profile 0, 2-token warmup) and a decode ctx
+     * (profile 1, single-token decode for residual groups) per frame. A single factory
+     * context cannot service both shapes without per-call profile churn, so we expose the
+     * pair directly. Phase 3 will install one such pair per request slot.
+     *
+     * @return std::pair{prefill_ctx, decode_ctx}. Both nullptr if the native CP engine
+     *         is not enabled.
+     */
+    std::pair<std::unique_ptr<nvinfer1::IExecutionContext>, std::unique_ptr<nvinfer1::IExecutionContext>>
+    createCodePredictorExecutionContextPair();
 
 private:
     class Qwen3TTSCodePredictorEngine;
