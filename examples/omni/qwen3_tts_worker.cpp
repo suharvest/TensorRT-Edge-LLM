@@ -466,6 +466,19 @@ std::mutex coutMutex;
 std::mutex cancelMapMu;
 std::unordered_map<std::string, std::atomic<bool>*> cancelMap;
 
+// [Phase B C5b — empirical probe] Worker-level mutex around the
+// entire ttsRuntime->handleAudioGeneration() call. Codex audit
+// (docs/specs/tts-n2-shared-tensor-audit.md §1) lists ~14 shared
+// mutable Qwen3OmniTTSRuntime members that race at N=2 (mTalkerLogits,
+// mTalkerHiddenStatesBuffer, mCodecHiddensBuffer-already-fixed,
+// mCodePredictor*, etc.). The N=2 probe with only C5 (Code2Wav
+// mutex) still crashed inside StatefulCode2WavRunner::reset, which
+// is a downstream symptom — runtime scratch races corrupt the
+// codes BEFORE Code2Wav runs, then Code2Wav's allocator returns
+// already-poisoned memory. Until C2/C3/C4 lands the proper per-slot
+// solution, serialize the whole runtime path at the worker.
+std::mutex runtimeMutex;
+
 // [Phase B C5] Code2Wav serialization — empirically required at
 // N=2 even with per-slot Code2Wav runners (Phase 3b-B-4 part-2).
 // The crash signature was:
@@ -1010,11 +1023,12 @@ int main(int argc, char** argv)
                         if (!statefulCode2wavRunners[c2wSlot])
                         {
                             logMemTag("worker_before_stateful_code2wav");
-                            {
-                                std::lock_guard<std::mutex> c2wLock(code2WavMutex);
-                                statefulCode2wavRunners[c2wSlot]
-                                    = std::make_unique<StatefulCode2WavRunner>(statefulCode2WavEngineDir, c2wStream);
-                            }
+                            // [Phase B C5b probe] runtime mutex (upstream) prevents
+                            // the upstream corruption that was crashing Code2Wav.
+                            // Per-slot runners should now be safe on their own —
+                            // no C5 lock needed here.
+                            statefulCode2wavRunners[c2wSlot]
+                                = std::make_unique<StatefulCode2WavRunner>(statefulCode2WavEngineDir, c2wStream);
                             logMemTag("worker_after_stateful_code2wav");
                         }
                     }
@@ -1024,11 +1038,9 @@ int main(int argc, char** argv)
                     auto const chunkStart = std::chrono::steady_clock::now();
                     logMemTag(isFinal ? "worker_before_stateful_code2wav_final_chunk"
                                       : "worker_before_stateful_code2wav_chunk");
-                    std::vector<float> samples;
-                    {
-                        std::lock_guard<std::mutex> c2wLock(code2WavMutex);
-                        samples = synthesizeStatefulChunk(runner, chunkCodes, isFinal, c2wStream);
-                    }
+                    // [Phase B C5b probe] no C5 lock — upstream runtime mutex
+                    // prevents corruption; per-slot runners are safe.
+                    auto samples = synthesizeStatefulChunk(runner, chunkCodes, isFinal, c2wStream);
                     auto const chunkEnd = std::chrono::steady_clock::now();
                     logMemTag(isFinal ? "worker_after_stateful_code2wav_final_chunk"
                                       : "worker_after_stateful_code2wav_chunk");
@@ -1115,9 +1127,8 @@ int main(int argc, char** argv)
             std::chrono::steady_clock::time_point genEnd{};
             if (statefulCode2Wav && statefulCode2wavRunners[c2wSlot])
             {
-                // [Phase B C5] Worker-level mutex around reset(): per-slot
-                // theory was insufficient at N=2 (state.read illegal access).
-                std::lock_guard<std::mutex> c2wLock(code2WavMutex);
+                // [Phase B C5b probe] no C5 lock — upstream runtime mutex
+                // prevents corruption; per-slot reset is safe.
                 statefulCode2wavRunners[c2wSlot]->reset(c2wStream);
             }
             if (streamOutput && asyncCode2Wav)
@@ -1246,7 +1257,10 @@ int main(int argc, char** argv)
                     streamCv.notify_one();
                 };
 
-                ok = ttsRuntime->handleAudioGeneration(request, talkerResponse, stream, asyncFrameCallback);
+                {
+                    std::lock_guard<std::mutex> runtimeLock(runtimeMutex);
+                    ok = ttsRuntime->handleAudioGeneration(request, talkerResponse, stream, asyncFrameCallback);
+                }
                 genEnd = std::chrono::steady_clock::now();
                 {
                     std::lock_guard<std::mutex> lock(streamMutex);
@@ -1268,8 +1282,11 @@ int main(int argc, char** argv)
                         emitChunk(false);
                     }
                 };
-                ok = streamOutput ? ttsRuntime->handleAudioGeneration(request, talkerResponse, stream, frameCallback)
-                                  : ttsRuntime->handleAudioGeneration(request, talkerResponse, stream);
+                {
+                    std::lock_guard<std::mutex> runtimeLock(runtimeMutex);
+                    ok = streamOutput ? ttsRuntime->handleAudioGeneration(request, talkerResponse, stream, frameCallback)
+                                      : ttsRuntime->handleAudioGeneration(request, talkerResponse, stream);
+                }
                 genEnd = std::chrono::steady_clock::now();
                 if (streamOutput)
                 {
