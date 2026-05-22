@@ -306,6 +306,31 @@ public:
         // Decode-loop state
         int32_t seqLen{0};
         int32_t parity{0};
+
+        // ===================================================================
+        // [Phase B Option B] Per-slot pre-allocated scratch tensors that
+        // were previously held in `TalkerLocal` and re-allocated on every
+        // `handleAudioGeneration` call. Moving them to the slot pool
+        // eliminates the CUDA allocator-mutex contention that limited N>1
+        // throughput. Lifetimes are tied to the slot, which is in turn
+        // owned by the engine's slot pool, so they survive across requests
+        // and slot reuse simply overwrites the contents.
+        // ===================================================================
+        rt::Tensor thinkerEmbedBuffer;            //!< [maxSeqLen, thinkerHiddenSize] half
+        rt::Tensor gpuTokenIdsBuffer;             //!< [1, maxSeqLen] int32
+        rt::Tensor mlpWorkspace;                  //!< [maxSeqLen, thinkerHiddenSize] half
+        rt::Tensor projectedBuffer;               //!< [maxSeqLen, talkerHiddenSize] half
+        rt::Tensor talkerInputEmbeds;             //!< [maxSeqLen, talkerHiddenSize] (mTalkerInputEmbedsDataType)
+        rt::Tensor speakerEmbedding;              //!< [talkerHiddenSize] half
+        rt::Tensor talkerLogits;                  //!< [1, talkerVocabSize] float
+        rt::Tensor talkerSelectedIndices;         //!< [1, 1] int32
+        rt::Tensor seenCodecTokensBuf;            //!< [maxKVCacheCapacity] int32
+        rt::Tensor talkerHiddenStatesBuffer;      //!< [1, maxSeqLen, talkerHiddenSize] (mTalkerHiddenStatesDataType)
+        rt::Tensor talkerLastHidden;              //!< [1, talkerHiddenSize] (mTalkerHiddenStatesDataType)
+        rt::Tensor residualEmbedBuffer;           //!< [1, 1, talkerHiddenSize] (mResidualEmbedDataType)
+        rt::Tensor codecHiddensBuffer;            //!< [1, 16, talkerHiddenSize] half (was C1 per-request local)
+        int32_t trailingTextLen{0};
+        std::vector<float> hostProjectedBuffer;
     };
 
     struct CodePredictorSlot
@@ -339,6 +364,21 @@ public:
         // policy the engine uses today.
         std::mt19937 rng;
         uint64_t gpuSamplingOffset{0};//!< Philox counter for GPU top-k/top-p path
+
+        // ===================================================================
+        // [Phase B Option B] Per-slot pre-allocated CodePredictor scratch
+        // tensors that were previously held in `CodePredictorLocal` and
+        // re-allocated per call. See TalkerSlot for rationale.
+        // ===================================================================
+        rt::Tensor codePredictorPrefillInput;         //!< [1, 2, codePredictorHiddenSize] half
+        rt::Tensor codePredictorCodecIds;             //!< [1, 1] int32
+        rt::Tensor codePredictorCodecEmbed;           //!< [1, 1, codePredictorHiddenSize] half
+        rt::Tensor rawCodecEmbed;                     //!< [1, 1, talkerHiddenSize] half
+        rt::Tensor smallToMtpProjectedHidden;         //!< [1, codePredictorHiddenSize] half
+        rt::Tensor codePredictorLogits;               //!< [1, codebookSize] float
+        std::vector<rt::Tensor> codePredictorLogitsPerHead; //!< 15 x [1, codebookSize] float
+        rt::Tensor codePredictorHiddenStatesBuffer;   //!< [1, 16, codePredictorHiddenSize] half
+        rt::Tensor codePredictorSelectedIndices;      //!< [1, 1] int32
     };
 
     //! [Phase 3a] Allocate a fully-sized Talker slot bound to the supplied
@@ -355,62 +395,21 @@ private:
     class Qwen3TTSCodePredictorEngine;
     class Qwen3TTSTalkerEngine;
 
-    // ===================================================================
-    // [Phase B C2/C3/C4] Per-request local state for handleAudioGeneration.
-    //
-    // Bundles every scratch tensor / counter / host buffer that was
-    // previously held as a runtime-global member but is only meaningful
-    // within a single audio generation request. Moving these to a stack
-    // local inside `handleAudioGeneration` removes the cross-request
-    // races flagged in docs/specs/tts-n2-shared-tensor-audit.md §1 and
-    // permits the worker to drop the global runtime mutex.
-    //
-    // The corresponding `m*` declarations are intentionally retained
-    // below because `captureDecodingCUDAGraph` (init-time path) still
-    // refers to them; those legacy paths are gated by
-    // `!mQwen3TTSTalkerEngine` / `!mUseQwen3TTSCodePredictorEngine` and
-    // are not exercised in the N=2 production configuration.
-    // ===================================================================
-    struct TalkerLocal
-    {
-        rt::Tensor thinkerEmbedBuffer;
-        rt::Tensor gpuTokenIdsBuffer;
-        rt::Tensor mlpWorkspace;
-        rt::Tensor projectedBuffer;
-        rt::Tensor talkerInputEmbeds;
-        rt::Tensor speakerEmbedding;
-        rt::Tensor talkerLogits;
-        rt::Tensor talkerSelectedIndices;
-        rt::Tensor seenCodecTokensBuf;
-        rt::Tensor talkerHiddenStatesBuffer;
-        rt::Tensor talkerLastHidden;
-        rt::Tensor residualEmbedBuffer;
-        int32_t trailingTextLen{0};
-        std::vector<float> hostProjectedBuffer;
-    };
-
-    struct CodePredictorLocal
-    {
-        rt::Tensor codePredictorPrefillInput;
-        rt::Tensor codePredictorCodecIds;
-        rt::Tensor codePredictorCodecEmbed;
-        rt::Tensor rawCodecEmbed;
-        rt::Tensor smallToMtpProjectedHidden;
-        // [Phase B C2 fix] These were originally kept runtime-global on the
-        // theory that they were legacy-CP only. In fact the native CP frame
-        // loop (runCodePredictorGenerationForFrame / executeCodePredictorDecodingStep)
-        // writes them on every decode step — so they race at N=2 and corrupt
-        // CUDA state, surfacing as cudaMemsetAsync(state.read) errors downstream
-        // in Code2Wav.
-        rt::Tensor codePredictorLogits;
-        std::vector<rt::Tensor> codePredictorLogitsPerHead;
-        rt::Tensor codePredictorHiddenStatesBuffer;
-        rt::Tensor codePredictorSelectedIndices;
-    };
+    // [Phase B Option B] TalkerLocal / CodePredictorLocal were removed and
+    // their fields folded into TalkerSlot / CodePredictorSlot above. The
+    // helper functions now take a slot reference and the slot's own
+    // pre-allocated tensors are reused across requests, eliminating the
+    // per-call GPU allocation pressure that limited N>1 throughput.
 
     // ========== Internal Methods ==========
 
     void initializeTTSEmbeddings(cudaStream_t stream);
+
+    //! [Phase B Option B] Populate per-slot scratch tensors on every slot
+    //! eagerly pre-allocated by the engine pools. Must run after engines
+    //! exist AND mTalkerConfig / m*DataType are finalized. Called once at
+    //! the end of the runtime ctor.
+    void initializeSlotScratchTensors();
 
     bool executeTalkerPrefillStep(
         rt::Tensor const& inputEmbeds, rt::Tensor& outputLogits, rt::Tensor& outputHiddenStates, cudaStream_t stream);
@@ -420,13 +419,13 @@ private:
 
     bool runCodePredictorGenerationForFrame(int32_t codecToken, rt::Tensor const& talkerHiddenState,
         SamplingParams const& samplingParams, std::vector<int32_t>& outputCodes,
-        rt::Tensor& codecHiddensBuffer, TalkerLocal& tlocal, CodePredictorLocal& cplocal, cudaStream_t stream);
+        rt::Tensor& codecHiddensBuffer, TalkerSlot& tslot, CodePredictorSlot& cpSlot, cudaStream_t stream);
 
     bool computeResidualConnection(std::vector<int32_t> const& codes, rt::Tensor& outputResidual, int32_t frameIdx,
-        rt::Tensor const& codecHiddensBuffer, TalkerLocal& tlocal, cudaStream_t stream);
+        rt::Tensor const& codecHiddensBuffer, TalkerSlot& tslot, cudaStream_t stream);
     bool computeResidualConnectionHost(
         std::vector<int32_t> const& codes, rt::Tensor& outputResidual, int32_t frameIdx,
-        TalkerLocal& tlocal, cudaStream_t stream);
+        TalkerSlot& tslot, cudaStream_t stream);
 
     bool extractTalkerLastHidden(
         rt::Tensor const& talkerHiddenStates, rt::Tensor& outputLastHidden, cudaStream_t stream);
@@ -634,16 +633,16 @@ private:
      */
     bool projectToTalkerInput(rt::Tensor const& thinkerEmbed, int32_t languageId, int32_t speakerId,
         std::vector<float> const& speakerEmbedding, rt::Tensor& output, int64_t& outputSeqLen,
-        TalkerLocal& tlocal, cudaStream_t stream);
+        TalkerSlot& tslot, cudaStream_t stream);
     bool projectToTalkerInputHost(rt::Tensor const& thinkerEmbed, int32_t languageId, int32_t speakerId,
         std::vector<float> const& speakerEmbedding, rt::Tensor& output, int64_t& outputSeqLen,
-        TalkerLocal& tlocal, cudaStream_t stream);
+        TalkerSlot& tslot, cudaStream_t stream);
 
     //! Embed token IDs, run MLP projection, and reshape buffers ready for Talker prefill.
-    //! Populates tlocal.talkerInputEmbeds and tlocal.talkerHiddenStatesBuffer as side effects.
+    //! Populates tslot.talkerInputEmbeds and tslot.talkerHiddenStatesBuffer as side effects.
     //! \param[out] outSeqLen  seqLen + 2 (non-streaming prefill length)
     bool prepareTalkerInput(std::vector<int32_t> const& textTokenIds, TalkerGenerationRequest const& request,
-        int64_t& outSeqLen, TalkerLocal& tlocal, cudaStream_t stream);
+        int64_t& outSeqLen, TalkerSlot& tslot, cudaStream_t stream);
 
     /*!
      * @brief Execute CodePredictor prefill step using CUDA Graph
@@ -677,7 +676,7 @@ private:
      */
     bool executeCodePredictorDecodingStep(int32_t tokenId, int32_t embeddingTableIndex, int32_t generationStep,
         rt::Tensor& outputLogits, rt::Tensor& outputHiddenStates, rt::Tensor& codecHiddensBuffer,
-        CodePredictorLocal& cplocal, cudaStream_t stream);
+        CodePredictorSlot& cpSlot, cudaStream_t stream);
 
     /*!
      * @brief Load Talker weights from safetensors files
