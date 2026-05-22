@@ -466,6 +466,23 @@ std::mutex coutMutex;
 std::mutex cancelMapMu;
 std::unordered_map<std::string, std::atomic<bool>*> cancelMap;
 
+// [Phase B C5] Code2Wav serialization — empirically required at
+// N=2 even with per-slot Code2Wav runners (Phase 3b-B-4 part-2).
+// The crash signature was:
+//   CUDA runtime error in cudaMemsetAsync(state.read.rawPointer(),
+//   ...) an illegal memory access was encountered
+//   CUDA runtime error in cudaMemcpyAsync(mInputCodesDevice...) ditto
+// observed in StatefulCode2WavRunner::reset / generateChunk when two
+// requests reach the worker concurrently. Per-slot runners theory
+// said this should be safe; reality says otherwise. Until per-instance
+// state buffer ownership is fully fixed (see
+// docs/specs/tts-n2-phase-b-patches.md §5), serialize at the worker
+// level around all Code2Wav GPU ops. Note that Code2Wav runs AFTER
+// all token generation completes, so slow-client TTFA is driven by
+// the first audio chunk emitted before this contention point —
+// throughput cost is tolerable.
+std::mutex code2WavMutex;
+
 // Phase 3b-B-4 part-2: Code2Wav runners are now per-slot (mirroring the
 // engine SlotPool capacity). Each in-flight request acquires a Code2Wav
 // slot index from Code2WavSlotPool below and uses the matching per-slot
@@ -993,8 +1010,11 @@ int main(int argc, char** argv)
                         if (!statefulCode2wavRunners[c2wSlot])
                         {
                             logMemTag("worker_before_stateful_code2wav");
-                            statefulCode2wavRunners[c2wSlot]
-                                = std::make_unique<StatefulCode2WavRunner>(statefulCode2WavEngineDir, c2wStream);
+                            {
+                                std::lock_guard<std::mutex> c2wLock(code2WavMutex);
+                                statefulCode2wavRunners[c2wSlot]
+                                    = std::make_unique<StatefulCode2WavRunner>(statefulCode2WavEngineDir, c2wStream);
+                            }
                             logMemTag("worker_after_stateful_code2wav");
                         }
                     }
@@ -1004,7 +1024,11 @@ int main(int argc, char** argv)
                     auto const chunkStart = std::chrono::steady_clock::now();
                     logMemTag(isFinal ? "worker_before_stateful_code2wav_final_chunk"
                                       : "worker_before_stateful_code2wav_chunk");
-                    auto samples = synthesizeStatefulChunk(runner, chunkCodes, isFinal, c2wStream);
+                    std::vector<float> samples;
+                    {
+                        std::lock_guard<std::mutex> c2wLock(code2WavMutex);
+                        samples = synthesizeStatefulChunk(runner, chunkCodes, isFinal, c2wStream);
+                    }
                     auto const chunkEnd = std::chrono::steady_clock::now();
                     logMemTag(isFinal ? "worker_after_stateful_code2wav_final_chunk"
                                       : "worker_after_stateful_code2wav_chunk");
@@ -1091,8 +1115,9 @@ int main(int argc, char** argv)
             std::chrono::steady_clock::time_point genEnd{};
             if (statefulCode2Wav && statefulCode2wavRunners[c2wSlot])
             {
-                // Phase 3b-B-4 part-2: per-slot reset — no cross-slot
-                // sharing, no mutex required.
+                // [Phase B C5] Worker-level mutex around reset(): per-slot
+                // theory was insufficient at N=2 (state.read illegal access).
+                std::lock_guard<std::mutex> c2wLock(code2WavMutex);
                 statefulCode2wavRunners[c2wSlot]->reset(c2wStream);
             }
             if (streamOutput && asyncCode2Wav)
