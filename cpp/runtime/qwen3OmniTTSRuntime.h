@@ -26,6 +26,7 @@
 #include <filesystem>
 #include <functional>
 #include <memory>
+#include <random>
 #include <string>
 #include <unordered_map>
 #include <utility>
@@ -252,6 +253,103 @@ public:
      */
     std::pair<std::unique_ptr<nvinfer1::IExecutionContext>, std::unique_ptr<nvinfer1::IExecutionContext>>
     createCodePredictorExecutionContextPair();
+
+    // ===================================================================
+    // [Phase 3a] Per-slot state ownership
+    //
+    // TalkerSlot / CodePredictorSlot wrap every piece of per-request mutable
+    // state previously held on the engine sub-classes (KV double-buffers, IO
+    // scratch tensors, sampling RNG, attention mask, prompt KV cache, etc.).
+    // The slot owns its own CUDA stream (borrowed reference) and execution
+    // context(s). The engine globals stay in place as the default path —
+    // every engine method now accepts an optional Slot*; when nullptr it
+    // falls back to engine members and behavior is byte-identical to Phase 2
+    // (N=1 default path).
+    //
+    // Phase 3b (out of scope here) will introduce a C++ Scheduler that holds
+    // a pool of these slots, one per concurrent request, and dispatches into
+    // the engine methods with non-null Slot* arguments.
+    //
+    // Storage is held in rt::Tensor (UINT8 byte buffer with size baked in)
+    // rather than the engine's private nested DeviceBuffer so that the slot
+    // types remain fully visible in the header without leaking engine
+    // internals.
+    // ===================================================================
+    struct TalkerSlot
+    {
+        cudaStream_t stream{nullptr};                       //!< borrowed
+        // Contexts are owned by the unique_ptrs below; callers should
+        // dereference those (via .get()) rather than caching a raw pointer.
+        // Codex round-3 review (Phase 3a) explicitly removed the public raw
+        // pointer mirrors to avoid silent dangling when the slot is moved
+        // or destroyed.
+        std::unique_ptr<nvinfer1::IExecutionContext> prefillCtxOwned;
+        std::unique_ptr<nvinfer1::IExecutionContext> decodeCtxOwned;
+        // Per-call IO scratch (byte buffers; sizes match the engine's mDevice* members)
+        rt::Tensor deviceEmbeds;
+        rt::Tensor deviceLogits;
+        rt::Tensor deviceHidden;
+        rt::Tensor devicePositionIds;
+        rt::Tensor deviceAttentionMask;
+        // KV double-buffers (2 * numDecoderLayers entries each)
+        std::vector<rt::Tensor> kvA;
+        std::vector<rt::Tensor> kvB;
+        // Prompt-KV cache (optional, lazy-allocated on first hit/store)
+        std::vector<rt::Tensor> promptKVs;
+        rt::Tensor promptLogits;
+        rt::Tensor promptHidden;
+        size_t promptKVBytes{0};
+        size_t promptHiddenBytes{0};
+        bool promptCacheValid{false};
+        int32_t promptCacheLen{0};
+        uint64_t promptCacheKey{0};
+        // Decode-loop state
+        int32_t seqLen{0};
+        int32_t parity{0};
+    };
+
+    struct CodePredictorSlot
+    {
+        cudaStream_t stream{nullptr};                      //!< borrowed
+        // Contexts are owned by the unique_ptrs below; callers should
+        // dereference those rather than caching a raw pointer (see
+        // TalkerSlot comment for the rationale).
+        std::unique_ptr<nvinfer1::IExecutionContext> prefillCtxOwned;
+        std::unique_ptr<nvinfer1::IExecutionContext> decodeCtxOwned;
+        // Per-call IO scratch
+        rt::Tensor deviceEmbeds;
+        rt::Tensor deviceLogits;
+        rt::Tensor deviceCachePosition;
+        rt::Tensor deviceSelectedTokens;
+        rt::Tensor deviceGenStep;
+        rt::Tensor devicePastLength;
+        rt::Tensor deviceSamplingWorkspace; //!< only sized when GPU sampling enabled on parent engine
+        // KV double-buffers (2 * numLayers each)
+        std::vector<rt::Tensor> kvA;
+        std::vector<rt::Tensor> kvB;
+        // Host-side sampling scratch (mirrors engine's mSample* members)
+        std::vector<float> sampleLogits;
+        std::vector<uint16_t> sampleRaw;
+        std::vector<std::pair<float, int32_t>> sampleVals;
+        std::vector<double> sampleProbs;
+        // Full std::mt19937 state (not just a seed). The engine mutates the
+        // mt19937 in-place during sampling (cpp ~:1484, ~:1525), so a 64-bit
+        // seed is NOT a drop-in replacement — codex round-3 review caught
+        // this gap. Initialize via the slot factory using the same seed
+        // policy the engine uses today.
+        std::mt19937 rng;
+        uint64_t gpuSamplingOffset{0};//!< Philox counter for GPU top-k/top-p path
+    };
+
+    //! [Phase 3a] Allocate a fully-sized Talker slot bound to the supplied
+    //! stream. Stream is borrowed (owner outlives the slot). Returns nullptr
+    //! if the explicit-KV Talker engine is not loaded.
+    std::unique_ptr<TalkerSlot> createTalkerSlot(cudaStream_t stream);
+
+    //! [Phase 3a] Allocate a fully-sized CodePredictor slot bound to the
+    //! supplied stream. Stream is borrowed. Returns nullptr if the native
+    //! Qwen3-TTS CP engine is not enabled.
+    std::unique_ptr<CodePredictorSlot> createCodePredictorSlot(cudaStream_t stream);
 
 private:
     class Qwen3TTSCodePredictorEngine;
