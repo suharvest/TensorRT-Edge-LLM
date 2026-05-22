@@ -1096,8 +1096,19 @@ private:
         // entire CP generate frame. Every helper call below forwards `s` so KV memset,
         // logits copy, sampling kernels, and TRT enqueueV3 all share one ordering domain.
         cudaStream_t const s = (stream != nullptr) ? stream : mStream;
-        nvinfer1::IExecutionContext* prefill = (prefillCtxOverride != nullptr) ? prefillCtxOverride : mPrefillContext.get();
-        nvinfer1::IExecutionContext* decode = (decodeCtxOverride != nullptr) ? decodeCtxOverride : mDecodeContext.get();
+        // [Phase B C6] When a slot is provided, prefer the slot's own owned TRT
+        // execution contexts. The engine-global mPrefillContext/mDecodeContext
+        // mutate per enqueueV3 (input shapes, tensor address bindings, etc.)
+        // and CANNOT be shared by two concurrent threads — that was the
+        // smoking-gun race causing cudaMemsetAsync(state.read.rawPointer())
+        // illegal-access after 2-3 N=2 bursts. Override params kept for
+        // backward compat (e.g. capture path); slot has highest priority.
+        nvinfer1::IExecutionContext* prefill = (prefillCtxOverride != nullptr)
+            ? prefillCtxOverride
+            : ((slot != nullptr && slot->prefillCtxOwned) ? slot->prefillCtxOwned.get() : mPrefillContext.get());
+        nvinfer1::IExecutionContext* decode = (decodeCtxOverride != nullptr)
+            ? decodeCtxOverride
+            : ((slot != nullptr && slot->decodeCtxOwned) ? slot->decodeCtxOwned.get() : mDecodeContext.get());
         // Phase 3a Iter2: when slot != nullptr, route mutable per-request state through
         // the slot's owned buffers instead of the engine globals. At N=1 callers pass
         // slot=nullptr and behavior is byte-identical to Phase 2. The slot's KV pair
@@ -2325,9 +2336,13 @@ public:
         // At slot == nullptr behavior is byte-identical to Phase 2. mDeviceDummyKV
         // remains engine-shared (16-byte dummy used only as a zero-length placeholder).
         cudaStream_t const s = (stream != nullptr) ? stream : mStream;
+        // [Phase B C6] Slot-owned prefill ctx when slot provided. See companion
+        // change in CP::generatePreparedInputs for rationale.
         nvinfer1::IExecutionContext* ctx = (ctxOverride != nullptr)
             ? ctxOverride
-            : (mHasDualProfiles ? mPrefillContext.get() : mDecodeContext.get());
+            : ((slot != nullptr && slot->prefillCtxOwned)
+                ? slot->prefillCtxOwned.get()
+                : (mHasDualProfiles ? mPrefillContext.get() : mDecodeContext.get()));
         int32_t& seqLenRef = (slot != nullptr) ? slot->seqLen : mSeqLen;
         int32_t& parity = (slot != nullptr) ? slot->parity : mParity;
         void* const deviceEmbedsPtr = (slot != nullptr) ? slot->deviceEmbeds.rawPointer() : mDeviceEmbeds.get();
@@ -2489,8 +2504,11 @@ public:
         }
 
         // Phase 2: resolve per-invocation stream and execution context, falling back to defaults.
+        // [Phase B C6] Slot-owned decode ctx when slot provided.
         cudaStream_t const s = (stream != nullptr) ? stream : mStream;
-        nvinfer1::IExecutionContext* ctx = (ctxOverride != nullptr) ? ctxOverride : mDecodeContext.get();
+        nvinfer1::IExecutionContext* ctx = (ctxOverride != nullptr)
+            ? ctxOverride
+            : ((slot != nullptr && slot->decodeCtxOwned) ? slot->decodeCtxOwned.get() : mDecodeContext.get());
         void* const deviceEmbedsPtr = (slot != nullptr) ? slot->deviceEmbeds.rawPointer() : mDeviceEmbeds.get();
         void* const deviceLogitsPtr = (slot != nullptr) ? slot->deviceLogits.rawPointer() : mDeviceLogits.get();
         void* const deviceHiddenPtr = (slot != nullptr) ? slot->deviceHidden.rawPointer() : mDeviceHidden.get();
