@@ -882,6 +882,26 @@ int main(int argc, char** argv)
             }
         }
         cudaStream_t const c2wStream = code2wavStreams[c2wSlot];
+
+        // [Phase B C7] Per-request CUDA stream for the talker + CP work.
+        // The startup-global `stream` is shared across all dispatch threads;
+        // CUDA serializes ops on a single stream, so two concurrent
+        // handleAudioGeneration calls were effectively running in lockstep
+        // on the GPU even with per-slot TRT contexts. Give each request its
+        // own dedicated stream and pass it to handleAudioGeneration so the
+        // GPU can actually overlap kernels between the two requests.
+        cudaStream_t reqStream{};
+        CUDA_CHECK(cudaStreamCreate(&reqStream));
+        struct StreamGuard {
+            cudaStream_t s;
+            ~StreamGuard() {
+                if (s) {
+                    cudaStreamSynchronize(s);
+                    cudaStreamDestroy(s);
+                }
+            }
+        } reqStreamGuard{reqStream};
+
         try
         {
             Json item = Json::parse(line);
@@ -1262,9 +1282,8 @@ int main(int argc, char** argv)
                 };
 
                 {
-                    // Per-request locals in handleAudioGeneration eliminate the
-                    // need for a global runtime mutex (Phase B C2/C3/C4).
-                    ok = ttsRuntime->handleAudioGeneration(request, talkerResponse, stream, asyncFrameCallback);
+                    // [Phase B C7] Per-request CUDA stream for true parallelism.
+                    ok = ttsRuntime->handleAudioGeneration(request, talkerResponse, reqStream, asyncFrameCallback);
                 }
                 genEnd = std::chrono::steady_clock::now();
                 {
@@ -1288,10 +1307,9 @@ int main(int argc, char** argv)
                     }
                 };
                 {
-                    // Per-request locals in handleAudioGeneration eliminate the
-                    // need for a global runtime mutex (Phase B C2/C3/C4).
-                    ok = streamOutput ? ttsRuntime->handleAudioGeneration(request, talkerResponse, stream, frameCallback)
-                                      : ttsRuntime->handleAudioGeneration(request, talkerResponse, stream);
+                    // [Phase B C7] Per-request CUDA stream for true parallelism.
+                    ok = streamOutput ? ttsRuntime->handleAudioGeneration(request, talkerResponse, reqStream, frameCallback)
+                                      : ttsRuntime->handleAudioGeneration(request, talkerResponse, reqStream);
                 }
                 genEnd = std::chrono::steady_clock::now();
                 if (streamOutput)
