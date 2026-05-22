@@ -466,18 +466,16 @@ std::mutex coutMutex;
 std::mutex cancelMapMu;
 std::unordered_map<std::string, std::atomic<bool>*> cancelMap;
 
-// [Phase B C5b — empirical probe] Worker-level mutex around the
-// entire ttsRuntime->handleAudioGeneration() call. Codex audit
-// (docs/specs/tts-n2-shared-tensor-audit.md §1) lists ~14 shared
-// mutable Qwen3OmniTTSRuntime members that race at N=2 (mTalkerLogits,
-// mTalkerHiddenStatesBuffer, mCodecHiddensBuffer-already-fixed,
-// mCodePredictor*, etc.). The N=2 probe with only C5 (Code2Wav
-// mutex) still crashed inside StatefulCode2WavRunner::reset, which
-// is a downstream symptom — runtime scratch races corrupt the
-// codes BEFORE Code2Wav runs, then Code2Wav's allocator returns
-// already-poisoned memory. Until C2/C3/C4 lands the proper per-slot
-// solution, serialize the whole runtime path at the worker.
-std::mutex runtimeMutex;
+// [Phase B C2/C3/C4 — final] The worker-level `runtimeMutex` that
+// previously serialized every `handleAudioGeneration` call has been
+// removed. Every shared runtime scratch tensor previously flagged by
+// the codex audit (docs/specs/tts-n2-shared-tensor-audit.md §1) is
+// now allocated per-request on the stack inside
+// `Qwen3OmniTTSRuntime::handleAudioGeneration` via TalkerLocal /
+// CodePredictorLocal (see qwen3OmniTTSRuntime.cpp). Concurrent N>=2
+// requests no longer race on those buffers. Code2Wav still uses its
+// own `code2WavMutex` below because that subsystem owns separate
+// CUDA state with its own concurrency rules.
 
 // [Phase B C5] Code2Wav serialization — empirically required at
 // N=2 even with per-slot Code2Wav runners (Phase 3b-B-4 part-2).
@@ -1258,7 +1256,8 @@ int main(int argc, char** argv)
                 };
 
                 {
-                    std::lock_guard<std::mutex> runtimeLock(runtimeMutex);
+                    // Per-request locals in handleAudioGeneration eliminate the
+                    // need for a global runtime mutex (Phase B C2/C3/C4).
                     ok = ttsRuntime->handleAudioGeneration(request, talkerResponse, stream, asyncFrameCallback);
                 }
                 genEnd = std::chrono::steady_clock::now();
@@ -1283,7 +1282,8 @@ int main(int argc, char** argv)
                     }
                 };
                 {
-                    std::lock_guard<std::mutex> runtimeLock(runtimeMutex);
+                    // Per-request locals in handleAudioGeneration eliminate the
+                    // need for a global runtime mutex (Phase B C2/C3/C4).
                     ok = streamOutput ? ttsRuntime->handleAudioGeneration(request, talkerResponse, stream, frameCallback)
                                       : ttsRuntime->handleAudioGeneration(request, talkerResponse, stream);
                 }
