@@ -13,6 +13,7 @@
 #include "runtime/qwen3OmniTTSRuntime.h"
 #include <algorithm>
 #include <array>
+#include <atomic>
 #include <chrono>
 #include <cmath>
 #include <condition_variable>
@@ -32,6 +33,7 @@
 #include <stdexcept>
 #include <string>
 #include <thread>
+#include <unordered_map>
 #include <vector>
 
 using namespace trt_edgellm;
@@ -447,6 +449,23 @@ std::vector<float> synthesizeStatefulChunk(
 // ("request_id") stay consistent across every emit site.
 std::mutex coutMutex;
 
+// [Cancel protocol step 1] Process-wide map of in-flight request_id ->
+// per-request atomic cancel flag. The flag's storage lives on the
+// worker thread's stack (inside handleRequest); the map holds a raw
+// pointer to it, valid only while the worker thread is active.
+// Lifetime guaranteed by RAII inside handleRequest (CancelMapEntry
+// registers in the lambda body and erases on scope exit, including
+// the exception path).
+//
+// Reads (worker thread checking its own flag) use acquire ordering;
+// writes (main/dispatcher thread setting another thread's flag on
+// "cancel" message) use release ordering. The map mutex serializes
+// insert / erase / lookup; once a worker thread has acquired the raw
+// atomic* via the map under the lock, subsequent flag stores/loads
+// go straight through the atomic without re-taking the map mutex.
+std::mutex cancelMapMu;
+std::unordered_map<std::string, std::atomic<bool>*> cancelMap;
+
 // Phase 3b-B-4 part-2: Code2Wav runners are now per-slot (mirroring the
 // engine SlotPool capacity). Each in-flight request acquires a Code2Wav
 // slot index from Code2WavSlotPool below and uses the matching per-slot
@@ -785,6 +804,36 @@ int main(int argc, char** argv)
         // fails before we extract "id", fall back to "__worker__".
         std::string id = "__worker__";
         std::string const& line = reqLine;
+        // [Cancel protocol step 1] Per-request cancel flag. Its address is
+        // published into cancelMap once we know the real request id (after
+        // JSON parse below). The dispatcher's main loop looks the address
+        // up by id when a {"type":"cancel"} message arrives, then stores
+        // true with release ordering. The chunk emit loop loads with
+        // acquire ordering between chunks; on observed-true it stops
+        // emitting further chunks and emits a "cancelled" terminal event
+        // in lieu of "done". Worst-case latency = one chunk boundary
+        // (~30-100 ms on Orin NX) — we never abort an in-flight CUDA
+        // kernel mid-enqueue.
+        std::atomic<bool> cancelled{false};
+        // RAII guard for cancelMap registration. Constructed AFTER the id
+        // is known (see below); destructor unconditionally erases the
+        // entry on every exit path including thrown exceptions. If the
+        // dispatcher never registered us (e.g. JSON parse threw before
+        // registration), mRegistered stays false and dtor is a no-op.
+        struct CancelMapEntry
+        {
+            std::string id;
+            bool registered{false};
+            ~CancelMapEntry()
+            {
+                if (!registered)
+                {
+                    return;
+                }
+                std::lock_guard<std::mutex> lk(cancelMapMu);
+                cancelMap.erase(id);
+            }
+        } cancelEntry;
         // Phase 3b-B-4 part-2: acquire a Code2Wav slot for the lifetime of
         // the request. The pool is sized to match dispatcher concurrency, so
         // at steady state acquire() never blocks; it only orders init when
@@ -813,6 +862,18 @@ int main(int argc, char** argv)
             {
                 id = "__worker__";
             }
+            // [Cancel protocol step 1] Publish our cancel flag now that
+            // we know the real request id. Done BEFORE entering the
+            // chunk emit loop so a cancel arriving milliseconds after
+            // the request line can still race in and be observed at
+            // the first chunk boundary. cancelEntry's dtor erases the
+            // entry on EVERY exit path (normal, throw, or cancel).
+            {
+                std::lock_guard<std::mutex> lk(cancelMapMu);
+                cancelMap[id] = &cancelled;
+            }
+            cancelEntry.id = id;
+            cancelEntry.registered = true;
             bool const streamOutput = item.value("stream", false);
             bool const streamOnly = item.value("stream_only", false);
             bool const asyncCode2Wav = item.value("async_code2wav", false);
@@ -900,6 +961,19 @@ int main(int argc, char** argv)
             };
 
             auto emitChunk = [&](bool isFinal) {
+                // [Cancel protocol step 1] Cooperative cancel checkpoint.
+                // Placed at the START of every chunk emit, BEFORE any
+                // synthesizeStatefulChunk / synthesizeWindow call, so the
+                // previous chunk's CUDA work completes naturally but no
+                // new vocoder kernel is enqueued after cancel is observed.
+                // Acquire ordering pairs with the dispatcher's release
+                // store. On observed-true we skip emit; the outer
+                // generation loop will continue but its frameCallback
+                // invocations become no-ops here.
+                if (cancelled.load(std::memory_order_acquire))
+                {
+                    return;
+                }
                 int32_t const totalFrames = static_cast<int32_t>(streamedFrames.size());
                 if (totalFrames <= lastEmittedFrames)
                 {
@@ -1086,6 +1160,16 @@ int main(int argc, char** argv)
                                     streamedFrames, static_cast<size_t>(windowStart), static_cast<size_t>(emitUntil));
                             }
 
+                            // [Cancel protocol step 1] Cooperative cancel
+                            // checkpoint for the async Code2Wav path —
+                            // same semantics as emitChunk above. Checked
+                            // AFTER the streamCv wait and BEFORE the next
+                            // synthesizeWindow enqueue so the previous
+                            // chunk's kernels finish naturally.
+                            if (cancelled.load(std::memory_order_acquire))
+                            {
+                                return;
+                            }
                             auto const chunkStart = std::chrono::steady_clock::now();
                             // Phase 3b-B-4 part-2: per-slot async runner +
                             // its dedicated CUDA stream; no cross-request
@@ -1213,6 +1297,18 @@ int main(int argc, char** argv)
                             : 0.0},
                     {"total_ms", totalMs},
                     {"rtf", audioSeconds > 0.0 ? totalMs / 1000.0 / audioSeconds : 0.0}};
+                // [Cancel protocol step 1] If cancellation was observed
+                // at any point during streaming, emit a terminal
+                // "cancelled" event in lieu of "done". ok:true per spec
+                // §4.1 — cancel is a normal control-flow event, not an
+                // error; Python's _WorkerIO.request() must treat it as
+                // terminal-non-error.
+                if (cancelled.load(std::memory_order_acquire))
+                {
+                    emitEvent(id, "cancelled",
+                        Json{{"ok", true}, {"reason", "client_disconnect"}});
+                    return;
+                }
                 emitEvent(id, "done", std::move(response));
                 return;
             }
@@ -1268,6 +1364,21 @@ int main(int argc, char** argv)
             emitEvent(id, "error", std::move(response));
             return;
         }
+        // [Cancel protocol step 1] Same terminal-event swap as the
+        // streamOnly path above: if a cancel was observed during the
+        // full-waveform generation, emit "cancelled" in lieu of "done".
+        // Note: the full-waveform code path has no chunk-boundary
+        // check today (Code2Wav runs as a single call), so cancel can
+        // only take effect at the very end of generation. The chunk
+        // emit loop is the main observation point; this branch covers
+        // the (rare) race where cancel arrives after the last chunk
+        // but before the terminal emit.
+        if (cancelled.load(std::memory_order_acquire))
+        {
+            emitEvent(id, "cancelled",
+                Json{{"ok", true}, {"reason", "client_disconnect"}});
+            return;
+        }
         emitEvent(id, "done", std::move(response));
     };
 
@@ -1283,6 +1394,54 @@ int main(int argc, char** argv)
         if (line.empty())
         {
             continue;
+        }
+        // [Cancel protocol step 1] Parse the request type BEFORE waiting
+        // for capacity. At concurrency=1, the single in-flight request
+        // owns the only slot; if we waited for capacity before parsing,
+        // a cancel for that very request would block on workersCv until
+        // the request it's trying to cancel finishes — deadlock.
+        // Cancel messages bypass the capacity gate entirely: look up
+        // the request_id, set its atomic, continue. No worker thread
+        // is spawned for a cancel.
+        //
+        // Malformed JSON falls through to the legacy path (worker
+        // thread + handleRequest's try/catch surfaces the parse error
+        // as an "error" event with id="__worker__"). This preserves
+        // pre-cancel behaviour for protocol-violating clients.
+        try
+        {
+            Json const peek = Json::parse(line);
+            std::string const type = peek.value("type", "");
+            if (type == "cancel")
+            {
+                std::string const cancelId = peek.value("id", "");
+                if (!cancelId.empty())
+                {
+                    std::atomic<bool>* flag = nullptr;
+                    {
+                        std::lock_guard<std::mutex> lk(cancelMapMu);
+                        auto it = cancelMap.find(cancelId);
+                        if (it != cancelMap.end())
+                        {
+                            flag = it->second;
+                        }
+                    }
+                    if (flag != nullptr)
+                    {
+                        flag->store(true, std::memory_order_release);
+                    }
+                    // Unknown id (request already finished, or never
+                    // existed): silently drop. The spec §4.3 documents
+                    // this as a no-op so late-arriving cancels after
+                    // natural completion don't break anything.
+                }
+                continue;
+            }
+        }
+        catch (std::exception const&)
+        {
+            // Fall through to the worker-thread path; handleRequest
+            // will re-parse and emit a structured error event.
         }
         {
             std::unique_lock<std::mutex> lk(workersMu);
