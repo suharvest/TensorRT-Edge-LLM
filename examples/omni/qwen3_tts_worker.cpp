@@ -1021,10 +1021,13 @@ int main(int argc, char** argv)
                         if (!statefulCode2wavRunners[c2wSlot])
                         {
                             logMemTag("worker_before_stateful_code2wav");
-                            // [Phase B C5b probe] runtime mutex (upstream) prevents
-                            // the upstream corruption that was crashing Code2Wav.
-                            // Per-slot runners should now be safe on their own —
-                            // no C5 lock needed here.
+                            // [Phase B C5 re-added 2026-05-22] After C2/C3/C4 made
+                            // runtime truly per-call (real talker/CP parallelism),
+                            // Code2Wav per-slot runners STILL race on state.read
+                            // (cudaMemsetAsync illegal access after 3-4 N=2 rounds,
+                            // empirically observed). Re-add worker-level serialization
+                            // around all Code2Wav GPU ops.
+                            std::lock_guard<std::mutex> c2wLock(code2WavMutex);
                             statefulCode2wavRunners[c2wSlot]
                                 = std::make_unique<StatefulCode2WavRunner>(statefulCode2WavEngineDir, c2wStream);
                             logMemTag("worker_after_stateful_code2wav");
@@ -1036,9 +1039,12 @@ int main(int argc, char** argv)
                     auto const chunkStart = std::chrono::steady_clock::now();
                     logMemTag(isFinal ? "worker_before_stateful_code2wav_final_chunk"
                                       : "worker_before_stateful_code2wav_chunk");
-                    // [Phase B C5b probe] no C5 lock — upstream runtime mutex
-                    // prevents corruption; per-slot runners are safe.
-                    auto samples = synthesizeStatefulChunk(runner, chunkCodes, isFinal, c2wStream);
+                    // [Phase B C5 re-added 2026-05-22] serialize Code2Wav chunk gen.
+                    std::vector<float> samples;
+                    {
+                        std::lock_guard<std::mutex> c2wLock(code2WavMutex);
+                        samples = synthesizeStatefulChunk(runner, chunkCodes, isFinal, c2wStream);
+                    }
                     auto const chunkEnd = std::chrono::steady_clock::now();
                     logMemTag(isFinal ? "worker_after_stateful_code2wav_final_chunk"
                                       : "worker_after_stateful_code2wav_chunk");
@@ -1125,8 +1131,8 @@ int main(int argc, char** argv)
             std::chrono::steady_clock::time_point genEnd{};
             if (statefulCode2Wav && statefulCode2wavRunners[c2wSlot])
             {
-                // [Phase B C5b probe] no C5 lock — upstream runtime mutex
-                // prevents corruption; per-slot reset is safe.
+                // [Phase B C5 re-added 2026-05-22] serialize Code2Wav reset.
+                std::lock_guard<std::mutex> c2wLock(code2WavMutex);
                 statefulCode2wavRunners[c2wSlot]->reset(c2wStream);
             }
             if (streamOutput && asyncCode2Wav)

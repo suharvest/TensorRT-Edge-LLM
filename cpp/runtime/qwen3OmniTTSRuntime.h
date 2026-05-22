@@ -396,6 +396,16 @@ private:
         rt::Tensor codePredictorCodecEmbed;
         rt::Tensor rawCodecEmbed;
         rt::Tensor smallToMtpProjectedHidden;
+        // [Phase B C2 fix] These were originally kept runtime-global on the
+        // theory that they were legacy-CP only. In fact the native CP frame
+        // loop (runCodePredictorGenerationForFrame / executeCodePredictorDecodingStep)
+        // writes them on every decode step — so they race at N=2 and corrupt
+        // CUDA state, surfacing as cudaMemsetAsync(state.read) errors downstream
+        // in Code2Wav.
+        rt::Tensor codePredictorLogits;
+        std::vector<rt::Tensor> codePredictorLogitsPerHead;
+        rt::Tensor codePredictorHiddenStatesBuffer;
+        rt::Tensor codePredictorSelectedIndices;
     };
 
     // ========== Internal Methods ==========
@@ -413,10 +423,10 @@ private:
         rt::Tensor& codecHiddensBuffer, TalkerLocal& tlocal, CodePredictorLocal& cplocal, cudaStream_t stream);
 
     bool computeResidualConnection(std::vector<int32_t> const& codes, rt::Tensor& outputResidual, int32_t frameIdx,
-        rt::Tensor const& codecHiddensBuffer, TalkerLocal const& tlocal, cudaStream_t stream);
+        rt::Tensor const& codecHiddensBuffer, TalkerLocal& tlocal, cudaStream_t stream);
     bool computeResidualConnectionHost(
         std::vector<int32_t> const& codes, rt::Tensor& outputResidual, int32_t frameIdx,
-        TalkerLocal const& tlocal, cudaStream_t stream);
+        TalkerLocal& tlocal, cudaStream_t stream);
 
     bool extractTalkerLastHidden(
         rt::Tensor const& talkerHiddenStates, rt::Tensor& outputLastHidden, cudaStream_t stream);

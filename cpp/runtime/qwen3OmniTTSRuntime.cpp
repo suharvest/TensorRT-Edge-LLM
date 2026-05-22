@@ -4259,12 +4259,14 @@ bool Qwen3OmniTTSRuntime::executeCodePredictorDecodingStep(int32_t tokenId, int3
         // Graph path: lm_head_weight addresses were bound during capture and remain unchanged,
         // so setLMHeadWeights is unnecessary. Each graph is keyed by its per-head output buffer.
         if (!mCodePredictorRunner->executeVanillaDecodingStep(cplocal.codePredictorCodecEmbed,
-                mCodePredictorLogitsPerHead[lmHeadIdx], rt::OptionalOutputTensor{std::ref(outputHiddenStates)}, stream))
+                cplocal.codePredictorLogitsPerHead[lmHeadIdx],
+                rt::OptionalOutputTensor{std::ref(outputHiddenStates)}, stream))
         {
             LOG_ERROR("CodePredictor decoding step failed (graph path)");
             return false;
         }
-        CUDA_CHECK(cudaMemcpyAsync(outputLogits.rawPointer(), mCodePredictorLogitsPerHead[lmHeadIdx].rawPointer(),
+        CUDA_CHECK(cudaMemcpyAsync(outputLogits.rawPointer(),
+            cplocal.codePredictorLogitsPerHead[lmHeadIdx].rawPointer(),
             outputLogits.getMemoryCapacity(), cudaMemcpyDeviceToDevice, stream));
     }
     else
@@ -4480,6 +4482,21 @@ bool Qwen3OmniTTSRuntime::handleAudioGeneration(TalkerGenerationRequest const& r
             = rt::Tensor({1, 1, mTalkerConfig.talkerHiddenSize}, rt::DeviceType::kGPU, nvinfer1::DataType::kHALF);
         cplocal.smallToMtpProjectedHidden
             = rt::Tensor({1, mTalkerConfig.codePredictorHiddenSize}, rt::DeviceType::kGPU, nvinfer1::DataType::kHALF);
+        // [Phase B C2 fix 2026-05-22] CP output tensors — native CP path uses these
+        // every decode step; they MUST be per-request to avoid N=2 races.
+        cplocal.codePredictorLogits = rt::Tensor(
+            {1, mTalkerConfig.codebookSize}, rt::DeviceType::kGPU, nvinfer1::DataType::kFLOAT);
+        cplocal.codePredictorLogitsPerHead.resize(kNumRvqLayers);
+        for (int32_t i = 0; i < kNumRvqLayers; ++i)
+        {
+            cplocal.codePredictorLogitsPerHead[i] = rt::Tensor(
+                {1, mTalkerConfig.codebookSize}, rt::DeviceType::kGPU, nvinfer1::DataType::kFLOAT);
+        }
+        cplocal.codePredictorHiddenStatesBuffer = rt::Tensor(
+            {1, 16, mTalkerConfig.codePredictorHiddenSize}, rt::DeviceType::kGPU,
+            nvinfer1::DataType::kHALF, "codePredictorHiddenStatesBuffer");
+        cplocal.codePredictorSelectedIndices = rt::Tensor(
+            {1, 1}, rt::DeviceType::kGPU, nvinfer1::DataType::kINT32);
     }
 
     // Talker/CodePredictor sampling: use dedicated parameters (not shared with Thinker).
@@ -4979,19 +4996,20 @@ bool Qwen3OmniTTSRuntime::runCodePredictorGenerationForFrame(int32_t codecToken,
     CUDA_CHECK(cudaMemcpyAsync(static_cast<__half*>(cplocal.codePredictorPrefillInput.rawPointer()) + hiddenSize,
         cplocal.codePredictorCodecEmbed.rawPointer(), hiddenSize * sizeof(__half), cudaMemcpyDeviceToDevice, stream));
 
-    check::check(mCodePredictorHiddenStatesBuffer.reshape({1, 2, mTalkerConfig.codePredictorHiddenSize}),
+    check::check(cplocal.codePredictorHiddenStatesBuffer.reshape({1, 2, mTalkerConfig.codePredictorHiddenSize}),
         "Tensor reshape failed");
 
     // NOTE: CodePredictor ONNX outputs FP32 logits directly (lm_head + cast in ONNX)
     // generationStep=0 corresponds to code_1 (using lm_head_0)
     if (!executeCodePredictorPrefillStep(
-            cplocal.codePredictorPrefillInput, 0, mCodePredictorLogits, mCodePredictorHiddenStatesBuffer, stream))
+            cplocal.codePredictorPrefillInput, 0, cplocal.codePredictorLogits,
+            cplocal.codePredictorHiddenStatesBuffer, stream))
     {
         return false;
     }
 
     // Sample code_1
-    int32_t code = sampleLogitsCPU(mCodePredictorLogits, mTalkerConfig.codebookSize, samplingParams.topK,
+    int32_t code = sampleLogitsCPU(cplocal.codePredictorLogits, mTalkerConfig.codebookSize, samplingParams.topK,
         samplingParams.topP, samplingParams.temperature, false, -1, 0.0f, false, nullptr, 1.0f, predictorRng, stream);
     outputCodes.push_back(code); // code_1
 
@@ -5013,10 +5031,10 @@ bool Qwen3OmniTTSRuntime::runCodePredictorGenerationForFrame(int32_t codecToken,
     // ========== Decoding loop: generate active residual codes only ==========
     for (int step = 2; step <= activeGroups; ++step)
     {
-        check::check(mCodePredictorHiddenStatesBuffer.reshape({1, 1, mTalkerConfig.codePredictorHiddenSize}),
+        check::check(cplocal.codePredictorHiddenStatesBuffer.reshape({1, 1, mTalkerConfig.codePredictorHiddenSize}),
             "Tensor reshape failed");
 
-        rt::OptionalInputTensor prevHiddenOpt{std::ref(mCodePredictorHiddenStatesBuffer)};
+        rt::OptionalInputTensor prevHiddenOpt{std::ref(cplocal.codePredictorHiddenStatesBuffer)};
 
         // PyTorch generation_steps logic:
         //   - generation_steps=1: embed(code_1) with codec_embedding[0], output with lm_head[1] -> code_2
@@ -5027,15 +5045,15 @@ bool Qwen3OmniTTSRuntime::runCodePredictorGenerationForFrame(int32_t codecToken,
         int32_t const embeddingIdx = step - 2; // step=2->embed[0], step=3->embed[1], ..., step=15->embed[13]
         int32_t const lmHeadIdx = step - 1;    // step=2->lm_head[1], step=3->lm_head[2], ..., step=15->lm_head[14]
 
-        if (!executeCodePredictorDecodingStep(code, embeddingIdx, lmHeadIdx, mCodePredictorLogits,
-                mCodePredictorHiddenStatesBuffer, codecHiddensBuffer, cplocal, stream))
+        if (!executeCodePredictorDecodingStep(code, embeddingIdx, lmHeadIdx, cplocal.codePredictorLogits,
+                cplocal.codePredictorHiddenStatesBuffer, codecHiddensBuffer, cplocal, stream))
         {
             return false;
         }
 
         // Embedding is now saved inside executeCodePredictorDecodingStep before engine execution
 
-        code = sampleLogitsCPU(mCodePredictorLogits, mTalkerConfig.codebookSize, samplingParams.topK,
+        code = sampleLogitsCPU(cplocal.codePredictorLogits, mTalkerConfig.codebookSize, samplingParams.topK,
             samplingParams.topP, samplingParams.temperature, false, -1, 0.0f, false, nullptr, 1.0f, predictorRng,
             stream);
         outputCodes.push_back(code); // code_2 to code_activeGroups
@@ -5063,7 +5081,7 @@ bool Qwen3OmniTTSRuntime::runCodePredictorGenerationForFrame(int32_t codecToken,
 }
 
 bool Qwen3OmniTTSRuntime::computeResidualConnection(std::vector<int32_t> const& codes, rt::Tensor& outputResidual,
-    int32_t frameIdx, rt::Tensor const& codecHiddensBuffer, TalkerLocal const& tlocal, cudaStream_t stream)
+    int32_t frameIdx, rt::Tensor const& codecHiddensBuffer, TalkerLocal& tlocal, cudaStream_t stream)
 {
     NVTX_SCOPED_RANGE(nvtx_range, "TalkerRunner::computeResidualConnection", nvtx_colors::BLUE);
 
@@ -5109,7 +5127,7 @@ bool Qwen3OmniTTSRuntime::computeResidualConnection(std::vector<int32_t> const& 
 
 bool Qwen3OmniTTSRuntime::computeResidualConnectionHost(
     std::vector<int32_t> const& codes, rt::Tensor& outputResidual, int32_t frameIdx,
-    TalkerLocal const& tlocal, cudaStream_t stream)
+    TalkerLocal& tlocal, cudaStream_t stream)
 {
     int32_t const hiddenSize = mTalkerConfig.talkerHiddenSize;
     int32_t const codebookSize = mTalkerConfig.codebookSize;
