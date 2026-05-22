@@ -366,10 +366,11 @@ private:
         rt::Tensor const& inputEmbeds, rt::Tensor& outputLogits, rt::Tensor& outputHiddenStates, cudaStream_t stream);
 
     bool runCodePredictorGenerationForFrame(int32_t codecToken, rt::Tensor const& talkerHiddenState,
-        SamplingParams const& samplingParams, std::vector<int32_t>& outputCodes, cudaStream_t stream);
+        SamplingParams const& samplingParams, std::vector<int32_t>& outputCodes,
+        rt::Tensor& codecHiddensBuffer, cudaStream_t stream);
 
-    bool computeResidualConnection(
-        std::vector<int32_t> const& codes, rt::Tensor& outputResidual, int32_t frameIdx, cudaStream_t stream);
+    bool computeResidualConnection(std::vector<int32_t> const& codes, rt::Tensor& outputResidual, int32_t frameIdx,
+        rt::Tensor const& codecHiddensBuffer, cudaStream_t stream);
     bool computeResidualConnectionHost(
         std::vector<int32_t> const& codes, rt::Tensor& outputResidual, int32_t frameIdx, cudaStream_t stream);
 
@@ -544,8 +545,11 @@ private:
     nvinfer1::DataType mTalkerInputEmbedsDataType{nvinfer1::DataType::kHALF};
     nvinfer1::DataType mResidualEmbedDataType{nvinfer1::DataType::kHALF};
     nvinfer1::DataType mTalkerHiddenStatesDataType{nvinfer1::DataType::kHALF};
-    rt::Tensor
-        mCodecHiddensBuffer; //!< Buffer for codec hiddens [1, 16, talkerHiddenSize] (Talker's space, for residual)
+    // [Phase B C1] mCodecHiddensBuffer was moved out of the runtime-global state to
+    // per-request scope to avoid cross-request `cudaMemsetAsync` races at N>1. The
+    // buffer is now a local in `handleAudioGeneration` (passed by reference into
+    // CP/residual helpers). C2 will fold it back into `TalkerSlot::codecHiddensBuffer`
+    // once full slot-plumbing lands.
     std::vector<float> mHostTalkerEmbeddingTable;
     std::vector<float> mHostCodePredictorEmbeddingTables;
     std::vector<float> mHostTextFC1Weight;
@@ -616,7 +620,7 @@ private:
      * @return True on success, false on failure
      */
     bool executeCodePredictorDecodingStep(int32_t tokenId, int32_t embeddingTableIndex, int32_t generationStep,
-        rt::Tensor& outputLogits, rt::Tensor& outputHiddenStates, cudaStream_t stream);
+        rt::Tensor& outputLogits, rt::Tensor& outputHiddenStates, rt::Tensor& codecHiddensBuffer, cudaStream_t stream);
 
     /*!
      * @brief Load Talker weights from safetensors files
