@@ -471,10 +471,16 @@ private:
     //! Run CodePredictor for one frame of one batch element (batch=1 engine call internally).
     //! Called inside the per-batch loop of the decode frame.
     bool runCodePredictorGenerationForFrame(int32_t codecToken, rt::Tensor const& talkerHiddenState,
-        SamplingParams const& samplingParams, std::vector<int32_t>& outputCodes, cudaStream_t stream);
+        SamplingParams const& samplingParams, std::vector<int32_t>& outputCodes,
+        rt::Tensor& codecHiddensBuffer, cudaStream_t stream);
 
     //! Compute residual connection for one batch element.
+    //! [Phase B C1] codecHiddensBuffer now passed per-request (was global mCodecHiddensBuffer).
     bool computeResidualConnection(std::vector<int32_t> const& codes, rt::Tensor const* trailingTextHidden,
+        int32_t generationStep, rt::Tensor& outputResidual, rt::Tensor const& codecHiddensBuffer, cudaStream_t stream);
+
+    //! Host-side residual connection (no CUDA kernel). Uses HEAD streaming addend logic.
+    bool computeResidualConnectionHost(std::vector<int32_t> const& codes, rt::Tensor const* trailingTextHidden,
         int32_t generationStep, rt::Tensor& outputResidual, cudaStream_t stream);
 
     //! Extract last hidden state from Talker hidden states buffer for one batch element.
@@ -522,8 +528,8 @@ private:
     //!        after batched prefill with padding. Empty for single-batch callers.
     bool runTalkerGenerationLoop(std::vector<PerBatchTalkerState>& states, int32_t activeBatchSize, int32_t maxFrames,
         SamplingParams const& talkerSamplingParams, SamplingParams const& predictorSamplingParams,
-        float repetitionPenalty, std::vector<rt::Tensor const*> const& trailingTextHiddens, cudaStream_t stream,
-        std::vector<int64_t> const& prefillSeqLens = {});
+        float repetitionPenalty, std::vector<rt::Tensor const*> const& trailingTextHiddens,
+        rt::Tensor& codecHiddensBuffer, cudaStream_t stream, std::vector<int64_t> const& prefillSeqLens = {});
 
     /*!
      * @brief Run a single Talker decode frame (used by the Thinker-Talker streaming path).
@@ -732,7 +738,26 @@ private:
     rt::Tensor mTalkerHiddenStatesBuffer;        //!< Talker hidden states [maxBS, maxSeqLen, talkerHidden] FP16
     rt::Tensor mCodePredictorHiddenStatesBuffer; //!< CodePredictor hidden states [1, numCodesPerFrame, cpHidden] FP16
     rt::Tensor mTalkerLastHidden;                //!< Extracted last hidden [maxBS, talkerHidden] FP16
-    rt::Tensor mCodecHiddensBuffer;              //!< Codec hiddens [1, numCodesPerFrame, talkerHidden] FP16
+    // [Phase B C1] mCodecHiddensBuffer was moved out of the runtime-global state to
+    // per-request scope to avoid cross-request `cudaMemsetAsync` races at N>1. The
+    // buffer is now a local in `handleAudioGeneration` (passed by reference into
+    // CP/residual helpers). C2 will fold it back into `TalkerSlot::codecHiddensBuffer`
+    // once full slot-plumbing lands.
+
+    nvinfer1::DataType mTalkerInputEmbedsDataType{nvinfer1::DataType::kHALF};
+    nvinfer1::DataType mResidualEmbedDataType{nvinfer1::DataType::kHALF};
+    nvinfer1::DataType mTalkerHiddenStatesDataType{nvinfer1::DataType::kHALF};
+
+    std::vector<float> mHostTalkerEmbeddingTable;
+    std::vector<float> mHostCodePredictorEmbeddingTables;
+    std::vector<float> mHostTextFC1Weight;
+    std::vector<float> mHostTextFC1Bias;
+    std::vector<float> mHostTextFC2Weight;
+    std::vector<float> mHostTextFC2Bias;
+    std::vector<float> mHostProjectedBuffer;
+    std::vector<float> mHostTtsPadEmbed;
+    std::vector<float> mHostTtsBosEmbed;
+    std::vector<float> mHostTtsEosEmbed;
 
     cudaStream_t mStream{nullptr};                   //!< CUDA stream for operations
     metrics::MultimodalMetrics mMultimodalMetrics;   //!< Performance metrics for Talker pipeline (legacy)
@@ -795,7 +820,7 @@ private:
      * @return True on success, false on failure
      */
     bool executeCodePredictorDecodingStep(int32_t tokenId, int32_t embeddingTableIndex, int32_t generationStep,
-        rt::Tensor& outputLogits, rt::Tensor& outputHiddenStates, cudaStream_t stream);
+        rt::Tensor& outputLogits, rt::Tensor& outputHiddenStates, rt::Tensor& codecHiddensBuffer, cudaStream_t stream);
 
     /*!
      * @brief Load Talker weights from safetensors files

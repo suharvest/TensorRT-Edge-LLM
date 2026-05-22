@@ -2995,8 +2995,9 @@ bool Qwen3OmniTTSRuntime::allocateBuffer()
             rt::DeviceType::kGPU, nvinfer1::DataType::kHALF, "mCodePredictorHiddenStatesBuffer");
         mTalkerLastHidden = rt::Tensor(
             {maxBS, talkerHiddenSize}, rt::DeviceType::kGPU, nvinfer1::DataType::kHALF, "mTalkerLastHidden");
-        mCodecHiddensBuffer = rt::Tensor({1, mNumCodesPerFrame, mTalkerConfig.talkerHiddenSize}, rt::DeviceType::kGPU,
-            nvinfer1::DataType::kHALF, "mCodecHiddensBuffer");
+
+        // [Phase B C1] mCodecHiddensBuffer is now allocated per-request as a local
+        // in handleAudioGeneration / generation helpers. See header comment for rationale.
 
         // Trailing text hidden buffer: [maxBS * (maxSeqLen+1), H] — per-batch regions for Omni multi-batch
         mStreamingTrailingHidden = rt::Tensor({maxBS * (maxSeqLen + 1), talkerHiddenSize}, rt::DeviceType::kGPU,
@@ -3269,7 +3270,8 @@ bool Qwen3OmniTTSRuntime::executeCodePredictorPrefillStep(rt::Tensor const& code
 }
 
 bool Qwen3OmniTTSRuntime::executeCodePredictorDecodingStep(int32_t tokenId, int32_t embeddingTableIndex,
-    int32_t generationStep, rt::Tensor& outputLogits, rt::Tensor& outputHiddenStates, cudaStream_t stream)
+    int32_t generationStep, rt::Tensor& outputLogits, rt::Tensor& outputHiddenStates,
+    rt::Tensor& codecHiddensBuffer, cudaStream_t stream)
 {
     NVTX_SCOPED_RANGE(nvtx_range, "TalkerRunner::executeCodePredictorDecodingStep", nvtx_colors::ORANGE);
 
@@ -3282,12 +3284,12 @@ bool Qwen3OmniTTSRuntime::executeCodePredictorDecodingStep(int32_t tokenId, int3
     kernel::embeddingLookup(
         mCodePredictorCodecIds, mCodePredictorEmbeddingTables[embedIdx], std::nullopt, mRawCodecEmbed, stream);
 
-    // Save raw (2048-dim) embedding to mCodecHiddensBuffer for residual connection
+    // Save raw (2048-dim) embedding to codecHiddensBuffer for residual connection
     // Position mapping: generationStep 1->pos 1, 2->pos 2, ..., (mNumRvqLayers-1)->pos (mNumRvqLayers-1)
     if (generationStep >= 1 && generationStep <= mNumRvqLayers - 1)
     {
         int64_t const H = mTalkerConfig.talkerHiddenSize;
-        __half* dst = static_cast<__half*>(mCodecHiddensBuffer.rawPointer()) + generationStep * H;
+        __half* dst = static_cast<__half*>(codecHiddensBuffer.rawPointer()) + generationStep * H;
         CUDA_CHECK(
             cudaMemcpyAsync(dst, mRawCodecEmbed.rawPointer(), H * sizeof(__half), cudaMemcpyDeviceToDevice, stream));
     }
@@ -3454,6 +3456,15 @@ bool Qwen3OmniTTSRuntime::handleAudioGeneration(
     response.numFramesPerSample.clear();
     response.success = false;
 
+    // [Phase B C1] Per-request codec hiddens buffer for the residual connection.
+    // Previously this was a runtime-global member (`mCodecHiddensBuffer`) which
+    // races on `cudaMemsetAsync` when more than one request is in flight.
+    // Allocating per-call keeps the lifetime tied to the request so concurrent
+    // generations cannot collide. C2 folds this into `TalkerSlot` once full
+    // slot threading lands.
+    rt::Tensor codecHiddensBuffer({1, mNumCodesPerFrame, mTalkerConfig.talkerHiddenSize}, rt::DeviceType::kGPU,
+        nvinfer1::DataType::kHALF, "codecHiddensBuffer");
+
     // Sampling params from requests[0], applied uniformly (matches LLMInferenceSpecDecodeRuntime design)
     auto const& req0 = requests[0];
     float const talkerTemperature = (req0.talkerTemperature > 0) ? req0.talkerTemperature : 0.9f;
@@ -3523,7 +3534,7 @@ bool Qwen3OmniTTSRuntime::handleAudioGeneration(
 
     std::vector<rt::Tensor const*> trailingPtrs(activeBatchSize, nullptr);
     if (!runTalkerGenerationLoop(states, activeBatchSize, effectiveMaxFrames, talkerSamplingParams,
-            predictorSamplingParams, repetitionPenalty, trailingPtrs, stream))
+            predictorSamplingParams, repetitionPenalty, trailingPtrs, codecHiddensBuffer, stream))
     {
         return false;
     }
@@ -3557,6 +3568,10 @@ bool Qwen3OmniTTSRuntime::handleAudioGenerationFromThinker(
     response.batchRvqCodes.clear();
     response.numFramesPerSample.clear();
     response.success = false;
+
+    // [Phase B C1] Per-request codec hiddens buffer (see handleAudioGeneration for rationale).
+    rt::Tensor codecHiddensBuffer({1, mNumCodesPerFrame, mTalkerConfig.talkerHiddenSize}, rt::DeviceType::kGPU,
+        nvinfer1::DataType::kHALF, "codecHiddensBuffer");
 
     // Sampling params from requests[0], applied uniformly (matches LLMInferenceSpecDecodeRuntime design)
     auto const& req0 = requests[0];
@@ -3723,7 +3738,7 @@ bool Qwen3OmniTTSRuntime::handleAudioGenerationFromThinker(
     }
 
     if (!runTalkerGenerationLoop(states, activeBatchSize, effectiveMaxFrames, talkerSamplingParams,
-            predictorSamplingParams, repetitionPenalty, trailingPtrs, stream, perBatchSeqLen))
+            predictorSamplingParams, repetitionPenalty, trailingPtrs, codecHiddensBuffer, stream, perBatchSeqLen))
     {
         return false;
     }
@@ -3774,8 +3789,8 @@ bool Qwen3OmniTTSRuntime::handleAudioGenerationFromThinker(
 
 bool Qwen3OmniTTSRuntime::runTalkerGenerationLoop(std::vector<PerBatchTalkerState>& states, int32_t activeBatchSize,
     int32_t maxFrames, SamplingParams const& talkerSamplingParams, SamplingParams const& predictorSamplingParams,
-    float repetitionPenalty, std::vector<rt::Tensor const*> const& trailingTextHiddens, cudaStream_t stream,
-    std::vector<int64_t> const& prefillSeqLens)
+    float repetitionPenalty, std::vector<rt::Tensor const*> const& trailingTextHiddens,
+    rt::Tensor& codecHiddensBuffer, cudaStream_t stream, std::vector<int64_t> const& prefillSeqLens)
 {
     NVTX_SCOPED_RANGE(nvtx_range, "TalkerRunner::runTalkerGenerationLoop", nvtx_colors::PURPLE);
 
@@ -3837,8 +3852,8 @@ bool Qwen3OmniTTSRuntime::runTalkerGenerationLoop(std::vector<PerBatchTalkerStat
                 }
 
                 std::vector<int32_t> frameCodes;
-                if (!runCodePredictorGenerationForFrame(
-                        states[b].codecToken, mTalkerLastHidden, predictorSamplingParams, frameCodes, stream))
+                if (!runCodePredictorGenerationForFrame(states[b].codecToken, mTalkerLastHidden,
+                        predictorSamplingParams, frameCodes, codecHiddensBuffer, stream))
                 {
                     LOG_ERROR("CodePredictor failed for batch %d frame %d", b, globalFrame);
                     states[b].finished = true;
@@ -3854,8 +3869,8 @@ bool Qwen3OmniTTSRuntime::runTalkerGenerationLoop(std::vector<PerBatchTalkerStat
                     static_cast<__half*>(mResidualEmbedBuffer.rawPointer()) + b * mTalkerConfig.talkerHiddenSize,
                     rt::Coords{1, 1, mTalkerConfig.talkerHiddenSize}, rt::DeviceType::kGPU, nvinfer1::DataType::kHALF);
 
-                if (!computeResidualConnection(
-                        states[b].rvqCodes.back(), trailingTextHiddens[b], globalFrame, residualSlice, stream))
+                if (!computeResidualConnection(states[b].rvqCodes.back(), trailingTextHiddens[b], globalFrame,
+                        residualSlice, codecHiddensBuffer, stream))
                 {
                     LOG_ERROR("Residual connection failed for batch %d frame %d", b, globalFrame);
                     states[b].finished = true;
@@ -3955,6 +3970,12 @@ bool Qwen3OmniTTSRuntime::runSingleTalkerDecodeFrame(int32_t& codecToken, Sampli
 {
     int32_t const codecEosId = mTalkerConfig.codecEosId;
 
+    // [Phase B C1] Per-frame codec hiddens buffer (streaming path).
+    // C2 will hoist this into a slot-owned buffer; for now keep it local to satisfy
+    // the new per-request signatures.
+    rt::Tensor codecHiddensBuffer({1, mNumCodesPerFrame, mTalkerConfig.talkerHiddenSize}, rt::DeviceType::kGPU,
+        nvinfer1::DataType::kHALF, "codecHiddensBufferStreaming");
+
     // Ensure batch=1 shape for CodePredictor KV cache reset (streaming path is per-batch)
     check::check(mHostReuseKVCacheLengths.reshape({1}), "Tensor reshape failed");
     mHostReuseKVCacheLengths.dataPointer<int32_t>()[0] = 0;
@@ -3967,7 +3988,8 @@ bool Qwen3OmniTTSRuntime::runSingleTalkerDecodeFrame(int32_t& codecToken, Sampli
     }
 
     std::vector<int32_t> frameCodes;
-    if (!runCodePredictorGenerationForFrame(codecToken, mTalkerLastHidden, predictorSamplingParams, frameCodes, stream))
+    if (!runCodePredictorGenerationForFrame(
+            codecToken, mTalkerLastHidden, predictorSamplingParams, frameCodes, codecHiddensBuffer, stream))
     {
         LOG_ERROR("CodePredictor generation failed at frame %d", frameIdx);
         return false;
@@ -3975,7 +3997,8 @@ bool Qwen3OmniTTSRuntime::runSingleTalkerDecodeFrame(int32_t& codecToken, Sampli
 
     rvqCodes.push_back(std::move(frameCodes));
 
-    if (!computeResidualConnection(rvqCodes.back(), trailingPtr, frameIdx, mResidualEmbedBuffer, stream))
+    if (!computeResidualConnection(
+            rvqCodes.back(), trailingPtr, frameIdx, mResidualEmbedBuffer, codecHiddensBuffer, stream))
     {
         LOG_ERROR("Residual connection failed at frame %d", frameIdx);
         return false;
@@ -4011,13 +4034,14 @@ bool Qwen3OmniTTSRuntime::runSingleTalkerDecodeFrame(int32_t& codecToken, Sampli
 }
 
 bool Qwen3OmniTTSRuntime::runCodePredictorGenerationForFrame(int32_t codecToken, rt::Tensor const& talkerHiddenState,
-    SamplingParams const& samplingParams, std::vector<int32_t>& outputCodes, cudaStream_t stream)
+    SamplingParams const& samplingParams, std::vector<int32_t>& outputCodes, rt::Tensor& codecHiddensBuffer,
+    cudaStream_t stream)
 {
     NVTX_SCOPED_RANGE(nvtx_range, "TalkerRunner::runCodePredictorGenerationForFrame", nvtx_colors::ORANGE);
 
     // Original model logic:
-    // - codes: code_0 (from Talker) + code_1..code_N (from CodePredictor) = mNumCodesPerFrame codes
-    // - hidden_states: written directly to mCodecHiddensBuffer
+    // - codes: code_0 (from Talker) + code_1..code_(N-1) (from CodePredictor) = mNumCodesPerFrame codes
+    // - hidden_states: written directly to codecHiddensBuffer (per-request, passed in)
 
     outputCodes.clear();
     outputCodes.reserve(mNumCodesPerFrame);
@@ -4089,8 +4113,8 @@ bool Qwen3OmniTTSRuntime::runCodePredictorGenerationForFrame(int32_t codecToken,
         outputCodes.push_back(code); // code_1
     } // end kCODEPREDICTOR_PREFILL scope
 
-    // ========== Write embedding lookups to mCodecHiddensBuffer for residual connection ==========
-    // mCodecHiddensBuffer layout: [1, mNumCodesPerFrame, H]
+    // ========== Write embedding lookups to codecHiddensBuffer for residual connection ==========
+    // codecHiddensBuffer layout: [1, mNumCodesPerFrame, H]
     // Position 0:  embed(code_0)  using Talker's embedding   - filled in computeResidualConnection
     // Position 1..(mNumRvqLayers-1): codec_embedding[step-1](code_step)
     //   — filled here (input embeddings, NOT engine hidden states)
@@ -4101,9 +4125,10 @@ bool Qwen3OmniTTSRuntime::runCodePredictorGenerationForFrame(int32_t codecToken,
     //   hid[0] = inputs_embeds for each decode step = codec_embedding[step-1](code_step)
     //   NOT the transformer output (last layer hidden states)
 
-    // mCodecHiddensBuffer stores raw (2048-dim) codec embeddings for the residual connection
+    // codecHiddensBuffer stores raw (2048-dim) codec embeddings for the residual connection
     check::check(
-        mCodecHiddensBuffer.reshape({1, mNumCodesPerFrame, mTalkerConfig.talkerHiddenSize}), "Tensor reshape failed");
+        codecHiddensBuffer.reshape({1, mNumCodesPerFrame, mTalkerConfig.talkerHiddenSize}), "Tensor reshape failed");
+    CUDA_CHECK(cudaMemsetAsync(codecHiddensBuffer.rawPointer(), 0, codecHiddensBuffer.getMemoryCapacity(), stream));
 
     // ========== Decoding loop: generate code_2 to code_(mNumRvqLayers) ==========
     {
@@ -4121,8 +4146,8 @@ bool Qwen3OmniTTSRuntime::runCodePredictorGenerationForFrame(int32_t codecToken,
             int32_t const embeddingIdx = step - 2; // step=2->embed[0], step=3->embed[1], ...
             int32_t const lmHeadIdx = step - 1;    // step=2->lm_head[1], step=3->lm_head[2], ...
 
-            if (!executeCodePredictorDecodingStep(
-                    code, embeddingIdx, lmHeadIdx, mCodePredictorLogits, mCodePredictorHiddenStatesBuffer, stream))
+            if (!executeCodePredictorDecodingStep(code, embeddingIdx, lmHeadIdx, mCodePredictorLogits,
+                    mCodePredictorHiddenStatesBuffer, codecHiddensBuffer, stream))
             {
                 return false;
             }
@@ -4144,7 +4169,8 @@ bool Qwen3OmniTTSRuntime::runCodePredictorGenerationForFrame(int32_t codecToken,
 }
 
 bool Qwen3OmniTTSRuntime::computeResidualConnection(std::vector<int32_t> const& codes,
-    rt::Tensor const* trailingTextHidden, int32_t generationStep, rt::Tensor& outputResidual, cudaStream_t stream)
+    rt::Tensor const* trailingTextHidden, int32_t generationStep, rt::Tensor& outputResidual,
+    rt::Tensor const& codecHiddensBuffer, cudaStream_t stream)
 {
     NVTX_SCOPED_RANGE(nvtx_range, "TalkerRunner::computeResidualConnection", nvtx_colors::BLUE);
 
@@ -4153,6 +4179,7 @@ bool Qwen3OmniTTSRuntime::computeResidualConnection(std::vector<int32_t> const& 
     //       inputs_embeds += trailing_text_hidden[:, generation_step]
     //   else:
     //       inputs_embeds += tts_pad_embed
+    // [Phase B C1] codecHiddensBuffer is per-request (was global mCodecHiddensBuffer).
 
     check::check(static_cast<int32_t>(codes.size()) == mNumCodesPerFrame,
         "Expected " + std::to_string(mNumCodesPerFrame) + " codes, got " + std::to_string(codes.size()));
@@ -4176,11 +4203,32 @@ bool Qwen3OmniTTSRuntime::computeResidualConnection(std::vector<int32_t> const& 
         }
     }
 
-    kernel::invokeResidualConnection(mCodecHiddensBuffer, mTalkerEmbeddingTable,
+    kernel::invokeResidualConnection(codecHiddensBuffer, mTalkerEmbeddingTable,
         mCodePredictorEmbeddingTables[mNumRvqLayers - 1], codes[0], codes[mNumRvqLayers], addend, outputResidual,
         stream);
 
     return true;
+}
+
+// [Phase B C1] Host-side residual connection (net new function — no CUDA kernel).
+// Uses HEAD's trailingTextHidden / generationStep addend logic (NOT fork's mTrailingTextLen path).
+// Currently a stub: routes through the GPU path with a synchronous copy if needed.
+// Real callers will be wired up in subsequent commits; for now keep parity with the
+// GPU `computeResidualConnection` so the symbol exists and the build links.
+bool Qwen3OmniTTSRuntime::computeResidualConnectionHost(std::vector<int32_t> const& codes,
+    rt::Tensor const* trailingTextHidden, int32_t generationStep, rt::Tensor& outputResidual, cudaStream_t stream)
+{
+    NVTX_SCOPED_RANGE(nvtx_range, "TalkerRunner::computeResidualConnectionHost", nvtx_colors::BLUE);
+
+    // Allocate a transient per-call codecHiddensBuffer matching the GPU path,
+    // since the host-side path does not have access to a request-scoped buffer.
+    rt::Tensor codecHiddensBufferLocal({1, mNumCodesPerFrame, mTalkerConfig.talkerHiddenSize},
+        rt::DeviceType::kGPU, nvinfer1::DataType::kHALF, "codecHiddensBufferHostLocal");
+    CUDA_CHECK(cudaMemsetAsync(
+        codecHiddensBufferLocal.rawPointer(), 0, codecHiddensBufferLocal.getMemoryCapacity(), stream));
+
+    return computeResidualConnection(
+        codes, trailingTextHidden, generationStep, outputResidual, codecHiddensBufferLocal, stream);
 }
 
 bool Qwen3OmniTTSRuntime::extractTalkerLastHidden(
