@@ -845,12 +845,53 @@ public:
             mKVB[i].allocate(kvBytes);
         }
         LOG_INFO("Qwen3-TTS CodePredictor enabled: %s", enginePath.string().c_str());
+
+        // [Phase 3b-B-4] Eager pre-allocate the slot pool. Without this the
+        // FIRST N=2 concurrent request triggers lazy-alloc of slot 2 inside
+        // acquirePoolSlot, which calls cudaStreamSynchronize(mStream) and
+        // blocks until client 1's primary-stream work drains — a one-time
+        // cold-start spike that has been observed adding ~2 s to client 2's
+        // TTFA. Pre-allocating here eliminates the spike; releases on first
+        // use just hand back already-warm slots from the free list.
+        eagerInitSlotPool();
     }
 
     ~Qwen3TTSCodePredictorEngine()
     {
         destroyDecodeCudaGraphs();
     }
+
+private:
+    //! [Phase 3b-B-4] Pre-allocate every slot up to mSlotPoolCapacity, populating
+    //! mFreeSlots so first-time acquire() never hits the lazy-init path.
+    //! Failed pair-creations leave the pool short — first-use will still try
+    //! lazy-init for those, matching prior behavior. Holds mSlotPoolMutex
+    //! while populating the vectors; no other thread can race the ctor.
+    void eagerInitSlotPool()
+    {
+        std::lock_guard<std::mutex> lk(mSlotPoolMutex);
+        for (int i = 0; i < mSlotPoolCapacity; ++i)
+        {
+            auto slot = std::make_unique<Qwen3OmniTTSRuntime::CodePredictorSlot>();
+            slot->stream = mStream;
+            auto ctxPair = createExecutionContextPair();
+            if (!ctxPair.first || !ctxPair.second)
+            {
+                LOG_WARNING("CodePredictorEngine eager pool: pair-init failed at slot %d "
+                            "(pool short; subsequent acquire() will retry)", i);
+                break;
+            }
+            slot->prefillCtxOwned = std::move(ctxPair.first);
+            slot->decodeCtxOwned = std::move(ctxPair.second);
+            allocateSlot(*slot);
+            mFreeSlots.push_back(slot.get());
+            mAllSlots.push_back(std::move(slot));
+        }
+        LOG_INFO("Qwen3-TTS CodePredictor SlotPool eager-initialised: %zu/%d slots ready",
+                 mFreeSlots.size(), mSlotPoolCapacity);
+    }
+
+public:
 
     //! [Phase 2 must-fix 3] Create a paired (prefill, decode) execution context set
     //! bound to this engine. CP requires both contexts per generate call (prefill on
@@ -2046,7 +2087,41 @@ public:
         allocateBuffers();
         LOG_INFO("Qwen3-TTS explicit-KV Talker enabled: %s, maxSeq=%d, maxKV=%d",
             enginePath.string().c_str(), mMaxSeqLen, mMaxKVSeqLen);
+
+        // [Phase 3b-B-4] Eager pre-allocate the slot pool — see the parallel
+        // change in CodePredictorEngine for rationale. Avoids the first-time
+        // cudaStreamSynchronize(mStream) blocker that adds ~2 s to client 2's
+        // TTFA when the cold lazy-init races client 1's primary-stream work.
+        eagerInitSlotPool();
     }
+
+private:
+    //! [Phase 3b-B-4] Pre-allocate every slot up to mSlotPoolCapacity.
+    void eagerInitSlotPool()
+    {
+        std::lock_guard<std::mutex> lk(mSlotPoolMutex);
+        for (int i = 0; i < mSlotPoolCapacity; ++i)
+        {
+            auto slot = std::make_unique<Qwen3OmniTTSRuntime::TalkerSlot>();
+            slot->stream = mStream;
+            auto ctxPair = createExecutionContextPair();
+            if (!ctxPair.first || !ctxPair.second)
+            {
+                LOG_WARNING("TalkerEngine eager pool: pair-init failed at slot %d "
+                            "(pool short; subsequent acquire() will retry)", i);
+                break;
+            }
+            slot->prefillCtxOwned = std::move(ctxPair.first);
+            slot->decodeCtxOwned = std::move(ctxPair.second);
+            allocateSlot(*slot, mStream);
+            mFreeSlots.push_back(slot.get());
+            mAllSlots.push_back(std::move(slot));
+        }
+        LOG_INFO("Qwen3-TTS Talker SlotPool eager-initialised: %zu/%d slots ready",
+                 mFreeSlots.size(), mSlotPoolCapacity);
+    }
+
+public:
 
     int32_t maxSeqLen() const
     {
