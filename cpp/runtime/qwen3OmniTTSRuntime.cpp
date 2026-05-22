@@ -34,6 +34,7 @@
 #include <algorithm>
 #include <chrono>
 #include <cmath>
+#include <condition_variable>
 #include <cstdlib>
 #include <cuda_runtime.h>
 #include <cstring>
@@ -41,6 +42,7 @@
 #include <fstream>
 #include <iterator>
 #include <limits>
+#include <mutex>
 #include <nlohmann/json.hpp>
 #include <numeric>
 #include <random>
@@ -889,6 +891,17 @@ public:
     void resetSampling()
     {
         mRng.seed(makeQwen3TTSSamplingSeed(0x5157454E));
+        // [Phase 3b-A audio-parity] Per-request reset boundary: the runtime
+        // calls resetSampling() once per TTS request before invoking generate().
+        // Phase 3a's slot path uses slot->rng, NOT mRng, so we must re-seed the
+        // pooled slot's rng here to keep request boundaries deterministic and
+        // byte-identical to the engine-globals path. gpuSamplingOffset is left
+        // untouched (engine path also accumulates it across requests).
+        std::lock_guard<std::mutex> lk(mSlotPoolMutex);
+        if (mPoolSlot)
+        {
+            mPoolSlot->rng.seed(makeQwen3TTSSamplingSeed(0x5157454E));
+        }
     }
 
     bool generate(std::vector<float> const& hidden, std::vector<float> const& primaryEmbedding, int32_t activeGroups,
@@ -897,6 +910,21 @@ public:
         nvinfer1::IExecutionContext* decodeCtxOverride = nullptr,
         Qwen3OmniTTSRuntime::CodePredictorSlot* slot = nullptr)
     {
+        // [Phase 3b-A] Activate the slot path at N=1 — acquire the single
+        // pooled slot when the caller didn't supply one, recurse, release.
+        if (slot == nullptr)
+        {
+            auto* pooled = acquirePoolSlot();
+            if (pooled == nullptr)
+            {
+                LOG_ERROR("Qwen3-TTS CP generate: pool slot unavailable");
+                return false;
+            }
+            bool const ok = generate(hidden, primaryEmbedding, activeGroups, topK, topP, temperature, residualCodes,
+                stream, prefillCtxOverride, decodeCtxOverride, pooled);
+            releasePoolSlot();
+            return ok;
+        }
         // Phase 2 must-fix 2: resolve per-invocation stream + dual ctx overrides.
         cudaStream_t const s = (stream != nullptr) ? stream : mStream;
         // Phase 3a Iter3: when slot != nullptr, route per-request mutable state through
@@ -929,6 +957,20 @@ public:
         nvinfer1::IExecutionContext* decodeCtxOverride = nullptr,
         Qwen3OmniTTSRuntime::CodePredictorSlot* slot = nullptr)
     {
+        // [Phase 3b-A] Activate the slot path at N=1 — see generate() above.
+        if (slot == nullptr)
+        {
+            auto* pooled = acquirePoolSlot();
+            if (pooled == nullptr)
+            {
+                LOG_ERROR("Qwen3-TTS CP generateDeviceHidden: pool slot unavailable");
+                return false;
+            }
+            bool const ok = generateDeviceHidden(hiddenDevice, primaryEmbedding, activeGroups, topK, topP, temperature,
+                residualCodes, stream, prefillCtxOverride, decodeCtxOverride, pooled);
+            releasePoolSlot();
+            return ok;
+        }
         // Phase 2 must-fix 2: resolve per-invocation stream + dual ctx overrides.
         cudaStream_t const s = (stream != nullptr) ? stream : mStream;
         // Phase 3a Iter3: see generate() above for slot semantics.
@@ -1728,6 +1770,62 @@ private:
     std::vector<std::string> mPastValueNames;
     std::vector<std::string> mNewPastKeyNames;
     std::vector<std::string> mNewPastValueNames;
+
+    // ==============================================================
+    // [Phase 3b-A] Per-engine SlotPool (N=1 single-slot pool).
+    //
+    // Activates the Phase-3a slot path for every caller that still
+    // passes slot=nullptr (the entire production worker right now).
+    // When the public entry method (generate / generateDeviceHidden)
+    // sees a null slot, it acquires the pool's single slot, drives
+    // the work through the slot-aware path, then releases. Phase 3b-B
+    // will expand this to N>1 with multiple slots + cv-based waiting,
+    // and rewire the worker main loop to acquire slots explicitly.
+    //
+    // Lazy init: the slot is allocated on first acquire, not in the
+    // engine ctor, so single-instance startup memory is unchanged
+    // until the first inference call.
+    // ==============================================================
+    mutable std::mutex mSlotPoolMutex;
+    std::condition_variable mSlotPoolCv;
+    std::unique_ptr<Qwen3OmniTTSRuntime::CodePredictorSlot> mPoolSlot;
+    bool mPoolSlotInUse{false};
+
+    // Lazily allocate the single pooled slot using this engine's own
+    // factory helpers (createExecutionContextPair + allocateSlot),
+    // matching the logic in Qwen3OmniTTSRuntime::createCodePredictorSlot
+    // (cpp ~:4958). Returns nullptr on context-pair failure.
+    Qwen3OmniTTSRuntime::CodePredictorSlot* acquirePoolSlot()
+    {
+        std::unique_lock<std::mutex> lk(mSlotPoolMutex);
+        mSlotPoolCv.wait(lk, [this] { return !mPoolSlotInUse; });
+        if (!mPoolSlot)
+        {
+            auto slot = std::make_unique<Qwen3OmniTTSRuntime::CodePredictorSlot>();
+            slot->stream = mStream;
+            auto ctxPair = createExecutionContextPair();
+            if (!ctxPair.first || !ctxPair.second)
+            {
+                LOG_WARNING("CodePredictorEngine pool: failed to allocate execution context pair");
+                return nullptr;
+            }
+            slot->prefillCtxOwned = std::move(ctxPair.first);
+            slot->decodeCtxOwned = std::move(ctxPair.second);
+            allocateSlot(*slot);
+            mPoolSlot = std::move(slot);
+        }
+        mPoolSlotInUse = true;
+        return mPoolSlot.get();
+    }
+
+    void releasePoolSlot()
+    {
+        {
+            std::lock_guard<std::mutex> lk(mSlotPoolMutex);
+            mPoolSlotInUse = false;
+        }
+        mSlotPoolCv.notify_one();
+    }
 };
 
 class Qwen3OmniTTSRuntime::Qwen3TTSTalkerEngine
@@ -2028,6 +2126,25 @@ public:
         nvinfer1::IExecutionContext* ctxOverride = nullptr,
         Qwen3OmniTTSRuntime::TalkerSlot* slot = nullptr)
     {
+        // [Phase 3b-A] Activate the slot path at N=1: when the caller did not
+        // supply an explicit slot, acquire the single pooled slot, recurse with
+        // it, then release. Recursive entries already have slot != nullptr so
+        // they do NOT re-enter the pool. ctxOverride/stream from the caller
+        // remain authoritative; the pool slot owns its own paired ctxs but the
+        // current N=1 path keeps the engine's default ctx/stream unless the
+        // caller explicitly overrides — matching Phase 3a Iter6 semantics.
+        if (slot == nullptr)
+        {
+            auto* pooled = acquirePoolSlot();
+            if (pooled == nullptr)
+            {
+                LOG_ERROR("Qwen3-TTS direct Talker prefill: pool slot unavailable");
+                return false;
+            }
+            bool const ok = prefill(inputEmbeds, seqLen, outputLogits, outputHiddenStates, stream, ctxOverride, pooled);
+            releasePoolSlot();
+            return ok;
+        }
         if (seqLen <= 0)
         {
             LOG_ERROR("Qwen3-TTS direct Talker prefill seqLen out of range: %d (max %d)", seqLen, mMaxSeqLen);
@@ -2147,6 +2264,24 @@ public:
         nvinfer1::IExecutionContext* ctxOverride = nullptr,
         Qwen3OmniTTSRuntime::TalkerSlot* slot = nullptr)
     {
+        // [Phase 3b-A] Activate the slot path at N=1 (see prefill above for the
+        // rationale). Pool acquire here threads `pooled` through to the nested
+        // prefill/restorePromptCache helpers so the entire prompt-cache hit/miss
+        // path runs against the slot's promptKVs/promptLogits/promptHidden
+        // buffers — not the engine globals.
+        if (slot == nullptr)
+        {
+            auto* pooled = acquirePoolSlot();
+            if (pooled == nullptr)
+            {
+                LOG_ERROR("Qwen3-TTS Talker prefillWithPromptCache: pool slot unavailable");
+                return false;
+            }
+            bool const ok = prefillWithPromptCache(
+                inputEmbeds, seqLen, outputLogits, outputHiddenStates, stream, ctxOverride, pooled);
+            releasePoolSlot();
+            return ok;
+        }
         // Phase 3a Iter6: route prompt-KV cache state through `slot` when supplied.
         // At slot == nullptr the path is byte-identical to Phase 2. Pattern mirrors
         // decode/reset (cpp ~:2127, ~:2281): aliases for the hit/miss decision fields,
@@ -2183,6 +2318,19 @@ public:
         cudaStream_t stream = nullptr, nvinfer1::IExecutionContext* ctxOverride = nullptr,
         Qwen3OmniTTSRuntime::TalkerSlot* slot = nullptr)
     {
+        // [Phase 3b-A] Activate the slot path at N=1 — see prefill().
+        if (slot == nullptr)
+        {
+            auto* pooled = acquirePoolSlot();
+            if (pooled == nullptr)
+            {
+                LOG_ERROR("Qwen3-TTS direct Talker decode: pool slot unavailable");
+                return false;
+            }
+            bool const ok = decode(inputEmbed, outputLogits, outputHiddenStates, stream, ctxOverride, pooled);
+            releasePoolSlot();
+            return ok;
+        }
         // Phase 3a Iter4: route mutable per-request state through `slot` when supplied.
         // At slot == nullptr the path is byte-identical to Phase 2. Pattern mirrors CP
         // generatePreparedInputs (cpp ~:957): aliases for engine-shared scalars/counters,
@@ -2626,6 +2774,55 @@ private:
     std::vector<std::string> mPastValueNames;
     std::vector<std::string> mNewPastKeyNames;
     std::vector<std::string> mNewPastValueNames;
+
+    // ==============================================================
+    // [Phase 3b-A] Per-engine SlotPool (N=1 single-slot pool).
+    //
+    // See CodePredictorEngine's pool block above for the rationale.
+    // Activates the Phase-3a Talker slot path for every caller that
+    // still passes slot=nullptr (worker, prompt-cache helpers, the
+    // iterative-prefill fallback).
+    // ==============================================================
+    mutable std::mutex mSlotPoolMutex;
+    std::condition_variable mSlotPoolCv;
+    std::unique_ptr<Qwen3OmniTTSRuntime::TalkerSlot> mPoolSlot;
+    bool mPoolSlotInUse{false};
+
+    // Lazily allocate the single pooled slot using this engine's own
+    // factory helpers (createExecutionContextPair + allocateSlot),
+    // matching the logic in Qwen3OmniTTSRuntime::createTalkerSlot
+    // (cpp ~:4933).
+    Qwen3OmniTTSRuntime::TalkerSlot* acquirePoolSlot()
+    {
+        std::unique_lock<std::mutex> lk(mSlotPoolMutex);
+        mSlotPoolCv.wait(lk, [this] { return !mPoolSlotInUse; });
+        if (!mPoolSlot)
+        {
+            auto slot = std::make_unique<Qwen3OmniTTSRuntime::TalkerSlot>();
+            slot->stream = mStream;
+            auto ctxPair = createExecutionContextPair();
+            if (!ctxPair.first || !ctxPair.second)
+            {
+                LOG_WARNING("TalkerEngine pool: failed to allocate execution context pair");
+                return nullptr;
+            }
+            slot->prefillCtxOwned = std::move(ctxPair.first);
+            slot->decodeCtxOwned = std::move(ctxPair.second);
+            allocateSlot(*slot, mStream);
+            mPoolSlot = std::move(slot);
+        }
+        mPoolSlotInUse = true;
+        return mPoolSlot.get();
+    }
+
+    void releasePoolSlot()
+    {
+        {
+            std::lock_guard<std::mutex> lk(mSlotPoolMutex);
+            mPoolSlotInUse = false;
+        }
+        mSlotPoolCv.notify_one();
+    }
 };
 
 Qwen3OmniTTSRuntime::Qwen3OmniTTSRuntime(std::string const& talkerEngineDir, std::string const& codePredictorEngineDir,
