@@ -2409,7 +2409,7 @@ bool LLMInferenceSpecDecodeRuntime::genAndSaveSystemPromptKVCache(
         return true;
     }
 
-    auto tokenizedPrompt = mTokenizer->encode(prompt, true);
+    auto tokenizedPrompt = mTokenizer->encode(prompt, false);
     if (tokenizedPrompt.empty())
     {
         LOG_ERROR("Failed to encode system prompt for KVCache generation.");
@@ -2526,7 +2526,7 @@ bool LLMInferenceSpecDecodeRuntime::genAndSaveSystemPromptKVCache(
     SpecDecodeInferenceContext tempContext;
     tempContext.initialize(1, 1, std::nullopt, rt::OptionalInputTensors{}, loraWeightsName, stream);
     tempContext.systemPrompts[0] = prompt;
-    auto tokenizedPrompt = mTokenizer->encode(prompt, true);
+    auto tokenizedPrompt = mTokenizer->encode(prompt, false);
     if (tokenizedPrompt.empty())
     {
         LOG_ERROR("Failed to encode system prompt for KVCache generation.");
