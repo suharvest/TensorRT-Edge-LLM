@@ -107,8 +107,8 @@ def _create_app(llm_instance):
 
     @app.post("/v1/cache/system_prompt")
     def cache_system_prompt(body: Dict[str, Any]):
-        if body.get("formatted_system_prompt"):
-            prompt = body["formatted_system_prompt"]
+        if body.get("formatted_system_prompt") or body.get("formatted_prefix"):
+            prompt = body.get("formatted_system_prompt") or body["formatted_prefix"]
         elif body.get("prompt"):
             prompt = body["prompt"]
         elif body.get("system_prompt") is not None:
@@ -134,7 +134,7 @@ def _create_app(llm_instance):
                 status_code=400,
                 content={
                     "error":
-                    "formatted_system_prompt, prompt, system_prompt, or "
+                    "formatted_system_prompt, formatted_prefix, prompt, system_prompt, or "
                     "messages with a leading system message is required"
                 },
             )

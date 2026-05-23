@@ -303,6 +303,10 @@ class LLM:
         self._draft_step = draft_step
         self._verify_tree_size = verify_tree_size
         self._chat_template: Optional[Dict[str, Any]] = None
+        # The C++ runtime owns one TRT execution context and mutable prompt
+        # KV-cache maps. Serialize every runtime entry point, including cache
+        # warmup, so /v1/cache/system_prompt cannot race chat completions.
+        self._runtime_lock = threading.Lock()
 
         if engine_dir:
             self._init_from_engine(engine_dir, visual_engine_dir)
@@ -665,7 +669,8 @@ class LLM:
             request.lora_weights_name = params.lora_weights_name
             request.disable_spec_decode = params.disable_spec_decode
 
-            response = self._runtime.handle_request(request)
+            with self._runtime_lock:
+                response = self._runtime.handle_request(request)
             text = response.output_texts[0] if response.output_texts else ""
             ids = response.output_ids[0] if response.output_ids else []
             reason = ("length" if len(ids) >= params.max_tokens else "stop")
@@ -739,7 +744,8 @@ class LLM:
 
         def _run():
             try:
-                self._runtime.handle_request(request)
+                with self._runtime_lock:
+                    self._runtime.handle_request(request)
             except Exception as exc:
                 error_holder[0] = exc
                 channel.cancel()
@@ -806,11 +812,12 @@ class LLM:
         lora_weights_name: str = "",
     ) -> bool:
         """Pre-generate and cache KV states for a formatted system prompt."""
-        return bool(
-            self._runtime.save_system_prompt_kv_cache(
-                formatted_system_prompt,
-                lora_weights_name,
-            ))
+        with self._runtime_lock:
+            return bool(
+                self._runtime.save_system_prompt_kv_cache(
+                    formatted_system_prompt,
+                    lora_weights_name,
+                ))
 
     def format_system_prompt(self, system_prompt: str) -> str:
         """Format a raw system prompt using processed_chat_template.json."""
