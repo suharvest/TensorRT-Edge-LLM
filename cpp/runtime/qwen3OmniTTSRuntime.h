@@ -89,6 +89,38 @@ constexpr int32_t kVideoTokenId = 151656;   //!< Video placeholder token
 class Qwen3OmniTTSRuntime
 {
 public:
+    using FrameCallback = std::function<void(std::vector<int32_t> const& frameCodes, int32_t totalFrames)>;
+
+    enum class TalkerBackend
+    {
+        kAuto,
+        kGeneric,
+        kQwen3TTSExplicitKV,
+    };
+
+    enum class CodePredictorBackend
+    {
+        kAuto,
+        kGeneric,
+        kQwen3TTSNative,
+    };
+
+    enum class TextProjectionMode
+    {
+        kAuto,
+        kDevice,
+        kHostFP32,
+    };
+
+    struct RuntimeOptions
+    {
+        TalkerBackend talkerBackend{TalkerBackend::kAuto};
+        std::string qwen3TtsTalkerEnginePath;
+        CodePredictorBackend codePredictorBackend{CodePredictorBackend::kAuto};
+        TextProjectionMode textProjectionMode{TextProjectionMode::kAuto};
+        bool qwen3TtsPromptKvCache{false};
+    };
+
     /*!
      * @brief Construct and fully initialize the TTS runtime
      * @param talkerEngineDir Directory containing talker engine, MLP weights, embedding table, etc.
