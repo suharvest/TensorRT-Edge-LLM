@@ -338,11 +338,15 @@ class LLM:
                           visual_engine_dir: str) -> None:
         """Load from pre-built engine directories (no export, no build)."""
         from .engine_layout import (find_visual_engine_dir,
+                                    validate_eagle_engine_dir,
                                     validate_llm_engine_dir,
                                     validate_visual_engine_dir)
 
         if not validate_llm_engine_dir(engine_dir):
-            raise ValueError(f"llm.engine not found in: {engine_dir}")
+            if not validate_eagle_engine_dir(engine_dir):
+                raise ValueError(
+                    f"Neither llm.engine nor eagle_base.engine found in: {engine_dir}"
+                )
         self._engine_dir = engine_dir
         self._model_dir = engine_dir
         self._is_vlm = False
@@ -464,6 +468,14 @@ class LLM:
                         self._visual_engine_dir)
         eagle = self._eagle_engine_dir
         if eagle:
+            if self._verify_tree_size < self._draft_step + 1:
+                raise ValueError(
+                    f"verify_tree_size ({self._verify_tree_size}) must be >= "
+                    f"draft_step + 1 ({self._draft_step + 1}). Kernel guard at "
+                    f"cpp/kernels/speculative/eagleAcceptKernels.cu:381 requires "
+                    f"maxDepth <= numTokens, where maxDepth = draft_step + 1 "
+                    f"and numTokens = verify_tree_size."
+                )
             logger.info(
                 "Eagle spec-decode enabled (top_k=%d, step=%d, tree=%d)",
                 self._draft_top_k,

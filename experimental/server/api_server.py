@@ -37,18 +37,27 @@ Usage (from LLM object)::
 
 import argparse
 import asyncio
+import copy
 import json
 import logging
 import queue as _queue
+import re
 import threading
 import uuid
-from typing import Any, Dict, Optional
+from typing import Any, Dict, List, Optional
 
 logger = logging.getLogger("edgellm.api_server")
 
 THINK_OPEN_TAG = "<think>"
 THINK_CLOSE_TAG = "</think>"
 IM_END_TOKEN = "<|im_end|>"
+
+TOOL_CALL_OPEN = "<tool_call>"
+TOOL_CALL_CLOSE = "</tool_call>"
+_TOOL_CALL_RE = re.compile(
+    re.escape(TOOL_CALL_OPEN) + r"\s*(.*?)\s*" + re.escape(TOOL_CALL_CLOSE),
+    re.DOTALL,
+)
 
 
 def _split_reasoning_and_content(text: str):
@@ -60,6 +69,181 @@ def _split_reasoning_and_content(text: str):
         content = text[think_close + len(THINK_CLOSE_TAG):].strip()
         return reasoning, content or None
     return None, text.strip() if text.strip() else None
+
+
+# ---------------------------------------------------------------------------
+# Tool-calling (Qwen3-format) helpers
+#
+# The compiled C++ runtime applies a static prefix/suffix-per-role template
+# (``processed_chat_template.json``) which has no notion of OpenAI ``tools``.
+# To support tool-calling without modifying the C++ runtime, we render the
+# tool schema into a Qwen3-style "# Tools" system block in Python and inject
+# it as the leading system message before the request reaches the runtime.
+# On the response side we parse ``<tool_call>{...}</tool_call>`` blocks out
+# of the generated text and emit them as OpenAI ``tool_calls`` entries.
+# ---------------------------------------------------------------------------
+
+
+def _render_tools_system_block(tools: List[Dict[str, Any]],
+                               existing_system: str = "") -> str:
+    """Build the Qwen3 tool-system prompt text.
+
+    Mirrors the upstream Qwen3 chat_template.jinja ``{% if tools %}`` branch.
+    """
+    parts: List[str] = []
+    if existing_system:
+        parts.append(existing_system + "\n\n")
+    parts.append(
+        "# Tools\n\n"
+        "You may call one or more functions to assist with the user query."
+        "\n\nYou are provided with function signatures within "
+        "<tools></tools> XML tags:\n<tools>")
+    for tool in tools:
+        parts.append("\n" + json.dumps(tool, ensure_ascii=False))
+    parts.append(
+        "\n</tools>\n\nFor each function call, return a json object with "
+        "function name and arguments within <tool_call></tool_call> XML "
+        "tags:\n<tool_call>\n"
+        "{\"name\": <function-name>, \"arguments\": <args-json-object>}\n"
+        "</tool_call>")
+    return "".join(parts)
+
+
+def _flatten_message_for_runtime(msg: Dict[str, Any]) -> Dict[str, Any]:
+    """Convert OpenAI tool-call / tool-result messages into plain text.
+
+    The C++ runtime only understands ``system|user|assistant`` roles with
+    string-or-multimodal content. We rewrite:
+        - ``role=tool``                 -> user with ``<tool_response>...``
+        - ``assistant`` w/ tool_calls   -> assistant with ``<tool_call>...``
+    """
+    role = msg.get("role")
+    if role == "tool":
+        out = {
+            "role": "user",
+            "content": ("<tool_response>\n" + str(msg.get("content", "")) +
+                        "\n</tool_response>"),
+        }
+        return out
+    if role == "assistant" and msg.get("tool_calls"):
+        text_parts: List[str] = []
+        content = msg.get("content") or ""
+        if isinstance(content, str) and content:
+            text_parts.append(content)
+        for tc in msg.get("tool_calls", []):
+            fn = tc.get("function", tc) if isinstance(tc, dict) else {}
+            name = fn.get("name", "")
+            args = fn.get("arguments", "")
+            if isinstance(args, str):
+                args_str = args
+            else:
+                args_str = json.dumps(args, ensure_ascii=False)
+            text_parts.append(
+                f"<tool_call>\n{{\"name\": \"{name}\", \"arguments\": "
+                f"{args_str}}}\n</tool_call>")
+        return {"role": "assistant", "content": "\n".join(text_parts)}
+    return msg
+
+
+def _inject_tools_and_normalize(
+        messages: List[Dict[str, Any]],
+        tools: Optional[List[Dict[str, Any]]]) -> List[Dict[str, Any]]:
+    """Return a new messages list with tool schema injected and tool/tool_call
+    messages flattened so the C++ runtime can handle them.
+    """
+    flat = [_flatten_message_for_runtime(copy.deepcopy(m)) for m in messages]
+    if not tools:
+        return flat
+
+    existing_system = ""
+    if flat and flat[0].get("role") == "system":
+        sys_content = flat[0].get("content", "")
+        if isinstance(sys_content, str):
+            existing_system = sys_content
+        elif isinstance(sys_content, list):
+            existing_system = "".join(
+                p.get("text", "") if isinstance(p, dict) else str(p)
+                for p in sys_content)
+        rendered = _render_tools_system_block(tools, existing_system)
+        flat[0] = {"role": "system", "content": rendered}
+    else:
+        rendered = _render_tools_system_block(tools, "")
+        flat = [{"role": "system", "content": rendered}] + flat
+    return flat
+
+
+def _tool_call_from_json_obj(obj: Any, idx: int) -> Optional[Dict[str, Any]]:
+    """Build an OpenAI ``tool_calls`` entry from a raw {name,arguments} dict."""
+    if not isinstance(obj, dict):
+        return None
+    name = obj.get("name")
+    if not isinstance(name, str) or not name:
+        return None
+    if "arguments" not in obj and "parameters" not in obj:
+        return None
+    args_obj = obj.get("arguments", obj.get("parameters", {}))
+    if isinstance(args_obj, str):
+        arguments_str = args_obj
+    else:
+        arguments_str = json.dumps(args_obj, ensure_ascii=False)
+    return {
+        "id": f"call_{uuid.uuid4().hex[:8]}",
+        "type": "function",
+        "index": idx,
+        "function": {
+            "name": name,
+            "arguments": arguments_str,
+        },
+    }
+
+
+def _extract_tool_calls(text: str):
+    """Pull tool-call payloads out of model output.
+
+    Handles both the canonical Qwen3 ``<tool_call>{...}</tool_call>`` wrapping
+    *and* the common AWQ/quantized failure mode where the model drops the XML
+    tags and emits the raw ``{"name": ..., "arguments": ...}`` JSON. The
+    fallback is conservative: it only triggers when the stripped text starts
+    with ``{`` and parses to a dict with both ``name`` and ``arguments``.
+
+    Returns ``(tool_calls_list, remaining_text)`` where ``tool_calls_list`` is
+    a list of OpenAI-shaped ``tool_calls`` dicts, and ``remaining_text`` is
+    the text with the tool-call payload stripped (used as ``content``).
+    """
+    tool_calls: List[Dict[str, Any]] = []
+    cleaned_parts: List[str] = []
+    last_end = 0
+    for match in _TOOL_CALL_RE.finditer(text):
+        cleaned_parts.append(text[last_end:match.start()])
+        last_end = match.end()
+        body = match.group(1).strip()
+        try:
+            obj = json.loads(body)
+        except json.JSONDecodeError:
+            obj = None
+        tc = _tool_call_from_json_obj(obj, len(tool_calls))
+        if tc is not None:
+            tool_calls.append(tc)
+        else:
+            # Preserve raw text on malformed tool_call body.
+            cleaned_parts.append(match.group(0))
+    cleaned_parts.append(text[last_end:])
+    cleaned = "".join(cleaned_parts).strip()
+
+    # Fallback: model dropped the <tool_call> XML wrapper but emitted the
+    # bare JSON payload. Only attempt when no XML-form calls were found and
+    # the entire cleaned text is one JSON object that looks like a call.
+    if not tool_calls and cleaned.startswith("{") and cleaned.endswith("}"):
+        try:
+            obj = json.loads(cleaned)
+        except json.JSONDecodeError:
+            obj = None
+        tc = _tool_call_from_json_obj(obj, 0)
+        if tc is not None:
+            tool_calls.append(tc)
+            cleaned = ""
+
+    return tool_calls, cleaned
 
 
 def _create_app(llm_instance):
@@ -160,6 +344,27 @@ def _create_app(llm_instance):
         if not messages:
             return JSONResponse(status_code=400,
                                 content={"error": "messages required"})
+
+        # OpenAI ``tools`` / ``tool_choice`` support. The compiled C++ runtime
+        # cannot render the OpenAI tools schema directly (its template is a
+        # static prefix/suffix-per-role JSON, no Jinja). We inject a
+        # Qwen3-format "# Tools" system block here and parse <tool_call>...
+        # </tool_call> back out of the response below.
+        tools = body.get("tools") or None
+        if tools:
+            try:
+                messages = _inject_tools_and_normalize(messages, tools)
+            except Exception as exc:
+                logger.exception("Tool prompt rendering failed")
+                return JSONResponse(
+                    status_code=400,
+                    content={"error": f"Invalid tools schema: {exc}"})
+        else:
+            # Still normalize any tool_calls / tool messages already in
+            # history so the runtime never sees an unsupported role.
+            messages = [
+                _flatten_message_for_runtime(m) for m in messages
+            ]
 
         temperature = body.get("temperature", 0.7)
         top_p = body.get("top_p", 0.9)
@@ -262,6 +467,7 @@ def _create_app(llm_instance):
                     enable_thinking,
                     before_metrics,
                     return_cache_metrics,
+                    tools_enabled=bool(tools),
                 ),
                 media_type="text/event-stream",
                 headers={
@@ -289,8 +495,24 @@ def _create_app(llm_instance):
         message_body: Dict[str, Any] = {"role": "assistant"}
         if reasoning is not None:
             message_body["reasoning"] = reasoning
-        message_body["content"] = (
-            (answer if answer is not None else reasoning) or "")
+        answer_text = (answer if answer is not None else reasoning) or ""
+
+        finish_reason = "stop"
+        if tools:
+            tcs, cleaned = _extract_tool_calls(answer_text)
+            if tcs:
+                # Strip ``index`` (only meaningful in streaming deltas) for
+                # the non-stream OpenAI shape.
+                message_body["tool_calls"] = [
+                    {k: v for k, v in tc.items() if k != "index"}
+                    for tc in tcs
+                ]
+                message_body["content"] = cleaned or None
+                finish_reason = "tool_calls"
+            else:
+                message_body["content"] = answer_text
+        else:
+            message_body["content"] = answer_text
 
         result = {
             "id":
@@ -300,7 +522,7 @@ def _create_app(llm_instance):
             "choices": [{
                 "index": 0,
                 "message": message_body,
-                "finish_reason": "stop",
+                "finish_reason": finish_reason,
             }],
             "usage": {
                 "completion_tokens": completion_tokens,
@@ -421,7 +643,8 @@ def _cache_metrics_delta(before_metrics, after_metrics):
 async def _generate_stream_sse(request, llm_instance, messages, params,
                                response_id, enable_thinking,
                                before_metrics=None,
-                               return_cache_metrics: bool = False):
+                               return_cache_metrics: bool = False,
+                               tools_enabled: bool = False):
     """Yield real SSE chunks via StreamChannel streaming.
 
     Runs the synchronous ``generate_stream`` iteration in a background
@@ -529,6 +752,13 @@ async def _generate_stream_sse(request, llm_instance, messages, params,
 
     watcher = asyncio.create_task(_watch_disconnect())
 
+    # When tools are enabled, buffer all assistant ``content`` until the
+    # stream finishes, then emit ``tool_calls`` (or content) atomically.
+    # Mid-stream <tool_call> XML must not leak to the OpenAI SDK client —
+    # it would be interpreted as raw assistant content and the eval would
+    # never see a structured tool_call.
+    content_buf: List[str] = []
+
     try:
         while True:
             try:
@@ -545,7 +775,10 @@ async def _generate_stream_sse(request, llm_instance, messages, params,
             delta = val
             if delta.text:
                 for field, text in sm.feed(delta.text):
-                    yield _sse_chunk(response_id, {field: text})
+                    if tools_enabled and field == "content":
+                        content_buf.append(text)
+                    else:
+                        yield _sse_chunk(response_id, {field: text})
             if delta.finished:
                 finish_reason = delta.finish_reason or "stop"
             if disconnected:
@@ -565,7 +798,40 @@ async def _generate_stream_sse(request, llm_instance, messages, params,
     # still yield the trailing frames so a graceful close (e.g. server
     # shutdown) drains the SSE protocol cleanly.
     for field, text in sm.flush():
-        yield _sse_chunk(response_id, {field: text})
+        if tools_enabled and field == "content":
+            content_buf.append(text)
+        else:
+            yield _sse_chunk(response_id, {field: text})
+
+    if tools_enabled:
+        full_text = "".join(content_buf)
+        tcs, cleaned = _extract_tool_calls(full_text)
+        if tcs:
+            for tc in tcs:
+                # Emit each tool_call as a single delta with name + full
+                # JSON arguments — the OpenAI SDK accumulates ``arguments``
+                # across deltas, so one-shot is fine.
+                tc_delta = {
+                    "tool_calls": [{
+                        "index": tc["index"],
+                        "id": tc["id"],
+                        "type": "function",
+                        "function": {
+                            "name": tc["function"]["name"],
+                            "arguments": tc["function"]["arguments"],
+                        },
+                    }]
+                }
+                yield _sse_chunk(response_id, tc_delta)
+            if finish_reason in (None, "stop"):
+                finish_reason = "tool_calls"
+            if cleaned:
+                # Trailing/leading non-tool text (rare). Emit as content so
+                # nothing is silently dropped.
+                yield _sse_chunk(response_id, {"content": cleaned})
+        else:
+            if full_text:
+                yield _sse_chunk(response_id, {"content": full_text})
 
     after_metrics = (
         llm_instance.get_prefill_metrics()
