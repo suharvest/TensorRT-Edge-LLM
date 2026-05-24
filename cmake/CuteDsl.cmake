@@ -788,7 +788,11 @@ function(cute_dsl_setup)
     # JetPack 6).
     if(NOT _cute_dsl_cuda_ver STREQUAL "" AND _cute_dsl_cuda_ver VERSION_LESS
                                               12.8)
-      target_link_options(${_tgt} PRIVATE "-Wl,--wrap=_cudaLaunchKernelEx")
+      if(_tgt_type STREQUAL "STATIC_LIBRARY")
+        target_link_options(${_tgt} INTERFACE "-Wl,--wrap=_cudaLaunchKernelEx")
+      else()
+        target_link_options(${_tgt} PRIVATE "-Wl,--wrap=_cudaLaunchKernelEx")
+      endif()
     endif()
   endforeach()
 
