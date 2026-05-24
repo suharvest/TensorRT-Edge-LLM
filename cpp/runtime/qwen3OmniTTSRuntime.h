@@ -656,6 +656,12 @@ private:
 
     std::unique_ptr<LLMEngineRunner> mTalkerLLMRunner;     //!< Talker LLM engine runner
     std::unique_ptr<LLMEngineRunner> mCodePredictorRunner; //!< CodePredictor engine runner
+    std::unique_ptr<Qwen3TTSCodePredictorEngine>
+        mQwen3TTSCodePredictorEngine; //!< Optional Qwen3-TTS native CodePredictor engine
+    bool mUseQwen3TTSCodePredictorEngine{false}; //!< Whether the Qwen3-TTS native CodePredictor engine is enabled
+    std::filesystem::path mQwen3TTSCodePredictorEnginePath;
+    std::unique_ptr<Qwen3TTSTalkerEngine> mQwen3TTSTalkerEngine; //!< Explicit-KV Qwen3-TTS Talker engine
+    bool mUseHostTextProjection{false};
 
     LLMEngineRunnerConfig mTalkerLLMConfig;     //!< Talker LLM configuration
     LLMEngineRunnerConfig mCodePredictorConfig; //!< CodePredictor configuration
