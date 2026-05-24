@@ -459,6 +459,9 @@ public:
     std::unique_ptr<CodePredictorSlot> createCodePredictorSlot(cudaStream_t stream);
 
 private:
+    class Qwen3TTSCodePredictorEngine;
+    class Qwen3TTSTalkerEngine;
+
     // ========== Internal Methods ==========
 
     void initializeTTSEmbeddings(cudaStream_t stream);
