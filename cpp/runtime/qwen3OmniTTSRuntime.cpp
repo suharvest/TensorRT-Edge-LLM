@@ -22,6 +22,7 @@
 #include "common/safetensorsUtils.h"
 #include "common/stringUtils.h"
 #include "kernels/embeddingKernels/embeddingKernels.h"
+#include "kernels/qwen3TtsCpKernels/qwen3TtsCpKernels.h"
 #include "kernels/talkerMLPKernels/talkerMLPKernels.h"
 #ifdef CUTE_DSL_GEMM_ENABLED
 #include "kernels/talkerMLPKernels/cuteDslGemmRunner.h"
