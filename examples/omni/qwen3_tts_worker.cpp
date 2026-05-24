@@ -3,6 +3,12 @@
  * SPDX-License-Identifier: Apache-2.0
  */
 
+// Several anonymous-namespace helpers in this worker (parseCodePredictorBackend,
+// transposeCodes, etc.) are referenced by P2-C SlotPool dispatch paths not yet
+// ported. -Wunused-function is treated as an error project-wide. Disable just
+// this warning here until the remaining P2-C tail commits land.
+#pragma GCC diagnostic ignored "-Wunused-function"
+
 #include "audioWriter.h"
 #include "common/checkMacros.h"
 #include "common/logger.h"
