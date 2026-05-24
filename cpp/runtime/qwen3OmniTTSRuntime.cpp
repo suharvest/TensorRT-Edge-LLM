@@ -140,6 +140,45 @@ inline int readTtsWorkerConcurrencyEnv(char const* engineTag)
     return capacity;
 }
 
+// Forward-declared from fork highperf/runtime-service tail (b9c57c8 reference
+// runtime); pulled into anonymous namespace so P2-C nested-class constructors
+// can resolve them without porting the full BF16 reference-runtime overhaul.
+uint32_t makeQwen3TTSSamplingSeed(uint32_t salt)
+{
+    if (char const* seedEnv = std::getenv("QWEN3_TTS_SEED"))
+    {
+        try
+        {
+            return static_cast<uint32_t>(std::stoul(seedEnv)) ^ salt;
+        }
+        catch (std::exception const&)
+        {
+            LOG_WARNING("Ignoring invalid QWEN3_TTS_SEED=%s", seedEnv);
+        }
+    }
+
+    std::random_device rd;
+    uint64_t const now = static_cast<uint64_t>(std::chrono::high_resolution_clock::now().time_since_epoch().count());
+    uint64_t const mixed = now ^ (static_cast<uint64_t>(rd()) << 32) ^ static_cast<uint64_t>(salt);
+    return static_cast<uint32_t>(mixed ^ (mixed >> 32));
+}
+
+uint32_t halfToFloatBits(uint16_t h)
+{
+    uint32_t const sign = (h >> 15) & 1;
+    uint32_t const exp = (h >> 10) & 0x1F;
+    uint32_t const mant = h & 0x3FF;
+    if (exp == 0x1F)
+    {
+        return (sign << 31) | (0xFF << 23) | (mant << 13);
+    }
+    if (exp == 0)
+    {
+        return sign << 31;
+    }
+    return (sign << 31) | ((exp + 112) << 23) | (mant << 13);
+}
+
 } // anonymous namespace
 
 class Qwen3OmniTTSRuntime::Qwen3TTSCodePredictorEngine
