@@ -2187,6 +2187,11 @@ bool LLMInferenceSpecDecodeRuntime::setUpForPrefillExecutionOneShot(SpecDecodeIn
                 && std::equal(precachedKVCacheBase.tokenizedPrompt.begin(),
                     precachedKVCacheBase.tokenizedPrompt.end(), batchedInputIds[i].begin());
 
+            LOG_DEBUG("Cache lookup: baseCount=%zu, draftCount=%zu, reuseLength=%zu, inputLen=%zu, shapeOk=%d, matchIds=%d",
+                mSystemPromptKVCacheBase.count(promptKey),
+                mDraftEngineRunner ? mSystemPromptKVCacheDraft.count(promptKey) : static_cast<size_t>(0),
+                reuseLength, batchedInputIds[i].size(), shapeOk ? 1 : 0, matchIds ? 1 : 0);
+
             if (shapeOk && matchIds)
             {
                 baseCacheManager.restoreKVCache(precachedKVCacheBase.kvCacheLayers, i, context.stream);
@@ -2751,9 +2756,12 @@ bool LLMInferenceSpecDecodeRuntime::genAndSaveSystemPromptKVCache(
         return true;
     }
     auto const promptKey = keySystemPromptWithLoraWeights(prompt, loraWeightsName);
-    if (mSystemPromptKVCacheBase.find(promptKey) != mSystemPromptKVCacheBase.end())
+    bool baseExists = mSystemPromptKVCacheBase.find(promptKey) != mSystemPromptKVCacheBase.end();
+    bool draftExists = !mDraftEngineRunner
+        || mSystemPromptKVCacheDraft.find(promptKey) != mSystemPromptKVCacheDraft.end();
+    if (baseExists && draftExists)
     {
-        LOG_DEBUG("The system prompt KVCache already exists for the prompt: {%s}", prompt.c_str());
+        LOG_DEBUG("The system prompt KVCache already exists (base+draft) for prompt: {%s}", prompt.c_str());
         return true;
     }
     SpecDecodeInferenceContext tempContext;
