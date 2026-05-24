@@ -23,6 +23,7 @@
 #include "common/logger.h"
 #include "common/trtUtils.h"
 #include "multimodal/code2WavRunner.h"
+#include "multimodal/statefulCode2WavRunner.h"
 #include "runtime/llmRuntimeUtils.h"
 #include "runtime/qwen3OmniTTSRuntime.h"
 
@@ -30,9 +31,11 @@
 #include <atomic>
 #include <chrono>
 #include <cmath>
+#include <condition_variable>
 #include <cstdint>
 #include <cstdlib>
 #include <cstring>
+#include <deque>
 #include <exception>
 #include <filesystem>
 #include <fstream>
@@ -275,8 +278,21 @@ int main(int argc, char** argv)
     cudaStream_t stream;
     CUDA_CHECK(cudaStreamCreate(&stream));
 
+    auto envIsOne = [](char const* name) {
+        auto* v = std::getenv(name);
+        return v != nullptr && std::string(v) == "1";
+    };
+    bool const useStateful = envIsOne("EDGE_LLM_TTS_STATEFUL_CODE2WAV");
+    bool const useAsyncVocode = envIsOne("EDGE_LLM_TTS_ASYNC_VOCODE");
+    std::string statefulEngineDir = args.code2wavEngineDir;
+    if (auto* env = std::getenv("EDGE_LLM_TTS_STATEFUL_CODE2WAV_ENGINE_DIR"))
+    {
+        statefulEngineDir = env;
+    }
+
     std::unique_ptr<Qwen3OmniTTSRuntime> ttsRuntime;
     std::unique_ptr<Code2WavRunner> code2wavRunner;
+    std::unique_ptr<StatefulCode2WavRunner> statefulCode2wavRunner;
 
     auto const initStart = std::chrono::steady_clock::now();
     try
@@ -284,7 +300,14 @@ int main(int argc, char** argv)
         Qwen3OmniTTSRuntime::RuntimeOptions runtimeOptions;
         ttsRuntime = std::make_unique<Qwen3OmniTTSRuntime>(
             args.talkerEngineDir, args.codePredictorEngineDir, args.tokenizerDir, stream, runtimeOptions);
-        code2wavRunner = std::make_unique<Code2WavRunner>(args.code2wavEngineDir, stream);
+        if (useStateful)
+        {
+            statefulCode2wavRunner = std::make_unique<StatefulCode2WavRunner>(statefulEngineDir, stream);
+        }
+        else
+        {
+            code2wavRunner = std::make_unique<Code2WavRunner>(args.code2wavEngineDir, stream);
+        }
     }
     catch (std::exception const& e)
     {
@@ -295,9 +318,11 @@ int main(int argc, char** argv)
     auto const initEnd = std::chrono::steady_clock::now();
     int64_t const initMs
         = std::chrono::duration_cast<std::chrono::milliseconds>(initEnd - initStart).count();
-    emitEvent(Json{{"event", "ready"}, {"request_id", "__worker__"}, {"id", "__worker__"}, {"init_ms", initMs}});
+    emitEvent(Json{{"event", "ready"}, {"request_id", "__worker__"}, {"id", "__worker__"},
+        {"init_ms", initMs}, {"stateful_code2wav", useStateful}, {"async_vocode", useAsyncVocode}});
 
-    int32_t const sampleRate = code2wavRunner->getConfig().sampleRate;
+    int32_t const sampleRate
+        = useStateful ? statefulCode2wavRunner->getConfig().sampleRate : code2wavRunner->getConfig().sampleRate;
 
     std::string line;
     while (std::getline(std::cin, line))
@@ -336,73 +361,201 @@ int main(int argc, char** argv)
         int32_t chunkIndex = 0;
         auto const requestStart = std::chrono::steady_clock::now();
 
+        // Async vocode worker plumbing (per-request, only constructed when enabled).
+        struct VocodeJob
+        {
+            bool poison{false};
+            bool isFinal{false};
+            std::vector<std::vector<int32_t>> frames;
+            int32_t chunkIndex{0};
+            std::chrono::steady_clock::time_point enqueuedAt;
+        };
+        std::mutex vocodeMu;
+        std::condition_variable vocodeCv;
+        std::deque<VocodeJob> vocodeQ;
+        std::exception_ptr vocodeError{nullptr};
+        std::thread vocodeThread;
+        cudaStream_t vocodeStream{};
+        bool vocodeStreamCreated{false};
+
         try
         {
             auto request = buildRequest(item);
-            int32_t const chunkFrames = std::max(1, item.value("chunk_frames", 13));
+            // first_chunk_frames drives the runtime's codecChunkFrames so the
+            // first emitted RVQ chunk arrives ASAP for low TTFA. chunk_frames
+            // is accepted for forward-compat with the adaptive-growth design
+            // (see codex spec §A); current implementation = "method ii" where
+            // codecChunkFrames is fixed at first_chunk_frames.
+            int32_t const firstChunkFrames = std::max(1, item.value("first_chunk_frames",
+                                                                    item.value("chunk_frames", 8)));
             bool const streaming = item.value("stream", true);
             std::string const chunkFormat = item.value("chunk_format", "pcm_s16le");
             std::string const chunkTransport = item.value("chunk_transport", "base64");
 
+            // Reset stateful Code2Wav state at request start so each request is independent.
+            if (useStateful && statefulCode2wavRunner)
+            {
+                statefulCode2wavRunner->reset(stream);
+            }
+
+            // Vocode lambda — runs on whichever stream is active (sync = main stream,
+            // async = dedicated vocodeStream).
+            auto runVocode = [&](std::vector<std::vector<int32_t>> const& chunkRvqCodes,
+                                  bool isFinal, cudaStream_t s, std::vector<float>& samplesOut) -> bool {
+                rt::audioUtils::AudioData audioOutput;
+                auto const transposed = transposeFrames(chunkRvqCodes);
+                bool ok = false;
+                if (useStateful)
+                {
+                    ok = statefulCode2wavRunner->generateChunk(transposed, isFinal, audioOutput, s);
+                }
+                else
+                {
+                    ok = code2wavRunner->generateWaveform(transposed, audioOutput, s);
+                }
+                if (!ok)
+                {
+                    return false;
+                }
+                samplesOut = audioToFloatSamples(audioOutput);
+                return true;
+            };
+
+            auto emitChunk = [&](std::vector<std::vector<int32_t>> const& chunkRvqCodes, bool isFinal,
+                                  int32_t idx, std::chrono::steady_clock::time_point startTs,
+                                  cudaStream_t vocStream) {
+                int32_t const frames = static_cast<int32_t>(chunkRvqCodes.size());
+                auto const c2wStart = std::chrono::steady_clock::now();
+                std::vector<float> samples;
+                if (frames > 0)
+                {
+                    if (!runVocode(chunkRvqCodes, isFinal, vocStream, samples))
+                    {
+                        emitEvent(Json{{"event", "error"}, {"ok", false},
+                            {"request_id", requestId}, {"id", requestId},
+                            {"error", "Code2Wav generateWaveform failed"}});
+                        return;
+                    }
+                }
+                auto const c2wEnd = std::chrono::steady_clock::now();
+                int64_t const c2wMs
+                    = std::chrono::duration_cast<std::chrono::milliseconds>(c2wEnd - c2wStart).count();
+
+                std::vector<int16_t> const pcm = floatToPcm16(samples);
+                std::string const b64 = base64Encode(
+                    reinterpret_cast<uint8_t const*>(pcm.data()), pcm.size() * sizeof(int16_t));
+
+                int64_t const elapsedMs = std::chrono::duration_cast<std::chrono::milliseconds>(
+                    c2wEnd - requestStart).count();
+                int64_t const queueMs = std::chrono::duration_cast<std::chrono::milliseconds>(
+                    c2wStart - startTs).count();
+
+                Json evt = {
+                    {"event", "chunk"},
+                    {"ok", true},
+                    {"request_id", requestId},
+                    {"id", requestId},
+                    {"chunk_index", idx},
+                    {"chunk_format", chunkFormat},
+                    {"chunk_transport", chunkTransport},
+                    {"frames", frames},
+                    {"samples", static_cast<int64_t>(pcm.size())},
+                    {"sample_rate", sampleRate},
+                    {"is_final", isFinal},
+                    {"code2wav_ms", c2wMs},
+                    {"queue_ms", queueMs},
+                    {"elapsed_ms", elapsedMs},
+                    {"audio_b64", b64},
+                };
+                emitEvent(std::move(evt));
+            };
+
+            if (streaming && useAsyncVocode)
+            {
+                CUDA_CHECK(cudaStreamCreate(&vocodeStream));
+                vocodeStreamCreated = true;
+                vocodeThread = std::thread([&] {
+                    while (true)
+                    {
+                        VocodeJob job;
+                        {
+                            std::unique_lock<std::mutex> lk(vocodeMu);
+                            vocodeCv.wait(lk, [&] { return !vocodeQ.empty(); });
+                            job = std::move(vocodeQ.front());
+                            vocodeQ.pop_front();
+                        }
+                        if (job.poison)
+                        {
+                            break;
+                        }
+                        try
+                        {
+                            emitChunk(job.frames, job.isFinal, job.chunkIndex, job.enqueuedAt, vocodeStream);
+                        }
+                        catch (...)
+                        {
+                            vocodeError = std::current_exception();
+                            // drain remaining jobs but keep loop alive until poison.
+                        }
+                    }
+                });
+            }
+
             if (streaming)
             {
-                request.codecChunkFrames = chunkFrames;
+                request.codecChunkFrames = firstChunkFrames;
                 request.shouldCancel = [&cancelled]() { return cancelled.load(std::memory_order_acquire); };
-                request.onAudioChunkReady
-                    = [&](std::vector<std::vector<int32_t>> const& chunkRvqCodes, int32_t /*batchIdx*/, bool isFinal) {
-                          // Skip empty non-final chunks defensively (final empty chunks
-                          // still produce an event so the consumer sees end-of-stream).
-                          int32_t const frames = static_cast<int32_t>(chunkRvqCodes.size());
-
-                          auto const c2wStart = std::chrono::steady_clock::now();
-                          std::vector<float> samples;
-                          if (frames > 0)
-                          {
-                              rt::audioUtils::AudioData audioOutput;
-                              auto const transposed = transposeFrames(chunkRvqCodes);
-                              if (!code2wavRunner->generateWaveform(transposed, audioOutput, stream))
-                              {
-                                  emitEvent(Json{{"event", "error"}, {"ok", false},
-                                      {"request_id", requestId}, {"id", requestId},
-                                      {"error", "Code2Wav generateWaveform failed"}});
-                                  return;
-                              }
-                              samples = audioToFloatSamples(audioOutput);
-                          }
-                          auto const c2wEnd = std::chrono::steady_clock::now();
-                          int64_t const c2wMs
-                              = std::chrono::duration_cast<std::chrono::milliseconds>(c2wEnd - c2wStart).count();
-
-                          std::vector<int16_t> const pcm = floatToPcm16(samples);
-                          std::string const b64 = base64Encode(
-                              reinterpret_cast<uint8_t const*>(pcm.data()), pcm.size() * sizeof(int16_t));
-
-                          int64_t const elapsedMs = std::chrono::duration_cast<std::chrono::milliseconds>(
-                              c2wEnd - requestStart)
-                                                        .count();
-
-                          Json evt = {
-                              {"event", "chunk"},
-                              {"ok", true},
-                              {"request_id", requestId},
-                              {"id", requestId},
-                              {"chunk_index", chunkIndex++},
-                              {"chunk_format", chunkFormat},
-                              {"chunk_transport", chunkTransport},
-                              {"frames", frames},
-                              {"samples", static_cast<int64_t>(pcm.size())},
-                              {"sample_rate", sampleRate},
-                              {"is_final", isFinal},
-                              {"code2wav_ms", c2wMs},
-                              {"elapsed_ms", elapsedMs},
-                              {"audio_b64", b64},
-                          };
-                          emitEvent(std::move(evt));
-                      };
+                if (useAsyncVocode)
+                {
+                    request.onAudioChunkReady = [&](std::vector<std::vector<int32_t>> const& chunkRvqCodes,
+                                                     int32_t /*batchIdx*/, bool isFinal) {
+                        VocodeJob job;
+                        job.poison = false;
+                        job.isFinal = isFinal;
+                        job.frames = chunkRvqCodes;
+                        job.chunkIndex = chunkIndex++;
+                        job.enqueuedAt = std::chrono::steady_clock::now();
+                        {
+                            std::lock_guard<std::mutex> lk(vocodeMu);
+                            vocodeQ.push_back(std::move(job));
+                        }
+                        vocodeCv.notify_one();
+                    };
+                }
+                else
+                {
+                    request.onAudioChunkReady = [&](std::vector<std::vector<int32_t>> const& chunkRvqCodes,
+                                                     int32_t /*batchIdx*/, bool isFinal) {
+                        emitChunk(chunkRvqCodes, isFinal, chunkIndex++,
+                            std::chrono::steady_clock::now(), stream);
+                    };
+                }
             }
 
             Qwen3OmniTTSRuntime::TalkerGenerationResponse response;
             bool const ok = ttsRuntime->handleAudioGeneration(request, response, stream);
+
+            // Drain async vocode thread before emitting done/cancelled/error.
+            if (vocodeThread.joinable())
+            {
+                {
+                    std::lock_guard<std::mutex> lk(vocodeMu);
+                    VocodeJob poison;
+                    poison.poison = true;
+                    vocodeQ.push_back(std::move(poison));
+                }
+                vocodeCv.notify_one();
+                vocodeThread.join();
+            }
+            if (vocodeStreamCreated)
+            {
+                cudaStreamDestroy(vocodeStream);
+                vocodeStreamCreated = false;
+            }
+            if (vocodeError)
+            {
+                std::rethrow_exception(vocodeError);
+            }
 
             if (cancelled.load(std::memory_order_acquire))
             {
@@ -431,6 +584,24 @@ int main(int argc, char** argv)
         }
         catch (std::exception const& e)
         {
+            // Best-effort drain of async vocode thread on exception so we don't
+            // leak a detached worker into the next request.
+            if (vocodeThread.joinable())
+            {
+                {
+                    std::lock_guard<std::mutex> lk(vocodeMu);
+                    VocodeJob poison;
+                    poison.poison = true;
+                    vocodeQ.push_back(std::move(poison));
+                }
+                vocodeCv.notify_one();
+                vocodeThread.join();
+            }
+            if (vocodeStreamCreated)
+            {
+                cudaStreamDestroy(vocodeStream);
+                vocodeStreamCreated = false;
+            }
             emitEvent(Json{{"event", "error"}, {"ok", false},
                 {"request_id", requestId}, {"id", requestId}, {"error", e.what()}});
         }
