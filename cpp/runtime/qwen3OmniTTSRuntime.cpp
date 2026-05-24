@@ -2613,6 +2613,14 @@ private:
     }
 };
 
+// 5-arg overload — for now delegates to 4-arg (RuntimeOptions backend selection
+// will activate once P2-C tail commits land). Worker.cpp passes options here.
+Qwen3OmniTTSRuntime::Qwen3OmniTTSRuntime(std::string const& talkerEngineDir, std::string const& codePredictorEngineDir,
+    std::string const& tokenizerDir, cudaStream_t stream, RuntimeOptions const& /*options*/)
+    : Qwen3OmniTTSRuntime(talkerEngineDir, codePredictorEngineDir, tokenizerDir, stream)
+{
+}
+
 Qwen3OmniTTSRuntime::Qwen3OmniTTSRuntime(std::string const& talkerEngineDir, std::string const& codePredictorEngineDir,
     std::string const& tokenizerDir, cudaStream_t stream)
     : mStream(stream)

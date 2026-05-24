@@ -132,6 +132,10 @@ public:
     Qwen3OmniTTSRuntime(std::string const& talkerEngineDir, std::string const& codePredictorEngineDir,
         std::string const& tokenizerDir, cudaStream_t stream);
 
+    //! @brief 5-arg overload accepting backend/projection RuntimeOptions (fork P2 worker contract).
+    Qwen3OmniTTSRuntime(std::string const& talkerEngineDir, std::string const& codePredictorEngineDir,
+        std::string const& tokenizerDir, cudaStream_t stream, RuntimeOptions const& options);
+
     //! @brief Destructor
     ~Qwen3OmniTTSRuntime();
 
