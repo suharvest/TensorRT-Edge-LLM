@@ -157,10 +157,16 @@ public:
         int32_t talkerTopK{0};          //!< Talker top-K (0 = default 50)
         float talkerTopP{0};            //!< Talker top-P (0 = default 1.0)
         float repetitionPenalty{1.05f}; //!< Repetition penalty applied to seen codec tokens (1.0 = disabled)
+        float codecEosLogitOffset{0};   //!< Added to codec EOS logit before EOS bias onset
+        float predictorTemperature{0};  //!< CodePredictor temperature (0 = talker temperature)
+        int32_t predictorTopK{0};        //!< CodePredictor top-K (0 = talker top-K)
+        float predictorTopP{0};          //!< CodePredictor top-P (0 = talker top-P)
 
         // Speaker selection (optional, defaults to config default)
         std::string speakerName{""}; //!< Speaker name (e.g., "f245", "m02") - empty means use default
+        std::string language{""};    //!< Language hint (e.g., "chinese", "english")
         int32_t speakerId{-1};       //!< Speaker ID - if >= 0, overrides speakerName
+        std::vector<float> speakerEmbedding; //!< Optional raw x-vector embedding [talkerHiddenSize]
 
         // Input: conversation messages for this request (runtime tokenizes internally)
         std::vector<Message> messages;
