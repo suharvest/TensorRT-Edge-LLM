@@ -180,6 +180,89 @@ uint32_t halfToFloatBits(uint16_t h)
     return (sign << 31) | ((exp + 112) << 23) | (mant << 13);
 }
 
+// Additional helpers from fork b9c57c8 needed by P2-C nested-class code.
+
+std::filesystem::path getDumpPath(std::string const& name)
+{
+    char const* dumpDir = std::getenv("QWEN3_TTS_DUMP_DIR");
+    if (!dumpDir || !*dumpDir)
+    {
+        return {};
+    }
+    std::filesystem::create_directories(dumpDir);
+    std::string prefix = "official";
+    if (char const* prefixEnv = std::getenv("QWEN3_TTS_DUMP_PREFIX"))
+    {
+        if (*prefixEnv)
+        {
+            prefix = prefixEnv;
+        }
+    }
+    return std::filesystem::path(dumpDir) / (prefix + "_" + name);
+}
+
+template <typename T>
+void dumpVector(std::string const& name, std::vector<T> const& values)
+{
+    auto path = getDumpPath(name);
+    if (path.empty())
+    {
+        return;
+    }
+    std::ofstream file(path, std::ios::binary);
+    file.write(reinterpret_cast<char const*>(values.data()),
+        static_cast<std::streamsize>(values.size() * sizeof(T)));
+}
+
+size_t dataTypeSize(nvinfer1::DataType dtype)
+{
+    switch (dtype)
+    {
+    case nvinfer1::DataType::kFLOAT: return sizeof(float);
+    case nvinfer1::DataType::kHALF:
+    case nvinfer1::DataType::kBF16: return sizeof(uint16_t);
+    case nvinfer1::DataType::kINT32: return sizeof(int32_t);
+    case nvinfer1::DataType::kINT64: return sizeof(int64_t);
+    default: throw std::runtime_error("Unsupported TensorRT data type");
+    }
+}
+
+std::vector<float> copyTensorToHostFloat(rt::Tensor const& tensor, int64_t elements, cudaStream_t stream)
+{
+    std::vector<float> out(static_cast<size_t>(elements));
+    auto const dtype = tensor.getDataType();
+    if (dtype == nvinfer1::DataType::kFLOAT)
+    {
+        CUDA_CHECK(cudaMemcpyAsync(
+            out.data(), tensor.rawPointer(), out.size() * sizeof(float), cudaMemcpyDeviceToHost, stream));
+        CUDA_CHECK(cudaStreamSynchronize(stream));
+        return out;
+    }
+    if (dtype != nvinfer1::DataType::kHALF && dtype != nvinfer1::DataType::kBF16)
+    {
+        throw std::runtime_error("Unsupported CodePredictor embedding table dtype");
+    }
+
+    std::vector<uint16_t> raw(static_cast<size_t>(elements));
+    CUDA_CHECK(cudaMemcpyAsync(
+        raw.data(), tensor.rawPointer(), raw.size() * sizeof(uint16_t), cudaMemcpyDeviceToHost, stream));
+    CUDA_CHECK(cudaStreamSynchronize(stream));
+    for (int64_t i = 0; i < elements; ++i)
+    {
+        uint32_t bits = 0;
+        if (dtype == nvinfer1::DataType::kBF16)
+        {
+            bits = static_cast<uint32_t>(raw[static_cast<size_t>(i)]) << 16;
+        }
+        else
+        {
+            bits = halfToFloatBits(raw[static_cast<size_t>(i)]);
+        }
+        std::memcpy(&out[static_cast<size_t>(i)], &bits, sizeof(float));
+    }
+    return out;
+}
+
 } // anonymous namespace
 
 class Qwen3OmniTTSRuntime::Qwen3TTSCodePredictorEngine
