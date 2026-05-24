@@ -70,7 +70,13 @@ if(NOT DEFINED AARCH64_BUILD
 endif()
 
 # Orin/JetPack cuda.h may lack cudaLibrary_t; GDN runner uses compat typedef
-# when this is set.
+# when this is set. Auto-detect Tegra so Jetson native builds don't have to
+# pass -DEMBEDDED_TARGET=jetson-orin manually (otherwise the cuteDSL prebuilt
+# headers fail to compile with 90 "cudaLibrary_t undefined" errors).
+if(NOT DEFINED EMBEDDED_TARGET AND EXISTS "/etc/nv_tegra_release")
+  set(EMBEDDED_TARGET "jetson-orin")
+  message(STATUS "Detected Tegra (L4T); defaulting EMBEDDED_TARGET=jetson-orin")
+endif()
 if(DEFINED EMBEDDED_TARGET AND EMBEDDED_TARGET STREQUAL "jetson-orin")
   add_compile_definitions(TRT_EDGELLM_CUDA_LIBRARY_T_COMPAT)
 endif()
