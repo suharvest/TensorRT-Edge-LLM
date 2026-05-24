@@ -141,6 +141,11 @@ public:
 
     // ========== Core API ==========
 
+    // Forward-declared streaming chunk callback (defined again below for clarity).
+    // 3-parameter signature: (chunkRvqCodes [numFrames][16], batchIdx, isFinal).
+    using AudioChunkCallback = std::function<void(
+        std::vector<std::vector<int32_t>> const& chunkRvqCodes, int32_t batchIdx, bool isFinal)>;
+
     /*!
      * @brief Talker audio generation request structure
      *
@@ -173,6 +178,16 @@ public:
         bool applyChatTemplate{true};   //!< Whether to apply chat template formatting
         bool addGenerationPrompt{true}; //!< Whether to add generation prompt at the end
         bool enableThinking{false};     //!< Whether to enable thinking mode
+
+        // ===== Optional streaming hooks (standalone-TTS streaming path) =====
+        //! Emit a chunk every N audio frames. 0 = disabled (non-streaming behavior).
+        int32_t codecChunkFrames{0};
+        //! Invoked from the Talker decode loop when codecChunkFrames frames have accumulated,
+        //! and once more at end-of-generation with isFinal=true for any remainder.
+        //! Signature: (chunkRvqCodes [N][16], batchIdx, isFinal).
+        AudioChunkCallback onAudioChunkReady{};
+        //! Optional polled cancel hook. Returning true cancels the request mid-stream.
+        std::function<bool()> shouldCancel{};
     };
 
     /*!
@@ -293,9 +308,10 @@ public:
 
     /*!
      * @brief Configuration for Thinker→Talker streaming pipeline
+     *
+     * AudioChunkCallback is the same 3-param signature defined earlier
+     * (see TalkerGenerationRequest::onAudioChunkReady).
      */
-    using AudioChunkCallback = std::function<void(std::vector<std::vector<int32_t>> const& chunkRvqCodes)>;
-
     struct ThinkerTalkerStreamingConfig
     {
         int32_t talkerPrefillThreshold{4};    //!< Start Talker prefill after this many assistant tokens
@@ -550,6 +566,7 @@ private:
         std::unordered_set<int32_t> seenTokenSet;   //!< Host-side seen tokens for repetition penalty
         int32_t numSeenTokens{0};                   //!< Count of unique seen tokens
         std::vector<std::vector<int32_t>> rvqCodes; //!< Generated RVQ codes [numFrames][numCodesPerFrame]
+        int32_t lastChunkEnd{0}; //!< Frame index of last emitted streaming chunk (standalone-TTS streaming path)
     };
 
     /*!
@@ -571,10 +588,20 @@ private:
      */
     //! @param prefillSeqLens Per-batch prefill sequence lengths for correct hidden-state extraction
     //!        after batched prefill with padding. Empty for single-batch callers.
+    //! Optional per-batch streaming hook bundle (standalone-TTS streaming path).
+    //! Empty vector or null entries disable streaming (preserves non-streaming behavior).
+    struct PerBatchStreamingHooks
+    {
+        int32_t codecChunkFrames{0};
+        AudioChunkCallback onAudioChunkReady{};
+        std::function<bool()> shouldCancel{};
+    };
+
     bool runTalkerGenerationLoop(std::vector<PerBatchTalkerState>& states, int32_t activeBatchSize, int32_t maxFrames,
         SamplingParams const& talkerSamplingParams, SamplingParams const& predictorSamplingParams,
         float repetitionPenalty, std::vector<rt::Tensor const*> const& trailingTextHiddens,
-        rt::Tensor& codecHiddensBuffer, cudaStream_t stream, std::vector<int64_t> const& prefillSeqLens = {});
+        rt::Tensor& codecHiddensBuffer, cudaStream_t stream, std::vector<int64_t> const& prefillSeqLens = {},
+        std::vector<PerBatchStreamingHooks> const& streamingHooks = {});
 
     /*!
      * @brief Run a single Talker decode frame (used by the Thinker-Talker streaming path).
