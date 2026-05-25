@@ -389,13 +389,14 @@ int main(int argc, char** argv)
         try
         {
             auto request = buildRequest(item);
-            // first_chunk_frames drives the runtime's codecChunkFrames so the
-            // first emitted RVQ chunk arrives ASAP for low TTFA. chunk_frames
-            // is accepted for forward-compat with the adaptive-growth design
-            // (see codex spec §A); current implementation = "method ii" where
-            // codecChunkFrames is fixed at first_chunk_frames.
-            int32_t const firstChunkFrames = std::max(1, item.value("first_chunk_frames",
-                                                                    item.value("chunk_frames", 8)));
+            // Adaptive chunk growth: first_chunk_frames sizes the FIRST emitted
+            // RVQ chunk (low TTFA target, default 8), chunk_frames sizes all
+            // subsequent chunks (steady-state stability, default 10). When
+            // chunk_frames <= 0 the runtime reuses first_chunk_frames for every
+            // chunk (legacy method-ii behavior). max_chunk_frames /
+            // chunk_growth_frames are accepted for forward-compat but unused.
+            int32_t const firstChunkFrames = std::max(1, item.value("first_chunk_frames", 8));
+            int32_t const subsequentChunkFrames = std::max(0, item.value("chunk_frames", 10));
             bool const streaming = item.value("stream", true);
             std::string const chunkFormat = item.value("chunk_format", "pcm_s16le");
             std::string const chunkTransport = item.value("chunk_transport", "base64");
@@ -512,6 +513,7 @@ int main(int argc, char** argv)
             if (streaming)
             {
                 request.codecChunkFrames = firstChunkFrames;
+                request.subsequentChunkFrames = subsequentChunkFrames;
                 request.shouldCancel = [&cancelled]() { return cancelled.load(std::memory_order_acquire); };
                 if (useAsyncVocode)
                 {

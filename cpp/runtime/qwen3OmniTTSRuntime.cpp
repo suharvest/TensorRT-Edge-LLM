@@ -3682,6 +3682,7 @@ bool Qwen3OmniTTSRuntime::handleAudioGeneration(
         for (int32_t b = 0; b < activeBatchSize; ++b)
         {
             streamingHooks[b].codecChunkFrames = requests[b].codecChunkFrames;
+            streamingHooks[b].subsequentChunkFrames = requests[b].subsequentChunkFrames;
             streamingHooks[b].onAudioChunkReady = requests[b].onAudioChunkReady;
             streamingHooks[b].shouldCancel = requests[b].shouldCancel;
         }
@@ -4111,8 +4112,13 @@ bool Qwen3OmniTTSRuntime::runTalkerGenerationLoop(std::vector<PerBatchTalkerStat
                         unfinished--;
                         continue;
                     }
+                    // Adaptive chunk size: first emitted chunk uses codecChunkFrames (low TTFA),
+                    // subsequent chunks use subsequentChunkFrames if set (>0), else fall back to codecChunkFrames.
+                    int32_t const threshold = (states[b].lastChunkEnd == 0 || hook.subsequentChunkFrames <= 0)
+                        ? hook.codecChunkFrames
+                        : hook.subsequentChunkFrames;
                     if (hook.codecChunkFrames > 0 && hook.onAudioChunkReady
-                        && (states[b].talkerFrames - states[b].lastChunkEnd) >= hook.codecChunkFrames)
+                        && (states[b].talkerFrames - states[b].lastChunkEnd) >= threshold)
                     {
                         std::vector<std::vector<int32_t>> chunk(states[b].rvqCodes.begin() + states[b].lastChunkEnd,
                             states[b].rvqCodes.begin() + states[b].talkerFrames);

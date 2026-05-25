@@ -181,7 +181,12 @@ public:
 
         // ===== Optional streaming hooks (standalone-TTS streaming path) =====
         //! Emit a chunk every N audio frames. 0 = disabled (non-streaming behavior).
+        //! This value applies to the FIRST emitted chunk (low TTFA target).
         int32_t codecChunkFrames{0};
+        //! Size of subsequent emitted chunks after the first. 0 means reuse codecChunkFrames.
+        //! Lets callers prioritize TTFA (small first chunk) and steady-state stability
+        //! (larger subsequent chunks).
+        int32_t subsequentChunkFrames{0};
         //! Invoked from the Talker decode loop when codecChunkFrames frames have accumulated,
         //! and once more at end-of-generation with isFinal=true for any remainder.
         //! Signature: (chunkRvqCodes [N][16], batchIdx, isFinal).
@@ -592,7 +597,8 @@ private:
     //! Empty vector or null entries disable streaming (preserves non-streaming behavior).
     struct PerBatchStreamingHooks
     {
-        int32_t codecChunkFrames{0};
+        int32_t codecChunkFrames{0};       //!< Size of the first emitted chunk.
+        int32_t subsequentChunkFrames{0};  //!< Size of subsequent chunks (0 = reuse codecChunkFrames).
         AudioChunkCallback onAudioChunkReady{};
         std::function<bool()> shouldCancel{};
     };
