@@ -964,6 +964,17 @@ def main():
                         type=int,
                         default=60,
                         help="Speculative decoding: verification tree size")
+    parser.add_argument(
+        "--weight-streaming-budget",
+        default=None,
+        help=(
+            "TensorRT weight streaming budget. Accepts: integer bytes, "
+            "'<N>g' GiB, '<N>m' MiB, 'off' (disable streaming, keep all weights "
+            "on GPU), 'min'/'-1' (minimum budget = max streaming, smallest "
+            "GPU footprint). Has no effect unless the engine was built with "
+            "kWEIGHT_STREAMING. Default: unset (full weights resident)."
+        ),
+    )
     args = parser.parse_args()
 
     from .engine import LLM
@@ -983,6 +994,7 @@ def main():
         draft_top_k=args.draft_top_k,
         draft_step=args.draft_step,
         verify_tree_size=args.verify_tree_size,
+        weight_streaming_budget=args.weight_streaming_budget,
     )
     if args.enable_profiling:
         llm.set_profiling_enabled(True)

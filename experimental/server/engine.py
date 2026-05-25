@@ -289,6 +289,7 @@ class LLM:
         draft_top_k: int = 10,
         draft_step: int = 6,
         verify_tree_size: int = 60,
+        weight_streaming_budget: Optional[str] = None,
     ):
         sources = sum(bool(s) for s in (model, onnx_dir, engine_dir))
         if sources != 1:
@@ -302,6 +303,23 @@ class LLM:
         self._draft_top_k = draft_top_k
         self._draft_step = draft_step
         self._verify_tree_size = verify_tree_size
+        # TRT weight streaming budget. Forwarded to the C++ runtime via the
+        # EDGELLM_WEIGHT_STREAMING_BUDGET env var, which is consumed inside
+        # LLMEngineRunner / EagleDraftEngineRunner constructors. Setting it
+        # in __init__ (before _load_runtime) guarantees the runtime sees it
+        # at the deserializeCudaEngine -> createExecutionContext seam.
+        # Accepted values: "<N>" bytes, "<N>g" GiB, "<N>m" MiB, "off", "min" / "-1".
+        # Has no effect if the engine was not built with kWEIGHT_STREAMING.
+        self._weight_streaming_budget = weight_streaming_budget
+        if weight_streaming_budget is not None and weight_streaming_budget != "":
+            os.environ["EDGELLM_WEIGHT_STREAMING_BUDGET"] = str(
+                weight_streaming_budget)
+            logger.info(
+                "Weight streaming budget requested: %s "
+                "(applied via EDGELLM_WEIGHT_STREAMING_BUDGET env var; "
+                "engine must be built with kWEIGHT_STREAMING for this to take effect).",
+                weight_streaming_budget,
+            )
         self._chat_template: Optional[Dict[str, Any]] = None
         # The C++ runtime owns one TRT execution context and mutable prompt
         # KV-cache maps. Serialize every runtime entry point, including cache

@@ -32,10 +32,38 @@
 #include <variant>
 #include <vector>
 
+// Forward declaration to avoid pulling NvInfer headers into every TU that includes this util header.
+namespace nvinfer1
+{
+class ICudaEngine;
+}
+
 namespace trt_edgellm
 {
 namespace rt
 {
+
+//! Apply weight-streaming budget to a TensorRT engine based on the
+//! EDGELLM_WEIGHT_STREAMING_BUDGET environment variable.
+//!
+//! No-op when:
+//!   - engine is null, or
+//!   - the engine was not built with `kWEIGHT_STREAMING` (streamableWeightsSize() == 0), or
+//!   - the env var is unset.
+//!
+//! Must be called AFTER deserializeCudaEngine and BEFORE createExecutionContext
+//! (per TensorRT API contract for setWeightStreamingBudgetV2).
+//!
+//! Env var formats (case-insensitive):
+//!   - "<N>"       : N bytes
+//!   - "<N>g"      : N GiB
+//!   - "<N>m"      : N MiB
+//!   - "off"       : disable streaming (budget = streamable size; all weights in GPU mem)
+//!   - "min" / "-1": minimum budget (maximum streaming, smallest GPU footprint)
+//!
+//! @param engine  Deserialized TRT engine (non-owning).
+//! @param tag     Short identifier used in log messages (e.g. "LLMEngineRunner").
+void applyWeightStreamingBudget(nvinfer1::ICudaEngine* engine, char const* tag);
 
 /*!
  * @brief Message with role and contents

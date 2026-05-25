@@ -146,6 +146,11 @@ LLMEngineRunner::LLMEngineRunner(std::filesystem::path const& enginePath, std::f
     mEngine = std::unique_ptr<nvinfer1::ICudaEngine>(
         mRuntime->deserializeCudaEngine(mmapReader->getData(), mmapReader->getSize()));
 
+    // Apply weight streaming budget (no-op unless EDGELLM_WEIGHT_STREAMING_BUDGET is set
+    // AND the engine was built with kWEIGHT_STREAMING).
+    // MUST happen before createExecutionContext per TensorRT requirements.
+    rt::applyWeightStreamingBudget(mEngine.get(), "LLMEngineRunner");
+
     // Use single executionContext for both prefill and generation.
     // Context memory is user-managed to enable sharing with other engines.
     // The caller must provide shared context memory via setContextMemory() before execution.

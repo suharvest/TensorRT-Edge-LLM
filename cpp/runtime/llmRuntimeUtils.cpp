@@ -23,16 +23,142 @@
 #include "common/stringUtils.h"
 #include "kernels/posEncoding/initializeCosSinCache.h"
 #include "runtime/streaming.h" // For SlotStreamState (explicit compactVector instantiation)
+#include <NvInferRuntime.h>
+#include <cctype>
+#include <cstdint>
+#include <cstdlib>
 #include <optional>
 #include <ostream>
 #include <sstream>
 #include <stdexcept>
+#include <string>
+
+// Local helpers to silence -Wdeprecated-declarations around the (still functional)
+// V1 weight-streaming getter, which TRT 10 marks TRT_DEPRECATED but never replaced
+// with a V2 variant. Scoped to the single call site.
+#if defined(__GNUC__) || defined(__clang__)
+#define EDGELLM_DIAG_PUSH_IGNORE_DEPRECATED                                                                            \
+    _Pragma("GCC diagnostic push") _Pragma("GCC diagnostic ignored \"-Wdeprecated-declarations\"")
+#define EDGELLM_DIAG_POP _Pragma("GCC diagnostic pop")
+#else
+#define EDGELLM_DIAG_PUSH_IGNORE_DEPRECATED
+#define EDGELLM_DIAG_POP
+#endif
 
 using namespace nvinfer1;
 namespace trt_edgellm
 {
 namespace rt
 {
+
+namespace
+{
+//! Parse EDGELLM_WEIGHT_STREAMING_BUDGET into a budget value (bytes).
+//! See header for accepted formats. Returns nullopt if unset/empty.
+std::optional<int64_t> parseWeightStreamingBudgetEnv(int64_t streamableSize, int64_t minimumBudget)
+{
+    char const* raw = std::getenv("EDGELLM_WEIGHT_STREAMING_BUDGET");
+    if (raw == nullptr)
+    {
+        return std::nullopt;
+    }
+    std::string s(raw);
+    while (!s.empty() && std::isspace(static_cast<unsigned char>(s.back())))
+    {
+        s.pop_back();
+    }
+    if (s.empty())
+    {
+        return std::nullopt;
+    }
+    std::string lower = s;
+    for (auto& c : lower)
+    {
+        c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
+    }
+    if (lower == "off")
+    {
+        return streamableSize;
+    }
+    if (lower == "min" || lower == "-1")
+    {
+        return minimumBudget;
+    }
+    char const suffix = lower.back();
+    int64_t mult = 1;
+    std::string numPart = lower;
+    if (suffix == 'g')
+    {
+        mult = static_cast<int64_t>(1) << 30;
+        numPart = lower.substr(0, lower.size() - 1);
+    }
+    else if (suffix == 'm')
+    {
+        mult = static_cast<int64_t>(1) << 20;
+        numPart = lower.substr(0, lower.size() - 1);
+    }
+    try
+    {
+        long long const v = std::stoll(numPart);
+        return static_cast<int64_t>(v) * mult;
+    }
+    catch (std::exception const&)
+    {
+        LOG_WARNING("EDGELLM_WEIGHT_STREAMING_BUDGET=%s could not be parsed; ignoring.", raw);
+        return std::nullopt;
+    }
+}
+} // namespace
+
+void applyWeightStreamingBudget(nvinfer1::ICudaEngine* engine, char const* tag)
+{
+    if (engine == nullptr)
+    {
+        return;
+    }
+    int64_t const streamableSize = engine->getStreamableWeightsSize();
+    if (streamableSize <= 0)
+    {
+        // Engine not built with kWEIGHT_STREAMING; nothing to do.
+        return;
+    }
+    // Note: TensorRT 10 ships setWeightStreamingBudgetV2() but did NOT introduce
+    // a V2 variant of the minimum-budget getter; the V1 getter is still the
+    // canonical way to query the minimum (it returns the same value used to
+    // clamp V2 budgets).
+    EDGELLM_DIAG_PUSH_IGNORE_DEPRECATED
+    int64_t const minBudget = engine->getMinimumWeightStreamingBudget();
+    EDGELLM_DIAG_POP
+    auto envBudget = parseWeightStreamingBudgetEnv(streamableSize, minBudget);
+    if (!envBudget.has_value())
+    {
+        LOG_INFO("[%s] Weight streaming AVAILABLE (streamable=%lld bytes, min=%lld bytes) but "
+                 "EDGELLM_WEIGHT_STREAMING_BUDGET not set; engine will load full weights.",
+            tag, static_cast<long long>(streamableSize), static_cast<long long>(minBudget));
+        return;
+    }
+    int64_t budget = envBudget.value();
+    if (budget < minBudget)
+    {
+        LOG_WARNING("[%s] Requested weight-streaming budget %lld < minimum %lld; clamping to minimum.", tag,
+            static_cast<long long>(budget), static_cast<long long>(minBudget));
+        budget = minBudget;
+    }
+    if (budget > streamableSize)
+    {
+        LOG_WARNING("[%s] Requested weight-streaming budget %lld > streamable %lld; clamping to streamable.", tag,
+            static_cast<long long>(budget), static_cast<long long>(streamableSize));
+        budget = streamableSize;
+    }
+    bool const ok = engine->setWeightStreamingBudgetV2(budget);
+    LOG_INFO("[%s] Weight streaming: budget=%lld / streamable=%lld bytes (min=%lld), setOK=%d", tag,
+        static_cast<long long>(budget), static_cast<long long>(streamableSize), static_cast<long long>(minBudget),
+        static_cast<int>(ok));
+    if (!ok)
+    {
+        LOG_ERROR("[%s] setWeightStreamingBudgetV2(%lld) returned false.", tag, static_cast<long long>(budget));
+    }
+}
 
 std::ostream& operator<<(std::ostream& os, RopeType const& type)
 {
