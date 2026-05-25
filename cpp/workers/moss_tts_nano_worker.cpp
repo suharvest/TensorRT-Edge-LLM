@@ -18,22 +18,27 @@
 
 #include <algorithm>
 #include <array>
+#include <atomic>
 #include <chrono>
 #include <cmath>
+#include <condition_variable>
 #include <cstdint>
 #include <cstdlib>
 #include <cstring>
+#include <deque>
 #include <exception>
 #include <filesystem>
 #include <fstream>
 #include <getopt.h>
 #include <iostream>
 #include <memory>
+#include <mutex>
 #include <nlohmann/json.hpp>
 #include <onnxruntime_cxx_api.h>
 #include <sentencepiece_processor.h>
 #include <stdexcept>
 #include <string>
+#include <thread>
 #include <utility>
 #include <vector>
 
@@ -141,8 +146,16 @@ int64_t elapsedMs(std::chrono::steady_clock::time_point a, std::chrono::steady_c
     return std::chrono::duration_cast<std::chrono::milliseconds>(b - a).count();
 }
 
+// N=2 concurrency: a single stdout is shared across multiple worker threads.
+// Without serialization, JSON lines from different requests can interleave
+// at byte boundaries (event A's "{...}\n" tail mixing with event B's head),
+// breaking the Python-side reader that does line-buffered json.loads().
+// emit() therefore holds gStdoutMutex around the full dump + newline + flush.
+std::mutex gStdoutMutex;
+
 void emit(Json payload)
 {
+    std::lock_guard<std::mutex> lock(gStdoutMutex);
     std::cout << payload.dump() << '\n' << std::flush;
 }
 
@@ -510,9 +523,16 @@ bool parseArgs(int argc, char** argv, Args& args)
 // ─── Request handler ─────────────────────────────────────────────────────────
 
 void handleRequest(Json const& item, MossTtsNanoRuntime& runtime,
-    sentencepiece::SentencePieceProcessor& sp, CodecEncodeRunner& codec, TtsConfig const& cfg)
+    sentencepiece::SentencePieceProcessor& sp, std::mutex& spMutex,
+    CodecEncodeRunner& codec, std::mutex& codecMutex, TtsConfig const& cfg)
 {
-    std::string const id = item.value("id", std::string("__request__"));
+    // Prefer "request_id" (spec §1 — TTS worker concurrency framework), fall
+    // back to the legacy "id" field that older Python callers still use.
+    // Backward compat: emit() events carry BOTH "request_id" and "id" so
+    // either reader format works.
+    std::string id = item.value("request_id", std::string{});
+    if (id.empty())
+        id = item.value("id", std::string("__request__"));
     auto const requestStart = std::chrono::steady_clock::now();
 
     if (!item.value("stream", true) || !item.value("stream_only", true))
@@ -525,7 +545,7 @@ void handleRequest(Json const& item, MossTtsNanoRuntime& runtime,
     std::string const text = item.value("text", std::string(""));
     if (text.empty()) throw std::runtime_error("text must not be empty");
 
-    emit(Json{{"event", "ready"}, {"id", id}, {"ok", true},
+    emit(Json{{"event", "ready"}, {"id", id}, {"request_id", id}, {"ok", true},
         {"sample_rate", runtime.codecSampleRate()}, {"channels", runtime.codecChannels()}});
 
     std::vector<std::vector<int32_t>> refAudioCodes;
@@ -533,6 +553,8 @@ void handleRequest(Json const& item, MossTtsNanoRuntime& runtime,
         && !item["ref_audio_b64"].get<std::string>().empty())
     {
         try {
+            // codec is shared (single ORT session); serialize encode across worker threads.
+            std::lock_guard<std::mutex> lock(codecMutex);
             refAudioCodes = encodeReferenceAudio(codec, item["ref_audio_b64"].get<std::string>(),
                 item.value("ref_audio_sample_rate", codec.sampleRate));
             std::fprintf(stderr, "[moss_worker] encoded ref audio → %zu code rows (codec.available=%d)\n",
@@ -550,7 +572,12 @@ void handleRequest(Json const& item, MossTtsNanoRuntime& runtime,
         std::fprintf(stderr, "[moss_worker] using default voice → %zu code rows\n", refAudioCodes.size());
     }
 
-    std::vector<int32_t> textIds = tokenize(sp, text);
+    std::vector<int32_t> textIds;
+    {
+        // SentencePiece is shared; Encode is not documented as thread-safe — lock.
+        std::lock_guard<std::mutex> lock(spMutex);
+        textIds = tokenize(sp, text);
+    }
     std::vector<int32_t> inputIds = buildInputIds(textIds, refAudioCodes, cfg);
     std::vector<int32_t> attentionMask(inputIds.size() / static_cast<size_t>(cfg.rowWidth), 1);
 
@@ -601,7 +628,7 @@ void handleRequest(Json const& item, MossTtsNanoRuntime& runtime,
         std::vector<int16_t> pcm = floatToPcm16(pcmOut, emittedSamples);
         emittedSamples = pcmOut.size();
 
-        emit(Json{{"event", "chunk"}, {"id", id}, {"ok", true},
+        emit(Json{{"event", "chunk"}, {"id", id}, {"request_id", id}, {"ok", true},
             {"audio_b64",
                 base64Encode(reinterpret_cast<uint8_t const*>(pcm.data()), pcm.size() * sizeof(int16_t))},
             {"frame_index", chunkIdx}, {"samples", static_cast<int32_t>(pcm.size())}});
@@ -626,9 +653,83 @@ void handleRequest(Json const& item, MossTtsNanoRuntime& runtime,
     flushBuffer(true);
 
     auto doneAt = std::chrono::steady_clock::now();
-    emit(Json{{"event", "done"}, {"id", id}, {"ok", true},
+    emit(Json{{"event", "done"}, {"id", id}, {"request_id", id}, {"ok", true},
         {"total_samples", static_cast<int32_t>(pcmOut.size())}, {"ttfa_ms", ttfaMs},
         {"wall_ms", elapsedMs(requestStart, doneAt)}});
+}
+
+// ─── Request dispatch (N=2 concurrency) ───────────────────────────────────────
+//
+// Why a worker-thread pool instead of round-robin per request?
+//
+// Runtime is already designed for parallel callers — slot pool +
+// std::this_thread::get_id()→slotId map (see mossTtsNanoRuntime.h
+// mActiveSlots) means each worker thread acquires its own slot and runs
+// prefill/decode/codec concurrently on independent CUDA streams + TRT
+// contexts. The main thread only reads stdin and dispatches.
+
+struct PendingRequest
+{
+    Json item;
+    std::string id;
+};
+
+struct WorkerPool
+{
+    std::deque<PendingRequest> queue;
+    std::mutex mu;
+    std::condition_variable cv;
+    std::atomic<bool> stop{false};
+    std::vector<std::thread> threads;
+
+    void push(PendingRequest&& req)
+    {
+        {
+            std::lock_guard<std::mutex> lock(mu);
+            queue.push_back(std::move(req));
+        }
+        cv.notify_one();
+    }
+
+    void shutdown()
+    {
+        stop.store(true);
+        cv.notify_all();
+        for (auto& t : threads)
+            if (t.joinable()) t.join();
+        threads.clear();
+    }
+};
+
+void workerThreadLoop(WorkerPool& pool, MossTtsNanoRuntime& runtime,
+    sentencepiece::SentencePieceProcessor& sp, std::mutex& spMutex,
+    CodecEncodeRunner& codec, std::mutex& codecMutex, TtsConfig const& cfg)
+{
+    while (true)
+    {
+        PendingRequest req;
+        {
+            std::unique_lock<std::mutex> lock(pool.mu);
+            pool.cv.wait(lock, [&] { return pool.stop.load() || !pool.queue.empty(); });
+            if (pool.stop.load() && pool.queue.empty()) return;
+            req = std::move(pool.queue.front());
+            pool.queue.pop_front();
+        }
+        try
+        {
+            handleRequest(req.item, runtime, sp, spMutex, codec, codecMutex, cfg);
+        }
+        catch (std::exception const& e)
+        {
+            emit(Json{{"event", "error"}, {"id", req.id}, {"request_id", req.id},
+                {"ok", false}, {"error", e.what()}});
+        }
+        catch (...)
+        {
+            emit(Json{{"event", "error"}, {"id", req.id}, {"request_id", req.id},
+                {"ok", false}, {"error", "unknown exception"}});
+        }
+    }
 }
 
 } // anonymous namespace
@@ -662,7 +763,21 @@ int main(int argc, char** argv)
             {"sample_rate", runtime.codecSampleRate()}, {"channels", runtime.codecChannels()},
             {"engine_dir", args.engineDir},
             {"voice_clone_enabled", codec.available()},
-            {"prompt_template_loaded", !cfg.userPromptPrefixTokenIds.empty()}});
+            {"prompt_template_loaded", !cfg.userPromptPrefixTokenIds.empty()},
+            {"max_slots", args.maxSlots}});
+
+        // N=2 concurrency: spawn maxSlots worker threads sharing the runtime's
+        // slot pool. Main thread reads stdin and pushes requests into the queue.
+        // At maxSlots=1 the pool degenerates to single-thread serial (same
+        // behavior as the pre-N=2 baseline, byte-equivalent output expected).
+        std::mutex spMutex;
+        std::mutex codecMutex;
+        WorkerPool pool;
+        for (int32_t i = 0; i < args.maxSlots; ++i)
+        {
+            pool.threads.emplace_back(workerThreadLoop, std::ref(pool), std::ref(runtime),
+                std::ref(sp), std::ref(spMutex), std::ref(codec), std::ref(codecMutex), std::cref(cfg));
+        }
 
         std::string line;
         while (std::getline(std::cin, line))
@@ -672,19 +787,25 @@ int main(int argc, char** argv)
             try
             {
                 Json item = Json::parse(line);
-                id = item.value("id", id);
-                handleRequest(item, runtime, sp, codec, cfg);
+                // Prefer request_id, fall back to id for protocol back-compat.
+                std::string rid = item.value("request_id", std::string{});
+                if (rid.empty()) rid = item.value("id", id);
+                id = rid;
+                pool.push(PendingRequest{std::move(item), id});
             }
             catch (std::exception const& e)
             {
-                emit(Json{{"event", "error"}, {"id", id}, {"ok", false}, {"error", e.what()}});
+                emit(Json{{"event", "error"}, {"id", id}, {"request_id", id},
+                    {"ok", false}, {"error", e.what()}});
             }
             catch (...)
             {
-                emit(Json{{"event", "error"}, {"id", id}, {"ok", false},
-                    {"error", "unknown exception"}});
+                emit(Json{{"event", "error"}, {"id", id}, {"request_id", id},
+                    {"ok", false}, {"error", "unknown exception"}});
             }
         }
+        // stdin EOF — drain queue and join worker threads.
+        pool.shutdown();
         return 0;
     }
     catch (std::exception const& e)

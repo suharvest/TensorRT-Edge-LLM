@@ -13,6 +13,7 @@
 #include <functional>
 #include <memory>
 #include <mutex>
+#include <random>
 #include <string>
 #include <thread>
 #include <unordered_map>
@@ -98,6 +99,15 @@ struct MossTtsNanoSlot
     // Chunk 4: codec stateful streaming context + state (per slot).
     nvinfer1::IExecutionContext* codecDecodeCtx{nullptr};
     std::unique_ptr<MossCodecState> codec;
+
+    // Per-slot deterministic RNG (N=2 concurrency parity gate). Was a
+    // ``static thread_local std::mt19937 rng{42}`` inside sampleFrame, which
+    // worked at N=1 but became non-deterministic at N=2: the second-served
+    // worker thread observed an already-advanced RNG state because both
+    // threads share neither the same RNG nor the same starting point
+    // determinstically. Per-slot RNG, re-seeded on acquirePoolSlot, makes
+    // each individual request byte-identical to its single-client baseline.
+    std::mt19937 rng{42};
 };
 
 class MossTtsNanoRuntime

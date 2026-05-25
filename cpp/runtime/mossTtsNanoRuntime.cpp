@@ -368,6 +368,10 @@ int32_t MossTtsNanoRuntime::acquirePoolSlot()
     mFreeSlots.pop_back();
     MossTtsNanoSlot& s = *mSlots.at(static_cast<size_t>(slotId));
     s.inUse = true; s.pastLen = 0; s.cumulativePastLen = 0; s.localPastLen = 0;
+    // Reset per-slot RNG so every request starts from the same deterministic
+    // PRNG state regardless of which slot it lands on or how many prior
+    // requests the slot handled — N=2 parity hard gate.
+    s.rng.seed(42);
     checkCuda(cudaMemsetAsync(s.globalKvDevice, 0, mGlobalKvBytes, s.stream), "clear MOSS global KV on acquire");
     if (s.localKvDevice != nullptr && mLocalKvBytes > 0)
         checkCuda(cudaMemsetAsync(s.localKvDevice, 0, mLocalKvBytes, s.stream), "clear MOSS local KV on acquire");
@@ -795,8 +799,9 @@ bool MossTtsNanoRuntime::sampleFrame(
 
     // Sample fresh random U values for this frame.
     // If MOSS_RNG_SEQ_FILE is set, consume floats from file (used to match ORT/PCG64).
-    // Else fall back to mt19937 seeded 42.
-    static thread_local std::mt19937 rng{42};
+    // Else fall back to the slot's mt19937 (re-seeded to 42 on acquirePoolSlot;
+    // see header comment on MossTtsNanoSlot::rng for N=2 parity rationale).
+    auto& rng = slot.rng;
     static thread_local std::uniform_real_distribution<float> u01(0.0f, 0.99999994f);
     float assistantU;
     std::vector<float> audioU(static_cast<size_t>(mNumVq));
