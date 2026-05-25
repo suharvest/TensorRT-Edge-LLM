@@ -308,6 +308,14 @@ int main(int argc, char** argv)
         {
             code2wavRunner = std::make_unique<Code2WavRunner>(args.code2wavEngineDir, stream);
         }
+        if (std::getenv("EDGE_LLM_TTS_CUDA_GRAPH") == nullptr
+            || std::string(std::getenv("EDGE_LLM_TTS_CUDA_GRAPH")) != "0")
+        {
+            if (!ttsRuntime->captureDecodingCUDAGraph(stream))
+            {
+                std::cerr << "warning: failed to capture talker decoding CUDA graph" << std::endl;
+            }
+        }
     }
     catch (std::exception const& e)
     {
