@@ -297,9 +297,8 @@ int main(int argc, char** argv)
     auto const initStart = std::chrono::steady_clock::now();
     try
     {
-        Qwen3OmniTTSRuntime::RuntimeOptions runtimeOptions;
         ttsRuntime = std::make_unique<Qwen3OmniTTSRuntime>(
-            args.talkerEngineDir, args.codePredictorEngineDir, args.tokenizerDir, stream, runtimeOptions);
+            args.talkerEngineDir, args.codePredictorEngineDir, args.tokenizerDir, stream);
         if (useStateful)
         {
             statefulCode2wavRunner = std::make_unique<StatefulCode2WavRunner>(statefulEngineDir, stream);

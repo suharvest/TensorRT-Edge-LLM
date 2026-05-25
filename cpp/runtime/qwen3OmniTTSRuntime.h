@@ -91,36 +91,6 @@ class Qwen3OmniTTSRuntime
 public:
     using FrameCallback = std::function<void(std::vector<int32_t> const& frameCodes, int32_t totalFrames)>;
 
-    enum class TalkerBackend
-    {
-        kAuto,
-        kGeneric,
-        kQwen3TTSExplicitKV,
-    };
-
-    enum class CodePredictorBackend
-    {
-        kAuto,
-        kGeneric,
-        kQwen3TTSNative,
-    };
-
-    enum class TextProjectionMode
-    {
-        kAuto,
-        kDevice,
-        kHostFP32,
-    };
-
-    struct RuntimeOptions
-    {
-        TalkerBackend talkerBackend{TalkerBackend::kAuto};
-        std::string qwen3TtsTalkerEnginePath;
-        CodePredictorBackend codePredictorBackend{CodePredictorBackend::kAuto};
-        TextProjectionMode textProjectionMode{TextProjectionMode::kAuto};
-        bool qwen3TtsPromptKvCache{false};
-    };
-
     /*!
      * @brief Construct and fully initialize the TTS runtime
      * @param talkerEngineDir Directory containing talker engine, MLP weights, embedding table, etc.
@@ -131,10 +101,6 @@ public:
      */
     Qwen3OmniTTSRuntime(std::string const& talkerEngineDir, std::string const& codePredictorEngineDir,
         std::string const& tokenizerDir, cudaStream_t stream);
-
-    //! @brief 5-arg overload accepting backend/projection RuntimeOptions (fork P2 worker contract).
-    Qwen3OmniTTSRuntime(std::string const& talkerEngineDir, std::string const& codePredictorEngineDir,
-        std::string const& tokenizerDir, cudaStream_t stream, RuntimeOptions const& options);
 
     //! @brief Destructor
     ~Qwen3OmniTTSRuntime();
@@ -390,141 +356,7 @@ public:
      */
     int32_t getSpeakerIdByName(std::string const& speakerName) const;
 
-    /*!
-     * @brief [Phase 2 hook] Create a fresh execution context bound to the loaded Talker engine.
-     *
-     * Returned context shares engine weights but has independent CUDA state and
-     * optimization-profile selection. Phase 3 will pair this with a per-slot CUDA stream
-     * and KV cache to enable concurrent N>1 inference. Phase 2 ships the hook only; the
-     * default per-instance contexts continue to serve all current call sites.
-     *
-     * NOTE: Talker uses a single context that switches between prefill (profile 0) and
-     * decode (profile 1) at runtime via setOptimizationProfileAsync — a single factory
-     * ctx is sufficient as long as Phase 3 also switches profiles per call. This is
-     * unlike the CP engine which requires a paired (prefill, decode) ctx set (see
-     * @ref createCodePredictorExecutionContextPair).
-     *
-     * @return Owning pointer to a fresh execution context, or nullptr if the Talker engine
-     *         is not loaded (e.g. wrong backend selected).
-     */
-    std::unique_ptr<nvinfer1::IExecutionContext> createTalkerExecutionContext();
-
-    /*!
-     * @brief [Phase 2 must-fix 3] Create a paired (prefill, decode) execution context set
-     *        bound to the loaded native Qwen3-TTS CodePredictor engine.
-     *
-     * CP generate-path uses BOTH a prefill ctx (profile 0, 2-token warmup) and a decode ctx
-     * (profile 1, single-token decode for residual groups) per frame. A single factory
-     * context cannot service both shapes without per-call profile churn, so we expose the
-     * pair directly. Phase 3 will install one such pair per request slot.
-     *
-     * @return std::pair{prefill_ctx, decode_ctx}. Both nullptr if the native CP engine
-     *         is not enabled.
-     */
-    std::pair<std::unique_ptr<nvinfer1::IExecutionContext>, std::unique_ptr<nvinfer1::IExecutionContext>>
-    createCodePredictorExecutionContextPair();
-
-    // ===================================================================
-    // [Phase 3a] Per-slot state ownership
-    //
-    // TalkerSlot / CodePredictorSlot wrap every piece of per-request mutable
-    // state previously held on the engine sub-classes (KV double-buffers, IO
-    // scratch tensors, sampling RNG, attention mask, prompt KV cache, etc.).
-    // The slot owns its own CUDA stream (borrowed reference) and execution
-    // context(s). The engine globals stay in place as the default path —
-    // every engine method now accepts an optional Slot*; when nullptr it
-    // falls back to engine members and behavior is byte-identical to Phase 2
-    // (N=1 default path).
-    //
-    // Phase 3b (out of scope here) will introduce a C++ Scheduler that holds
-    // a pool of these slots, one per concurrent request, and dispatches into
-    // the engine methods with non-null Slot* arguments.
-    //
-    // Storage is held in rt::Tensor (UINT8 byte buffer with size baked in)
-    // rather than the engine's private nested DeviceBuffer so that the slot
-    // types remain fully visible in the header without leaking engine
-    // internals.
-    // ===================================================================
-    struct TalkerSlot
-    {
-        cudaStream_t stream{nullptr};                       //!< borrowed
-        // Contexts are owned by the unique_ptrs below; callers should
-        // dereference those (via .get()) rather than caching a raw pointer.
-        // Codex round-3 review (Phase 3a) explicitly removed the public raw
-        // pointer mirrors to avoid silent dangling when the slot is moved
-        // or destroyed.
-        std::unique_ptr<nvinfer1::IExecutionContext> prefillCtxOwned;
-        std::unique_ptr<nvinfer1::IExecutionContext> decodeCtxOwned;
-        // Per-call IO scratch (byte buffers; sizes match the engine's mDevice* members)
-        rt::Tensor deviceEmbeds;
-        rt::Tensor deviceLogits;
-        rt::Tensor deviceHidden;
-        rt::Tensor devicePositionIds;
-        rt::Tensor deviceAttentionMask;
-        // KV double-buffers (2 * numDecoderLayers entries each)
-        std::vector<rt::Tensor> kvA;
-        std::vector<rt::Tensor> kvB;
-        // Prompt-KV cache (optional, lazy-allocated on first hit/store)
-        std::vector<rt::Tensor> promptKVs;
-        rt::Tensor promptLogits;
-        rt::Tensor promptHidden;
-        size_t promptKVBytes{0};
-        size_t promptHiddenBytes{0};
-        bool promptCacheValid{false};
-        int32_t promptCacheLen{0};
-        uint64_t promptCacheKey{0};
-        // Decode-loop state
-        int32_t seqLen{0};
-        int32_t parity{0};
-    };
-
-    struct CodePredictorSlot
-    {
-        cudaStream_t stream{nullptr};                      //!< borrowed
-        // Contexts are owned by the unique_ptrs below; callers should
-        // dereference those rather than caching a raw pointer (see
-        // TalkerSlot comment for the rationale).
-        std::unique_ptr<nvinfer1::IExecutionContext> prefillCtxOwned;
-        std::unique_ptr<nvinfer1::IExecutionContext> decodeCtxOwned;
-        // Per-call IO scratch
-        rt::Tensor deviceEmbeds;
-        rt::Tensor deviceLogits;
-        rt::Tensor deviceCachePosition;
-        rt::Tensor deviceSelectedTokens;
-        rt::Tensor deviceGenStep;
-        rt::Tensor devicePastLength;
-        rt::Tensor deviceSamplingWorkspace; //!< only sized when GPU sampling enabled on parent engine
-        // KV double-buffers (2 * numLayers each)
-        std::vector<rt::Tensor> kvA;
-        std::vector<rt::Tensor> kvB;
-        // Host-side sampling scratch (mirrors engine's mSample* members)
-        std::vector<float> sampleLogits;
-        std::vector<uint16_t> sampleRaw;
-        std::vector<std::pair<float, int32_t>> sampleVals;
-        std::vector<double> sampleProbs;
-        // Full std::mt19937 state (not just a seed). The engine mutates the
-        // mt19937 in-place during sampling (cpp ~:1484, ~:1525), so a 64-bit
-        // seed is NOT a drop-in replacement — codex round-3 review caught
-        // this gap. Initialize via the slot factory using the same seed
-        // policy the engine uses today.
-        std::mt19937 rng;
-        uint64_t gpuSamplingOffset{0};//!< Philox counter for GPU top-k/top-p path
-    };
-
-    //! [Phase 3a] Allocate a fully-sized Talker slot bound to the supplied
-    //! stream. Stream is borrowed (owner outlives the slot). Returns nullptr
-    //! if the explicit-KV Talker engine is not loaded.
-    std::unique_ptr<TalkerSlot> createTalkerSlot(cudaStream_t stream);
-
-    //! [Phase 3a] Allocate a fully-sized CodePredictor slot bound to the
-    //! supplied stream. Stream is borrowed. Returns nullptr if the native
-    //! Qwen3-TTS CP engine is not enabled.
-    std::unique_ptr<CodePredictorSlot> createCodePredictorSlot(cudaStream_t stream);
-
 private:
-    class Qwen3TTSCodePredictorEngine;
-    class Qwen3TTSTalkerEngine;
-
     // ========== Internal Methods ==========
 
     void initializeTTSEmbeddings(cudaStream_t stream);
@@ -731,11 +563,6 @@ private:
 
     std::unique_ptr<LLMEngineRunner> mTalkerLLMRunner;     //!< Talker LLM engine runner
     std::unique_ptr<LLMEngineRunner> mCodePredictorRunner; //!< CodePredictor engine runner
-    std::unique_ptr<Qwen3TTSCodePredictorEngine>
-        mQwen3TTSCodePredictorEngine; //!< Optional Qwen3-TTS native CodePredictor engine
-    bool mUseQwen3TTSCodePredictorEngine{false}; //!< Whether the Qwen3-TTS native CodePredictor engine is enabled
-    std::filesystem::path mQwen3TTSCodePredictorEnginePath;
-    std::unique_ptr<Qwen3TTSTalkerEngine> mQwen3TTSTalkerEngine; //!< Explicit-KV Qwen3-TTS Talker engine
     bool mUseHostTextProjection{false};
 
     LLMEngineRunnerConfig mTalkerLLMConfig;     //!< Talker LLM configuration
@@ -825,8 +652,7 @@ private:
     // [Phase B C1] mCodecHiddensBuffer was moved out of the runtime-global state to
     // per-request scope to avoid cross-request `cudaMemsetAsync` races at N>1. The
     // buffer is now a local in `handleAudioGeneration` (passed by reference into
-    // CP/residual helpers). C2 will fold it back into `TalkerSlot::codecHiddensBuffer`
-    // once full slot-plumbing lands.
+    // CP/residual helpers).
 
     nvinfer1::DataType mTalkerInputEmbedsDataType{nvinfer1::DataType::kHALF};
     nvinfer1::DataType mResidualEmbedDataType{nvinfer1::DataType::kHALF};
