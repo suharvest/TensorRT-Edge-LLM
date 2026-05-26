@@ -291,22 +291,56 @@ def _create_app(llm_instance):
 
     @app.post("/v1/cache/system_prompt")
     def cache_system_prompt(body: Dict[str, Any]):
+        # Optional ``tools`` (OpenAI schema). When provided alongside a
+        # ``system_prompt`` (or messages), render them into the cached prefix
+        # so that subsequent /v1/chat/completions requests carrying the same
+        # tools list hit the radix-tree prefix cache instead of re-prefilling
+        # the ~400 tokens of tool schema every turn.
+        tools = body.get("tools") or None
+        has_tools = bool(tools)
         if body.get("formatted_system_prompt") or body.get("formatted_prefix"):
+            # Caller pre-formatted everything; trust it as-is. Tools must be
+            # baked in by caller in this mode.
             prompt = body.get("formatted_system_prompt") or body["formatted_prefix"]
         elif body.get("prompt"):
             prompt = body["prompt"]
-        elif body.get("system_prompt") is not None:
+        elif body.get("system_prompt") is not None or has_tools:
             try:
-                prompt = llm_instance.format_system_prompt(
-                    body.get("system_prompt", ""))
+                if has_tools:
+                    # Build a synthetic [system] messages list with tools
+                    # injected, then format the full message (system role
+                    # prefix/suffix included) so the cached KV covers
+                    # system + tools spec as one contiguous prefix.
+                    sys_text = body.get("system_prompt", "") or ""
+                    base_messages = [{"role": "system", "content": sys_text}]
+                    injected = _inject_tools_and_normalize(base_messages, tools)
+                    prompt = llm_instance.format_messages(
+                        injected,
+                        add_generation_prompt=False,
+                        enable_thinking=False,
+                    )
+                else:
+                    prompt = llm_instance.format_system_prompt(
+                        body.get("system_prompt", ""))
             except Exception as exc:
                 logger.exception("System prompt formatting failed")
                 return JSONResponse(status_code=500,
                                     content={"error": str(exc)})
         elif body.get("messages"):
             try:
-                prompt = llm_instance.format_system_prompt_from_messages(
-                    body["messages"])
+                messages = body["messages"]
+                if has_tools:
+                    injected = _inject_tools_and_normalize(messages, tools)
+                    # Only cache the leading system block (post-injection)
+                    # so the prefix matches what chat_completions emits.
+                    prompt = llm_instance.format_messages(
+                        [injected[0]] if injected and injected[0].get("role") == "system" else injected,
+                        add_generation_prompt=False,
+                        enable_thinking=False,
+                    )
+                else:
+                    prompt = llm_instance.format_system_prompt_from_messages(
+                        messages)
             except Exception as exc:
                 logger.exception("System prompt formatting failed")
                 return JSONResponse(status_code=500,
@@ -318,8 +352,8 @@ def _create_app(llm_instance):
                 status_code=400,
                 content={
                     "error":
-                    "formatted_system_prompt, formatted_prefix, prompt, system_prompt, or "
-                    "messages with a leading system message is required"
+                    "formatted_system_prompt, formatted_prefix, prompt, system_prompt, "
+                    "tools, or messages with a leading system message is required"
                 },
             )
         lora_weights_name = body.get("lora_weights_name",
@@ -336,6 +370,9 @@ def _create_app(llm_instance):
             "object": "cache.system_prompt",
             "cached": cached,
             "lora_weights_name": lora_weights_name,
+            "has_tools": has_tools,
+            "tools_count": len(tools) if has_tools else 0,
+            "prompt_chars": len(prompt),
         }
 
     @app.post("/v1/chat/completions")
