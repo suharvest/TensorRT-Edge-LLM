@@ -33,7 +33,11 @@
 #include "profiling/timer.h"
 #include "sampler/sampling.h"
 #include <algorithm>
+#include <atomic>
+#include <cctype>
 #include <chrono>
+#include <cstdio>
+#include <cstdlib>
 #include <cmath>
 #include <condition_variable>
 #include <cstdlib>
@@ -144,6 +148,189 @@ inline int readTtsWorkerConcurrencyEnv(char const* engineTag)
 // Forward-declared from fork highperf/runtime-service tail (b9c57c8 reference
 // runtime); pulled into anonymous namespace so P2-C nested-class constructors
 // can resolve them without porting the full BF16 reference-runtime overhaul.
+
+// =========================================================================
+// Parity-dump helpers (env-gated; no-op when QWEN3_TTS_DUMP_DIR is unset).
+// Writes per-call NPY tensors (FP32 host-converted) + a `_log.json` manifest
+// matching the format produced by wsl2 reference dump
+// (bench/parity/ref_dump_qwen3_customvoice_bf16.tar.gz).
+// =========================================================================
+inline std::string const& qwenDumpDir()
+{
+    static std::string const sDir = []() -> std::string {
+        char const* env = std::getenv("QWEN3_TTS_DUMP_DIR");
+        std::string dir = env ? std::string(env) : std::string();
+        if (!dir.empty())
+        {
+            try
+            {
+                std::filesystem::create_directories(dir);
+            }
+            catch (...)
+            {
+            }
+        }
+        return dir;
+    }();
+    return sDir;
+}
+
+inline std::string safeDotName(std::string s)
+{
+    for (auto& c : s)
+    {
+        if (c == '.' || c == '/' || c == ' ')
+            c = '_';
+    }
+    return s;
+}
+
+// Convert device-side FP16/FP32 buffer to host float32 vector.
+inline std::vector<float> copyTensorToHostFloat(
+    void const* devPtr, size_t numElements, nvinfer1::DataType dtype, cudaStream_t stream)
+{
+    std::vector<float> out(numElements, 0.0f);
+    if (numElements == 0 || devPtr == nullptr)
+        return out;
+    if (dtype == nvinfer1::DataType::kFLOAT)
+    {
+        CUDA_CHECK(cudaMemcpyAsync(out.data(), devPtr, numElements * sizeof(float), cudaMemcpyDeviceToHost, stream));
+        CUDA_CHECK(cudaStreamSynchronize(stream));
+    }
+    else if (dtype == nvinfer1::DataType::kHALF)
+    {
+        std::vector<__half> tmp(numElements);
+        CUDA_CHECK(cudaMemcpyAsync(tmp.data(), devPtr, numElements * sizeof(__half), cudaMemcpyDeviceToHost, stream));
+        CUDA_CHECK(cudaStreamSynchronize(stream));
+        for (size_t i = 0; i < numElements; ++i)
+            out[i] = __half2float(tmp[i]);
+    }
+    else if (dtype == nvinfer1::DataType::kINT32)
+    {
+        std::vector<int32_t> tmp(numElements);
+        CUDA_CHECK(cudaMemcpyAsync(tmp.data(), devPtr, numElements * sizeof(int32_t), cudaMemcpyDeviceToHost, stream));
+        CUDA_CHECK(cudaStreamSynchronize(stream));
+        for (size_t i = 0; i < numElements; ++i)
+            out[i] = static_cast<float>(tmp[i]);
+    }
+    else
+    {
+        LOG_WARNING("copyTensorToHostFloat: unsupported dtype %d, dumping zeros", static_cast<int>(dtype));
+    }
+    return out;
+}
+
+// Write a flat float32 vector as a 1-D NPY file (minimal NPY v1.0 writer).
+inline void writeNpyF32(std::string const& path, std::vector<float> const& data)
+{
+    std::ofstream f(path, std::ios::binary);
+    if (!f)
+    {
+        LOG_WARNING("writeNpyF32: failed to open %s", path.c_str());
+        return;
+    }
+    char const magic[6] = {char(0x93), 'N', 'U', 'M', 'P', 'Y'};
+    f.write(magic, 6);
+    uint8_t ver[2] = {1, 0};
+    f.write(reinterpret_cast<char const*>(ver), 2);
+    std::string header = std::string("{'descr': '<f4', 'fortran_order': False, 'shape': (")
+        + std::to_string(data.size()) + ",), }";
+    // Pad header so total (10-byte preamble + header + '\n') is multiple of 64.
+    size_t const preamble = 10;
+    size_t pad = 64 - ((preamble + header.size() + 1) % 64);
+    header.append(pad, ' ');
+    header.push_back('\n');
+    uint16_t hlen = static_cast<uint16_t>(header.size());
+    f.write(reinterpret_cast<char const*>(&hlen), 2);
+    f.write(header.data(), header.size());
+    f.write(reinterpret_cast<char const*>(data.data()), data.size() * sizeof(float));
+}
+
+// Append one JSON-line manifest entry.
+inline void appendDumpLog(std::string const& jsonLine)
+{
+    auto const& dir = qwenDumpDir();
+    if (dir.empty())
+        return;
+    std::ofstream f(dir + "/_log.json", std::ios::app);
+    if (!f)
+        return;
+    f << jsonLine << "\n";
+}
+
+// Main dump driver. `shape` may be empty (treated as [num]). `callIdx`: 0=prefill, 1=first decode.
+inline void dumpTensor(std::string const& name, std::string const& tensorTag, void const* devPtr,
+    nvinfer1::DataType dtype, std::vector<int64_t> const& shape, cudaStream_t stream, int32_t callIdx = 0)
+{
+    auto const& dir = qwenDumpDir();
+    if (dir.empty() || devPtr == nullptr)
+        return;
+    int64_t numEl = 1;
+    if (shape.empty())
+    {
+        return; // need a shape
+    }
+    for (auto d : shape)
+        numEl *= d;
+    if (numEl <= 0)
+        return;
+
+    constexpr size_t kCap = 4096;
+    constexpr size_t kHalf = 2048;
+    std::vector<float> hostFull = copyTensorToHostFloat(devPtr, static_cast<size_t>(numEl), dtype, stream);
+    bool truncated = false;
+    std::vector<float> dumped;
+    if (hostFull.size() > kCap)
+    {
+        truncated = true;
+        dumped.reserve(2 * kHalf);
+        dumped.insert(dumped.end(), hostFull.begin(), hostFull.begin() + kHalf);
+        dumped.insert(dumped.end(), hostFull.end() - kHalf, hostFull.end());
+    }
+    else
+    {
+        dumped = hostFull;
+    }
+
+    // Basic stats (over the kept portion — same convention as reference).
+    float absmax = 0.0f;
+    double sum = 0.0;
+    for (float v : dumped)
+    {
+        float av = std::fabs(v);
+        if (av > absmax)
+            absmax = av;
+        sum += v;
+    }
+    double mean = dumped.empty() ? 0.0 : sum / static_cast<double>(dumped.size());
+
+    std::string safe = safeDotName(name) + "__" + safeDotName(tensorTag);
+    std::string npyFile = safe + (callIdx == 0 ? "" : std::string("__c") + std::to_string(callIdx)) + ".npy";
+    writeNpyF32(dir + "/" + npyFile, dumped);
+
+    // Compose minimal JSON entry (one line — matches ref _log.json semantics).
+    std::string dtypeStr = (dtype == nvinfer1::DataType::kFLOAT) ? "float32"
+        : (dtype == nvinfer1::DataType::kHALF)                   ? "float16"
+        : (dtype == nvinfer1::DataType::kINT32)                  ? "int32"
+                                                                 : "unknown";
+    std::string shapeStr = "[";
+    for (size_t i = 0; i < shape.size(); ++i)
+    {
+        shapeStr += std::to_string(shape[i]);
+        if (i + 1 < shape.size())
+            shapeStr += ", ";
+    }
+    shapeStr += "]";
+
+    char buf[512];
+    std::snprintf(buf, sizeof(buf),
+        "{\"name\":\"%s\",\"tensor\":\"%s\",\"shape\":%s,\"dtype\":\"%s\",\"absmax\":%.6g,\"mean\":%.6g,\"npy\":\"%s\","
+        "\"truncated\":%s,\"call_idx\":%d}",
+        name.c_str(), tensorTag.c_str(), shapeStr.c_str(), dtypeStr.c_str(), absmax, mean, npyFile.c_str(),
+        truncated ? "true" : "false", callIdx);
+    appendDumpLog(std::string(buf));
+}
+
 } // anonymous namespace
 
 Qwen3OmniTTSRuntime::Qwen3OmniTTSRuntime(std::string const& talkerEngineDir, std::string const& codePredictorEngineDir,
@@ -409,6 +596,22 @@ bool Qwen3OmniTTSRuntime::validateAndFillConfig(std::string const& talkerEngineD
     mTalkerConfig.codecThinkEosId = configJson["codec_think_eos_id"].get<int32_t>();
     mTalkerConfig.codecPadId = configJson["codec_pad_id"].get<int32_t>();
     mTalkerConfig.codecBosId = configJson["codec_bos_id"].get<int32_t>();
+
+    // CustomVoice: language-conditioned prefill path needs codec_think_id + codec_language_id map.
+    // Both fields are optional; if absent the runtime falls back to the legacy no-language path.
+    if (configJson.contains("codec_think_id"))
+    {
+        mTalkerConfig.codecThinkId = configJson["codec_think_id"].get<int32_t>();
+    }
+    if (configJson.contains("codec_language_id") && configJson["codec_language_id"].is_object())
+    {
+        for (auto const& [k, v] : configJson["codec_language_id"].items())
+        {
+            mTalkerConfig.codecLanguageId[k] = v.get<int32_t>();
+        }
+    }
+    LOG_INFO("CustomVoice language config: codecThinkId=%d, codecLanguageId entries=%zu", mTalkerConfig.codecThinkId,
+        mTalkerConfig.codecLanguageId.size());
     // Support both codec_eos_token_id (original) and codec_eos_id (legacy) for backward compatibility
     if (configJson.contains("codec_eos_token_id"))
     {
@@ -802,8 +1005,8 @@ void Qwen3OmniTTSRuntime::initializeTTSEmbeddings(cudaStream_t stream)
     LOG_INFO("TTS embeddings initialized");
 }
 
-bool Qwen3OmniTTSRuntime::projectToTalkerInput(
-    rt::Tensor const& thinkerEmbed, int32_t speakerId, rt::Tensor& output, int64_t& outputSeqLen, cudaStream_t stream)
+bool Qwen3OmniTTSRuntime::projectToTalkerInput(rt::Tensor const& thinkerEmbed, int32_t speakerId, int32_t langId,
+    rt::Tensor& output, int64_t& outputSeqLen, cudaStream_t stream)
 {
     int64_t const seqLen = thinkerEmbed.getShape()[0];
     int64_t const hiddenSize = mTalkerConfig.talkerHiddenSize;
@@ -811,22 +1014,99 @@ bool Qwen3OmniTTSRuntime::projectToTalkerInput(
 
     // N = text tokens after stripping 3-token role prefix and 5-token suffix
     int64_t const N = seqLen - kAssistantPrefixLen - kAssistantTrailingSuffix;
-    // Non-streaming prefill: 8 fixed prefix rows + N text rows + 2 suffix rows
-    outputSeqLen = kNonStreamingPrefixRows + N + 2; // = seqLen + 2
-    LOG_INFO("projectToTalkerInput: seqLen=%ld, N=%ld (stripped prefix=%d suffix=%d), outputSeqLen=%ld, speakerId=%d",
-        seqLen, N, kAssistantPrefixLen, kAssistantTrailingSuffix, outputSeqLen, speakerId);
+    // Non-streaming prefill: kFixedPrefixLen rows + N text rows + 2 suffix rows.
+    // langId >= 0 uses the 9-row CustomVoice language prefix; otherwise 8-row legacy prefix.
+    int64_t const kFixedPrefixLen = (langId >= 0) ? 9 : kNonStreamingPrefixRows;
+    outputSeqLen = kFixedPrefixLen + N + 2;
+    LOG_INFO(
+        "projectToTalkerInput: seqLen=%ld, N=%ld (stripped prefix=%d suffix=%d), outputSeqLen=%ld, speakerId=%d, "
+        "langId=%d, prefixRows=%ld",
+        seqLen, N, kAssistantPrefixLen, kAssistantTrailingSuffix, outputSeqLen, speakerId, langId, kFixedPrefixLen);
 
-    // Project all tokens via text_projection MLP
+    // Project tokens via text_projection MLP — split into role[:3] + body[3:3+N] to match Python
+    // reference batching. Single 12-row call exposed a CuTe DSL kernel bug where row 1 produced
+    // wrong values (row 0 matched ref to fp16 noise, row 1 max_diff 0.65 vs absmax 0.83).
     check::check(mProjectedBuffer.reshape({seqLen, hiddenSize}), "Tensor reshape failed");
     check::check(mMLPWorkspace.reshape({seqLen, thinkerHiddenSize}), "Tensor reshape failed");
-    kernel::invokeTalkerMLP(thinkerEmbed, mTextFC1Weight, mTextFC1Bias, mTextFC2Weight, mTextFC2Bias, mProjectedBuffer,
-        mMLPWorkspace, stream);
+    {
+        auto* thinkerPtr
+            = static_cast<__half*>(const_cast<void*>(thinkerEmbed.rawPointer()));
+        auto* projectedPtr = static_cast<__half*>(mProjectedBuffer.rawPointer());
+        auto* wsPtr = static_cast<__half*>(mMLPWorkspace.rawPointer());
+
+        // Role prefix [0:3]
+        rt::Tensor thinkerRole(thinkerPtr, {kAssistantPrefixLen, thinkerHiddenSize}, rt::DeviceType::kGPU,
+            nvinfer1::DataType::kHALF);
+        rt::Tensor projectedRole(projectedPtr, {kAssistantPrefixLen, hiddenSize}, rt::DeviceType::kGPU,
+            nvinfer1::DataType::kHALF);
+        rt::Tensor wsRole(wsPtr, {kAssistantPrefixLen, thinkerHiddenSize}, rt::DeviceType::kGPU,
+            nvinfer1::DataType::kHALF);
+        kernel::invokeTalkerMLP(thinkerRole, mTextFC1Weight, mTextFC1Bias, mTextFC2Weight, mTextFC2Bias,
+            projectedRole, wsRole, stream);
+
+        // Body [3:3+N]
+        if (N > 0)
+        {
+            int64_t const off = kAssistantPrefixLen;
+            rt::Tensor thinkerBody(thinkerPtr + off * thinkerHiddenSize, {N, thinkerHiddenSize},
+                rt::DeviceType::kGPU, nvinfer1::DataType::kHALF);
+            rt::Tensor projectedBody(projectedPtr + off * hiddenSize, {N, hiddenSize}, rt::DeviceType::kGPU,
+                nvinfer1::DataType::kHALF);
+            rt::Tensor wsBody(wsPtr + off * thinkerHiddenSize, {N, thinkerHiddenSize}, rt::DeviceType::kGPU,
+                nvinfer1::DataType::kHALF);
+            kernel::invokeTalkerMLP(thinkerBody, mTextFC1Weight, mTextFC1Bias, mTextFC2Weight, mTextFC2Bias,
+                projectedBody, wsBody, stream);
+        }
+    }
+    if (!qwenDumpDir().empty())
+    {
+        CUDA_CHECK(cudaStreamSynchronize(stream));
+        dumpTensor("text_projection", "out", mProjectedBuffer.rawPointer(), mProjectedBuffer.getDataType(),
+            {seqLen, hiddenSize}, stream, 0);
+    }
 
     // Fused kernel: build complete non-streaming prefill buffer
     check::check(output.reshape({outputSeqLen, hiddenSize}), "Tensor reshape failed");
     kernel::invokeAssistantPreamble(mProjectedBuffer, mTtsPadEmbed, mTtsBosEmbed, mTtsEosEmbed, mTalkerEmbeddingTable,
-        mTalkerConfig.codecNothinkId, mTalkerConfig.codecThinkBosId, mTalkerConfig.codecThinkEosId, speakerId,
-        mTalkerConfig.codecPadId, mTalkerConfig.codecBosId, static_cast<int32_t>(N), output, stream);
+        mTalkerConfig.codecNothinkId, mTalkerConfig.codecThinkId, mTalkerConfig.codecThinkBosId,
+        mTalkerConfig.codecThinkEosId, speakerId, mTalkerConfig.codecPadId, mTalkerConfig.codecBosId, langId,
+        static_cast<int32_t>(N), output, stream);
+    if (!qwenDumpDir().empty())
+    {
+        CUDA_CHECK(cudaStreamSynchronize(stream));
+        dumpTensor("talker_inputs_embeds", "out", output.rawPointer(), output.getDataType(),
+            {1, outputSeqLen, hiddenSize}, stream, 0);
+    }
+
+    // Diagnostic override: load Python-computed talker_inputs_embeds [outputSeqLen, hiddenSize] FP32
+    // from binary file and replace post-kernel result. Used to bisect kernel bug vs downstream bugs.
+    if (char const* p = std::getenv("QWEN3_TTS_PRELOAD_TALKER_EMBEDS"))
+    {
+        std::ifstream f(p, std::ios::binary);
+        if (f)
+        {
+            size_t const n = static_cast<size_t>(outputSeqLen) * static_cast<size_t>(hiddenSize);
+            std::vector<float> hostFp32(n);
+            f.read(reinterpret_cast<char*>(hostFp32.data()), static_cast<std::streamsize>(n * sizeof(float)));
+            if (static_cast<size_t>(f.gcount()) == n * sizeof(float))
+            {
+                std::vector<__half> hostFp16(n);
+                for (size_t i = 0; i < n; ++i)
+                {
+                    hostFp16[i] = __float2half(hostFp32[i]);
+                }
+                CUDA_CHECK(cudaMemcpyAsync(output.rawPointer(), hostFp16.data(), n * sizeof(__half),
+                    cudaMemcpyHostToDevice, stream));
+                CUDA_CHECK(cudaStreamSynchronize(stream));
+                LOG_INFO("Overrode talker_inputs_embeds from %s (%zu floats)", p, n);
+            }
+            else
+            {
+                LOG_WARNING("QWEN3_TTS_PRELOAD_TALKER_EMBEDS: expected %zu bytes, got %ld — skipping",
+                    n * sizeof(float), static_cast<long>(f.gcount()));
+            }
+        }
+    }
 
     return true;
 }
@@ -1083,9 +1363,33 @@ bool Qwen3OmniTTSRuntime::prepareTalkerInput(std::vector<int32_t> const& textTok
         speakerId = getSpeakerIdByName(request.speakerName);
     }
 
-    // MLP projection: thinker embed → talker input embeds (non-streaming, outputSeqLen = seqLen + 2)
+    // CustomVoice language conditioning: resolve language string -> codec token ID.
+    // Lower-case the request string; lookup in codecLanguageId map. -1 means use legacy no-language path.
+    int32_t langId = -1;
+    if (!request.language.empty())
+    {
+        std::string langLc = request.language;
+        std::transform(langLc.begin(), langLc.end(), langLc.begin(),
+            [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
+        auto it = mTalkerConfig.codecLanguageId.find(langLc);
+        if (it != mTalkerConfig.codecLanguageId.end())
+        {
+            langId = it->second;
+            LOG_INFO("CustomVoice language conditioning enabled: language=\"%s\" -> codec_id=%d", langLc.c_str(),
+                langId);
+        }
+        else
+        {
+            LOG_WARNING(
+                "Requested language=\"%s\" not found in codec_language_id map (size=%zu); "
+                "falling back to no-language prefill path",
+                langLc.c_str(), mTalkerConfig.codecLanguageId.size());
+        }
+    }
+
+    // MLP projection: thinker embed → talker input embeds (non-streaming, outputSeqLen = seqLen + 2 or +3 w/ lang)
     int64_t const hiddenSize = mTalkerConfig.talkerHiddenSize;
-    if (!projectToTalkerInput(mThinkerEmbedBuffer, speakerId, mTalkerInputEmbeds, outSeqLen, stream))
+    if (!projectToTalkerInput(mThinkerEmbedBuffer, speakerId, langId, mTalkerInputEmbeds, outSeqLen, stream))
     {
         LOG_ERROR("MLP projection failed");
         return false;
@@ -1164,6 +1468,23 @@ bool Qwen3OmniTTSRuntime::handleAudioGeneration(
                 LOG_ERROR("Talker prefill failed for batch %d", b);
                 return false;
             }
+        }
+        if (!qwenDumpDir().empty() && b == 0)
+        {
+            CUDA_CHECK(cudaStreamSynchronize(stream));
+            auto hsShape = mTalkerHiddenStatesBuffer.getShape();
+            std::vector<int64_t> hsDims;
+            for (int32_t d = 0; d < hsShape.getNumDims(); ++d)
+                hsDims.push_back(hsShape[d]);
+            dumpTensor("model", "out_last_hidden_state", mTalkerHiddenStatesBuffer.rawPointer(),
+                mTalkerHiddenStatesBuffer.getDataType(), hsDims, stream, 0);
+            // Also dump full prefill logits for completeness.
+            auto lgShape = mTalkerLogits.getShape();
+            std::vector<int64_t> lgDims;
+            for (int32_t d = 0; d < lgShape.getNumDims(); ++d)
+                lgDims.push_back(lgShape[d]);
+            dumpTensor("talker_lm_head", "out", mTalkerLogits.rawPointer(), mTalkerLogits.getDataType(), lgDims, stream,
+                0);
         }
 
         kernel::invokeTalkerLogitAdjust(mSeenCodecTokensBuf, mTalkerLogits, mTalkerConfig.talkerVocabSize - 1024,
@@ -1822,12 +2143,39 @@ bool Qwen3OmniTTSRuntime::runCodePredictorGenerationForFrame(int32_t codecToken,
         check::check(mCodePredictorHiddenStatesBuffer.reshape({1, 2, mTalkerConfig.codePredictorHiddenSize}),
             "Tensor reshape failed");
 
+        // Parity dump: CP input embeds (post small_to_mtp_projection / concat) for FIRST frame only.
+        {
+            static std::atomic<int> sCpDumpedFrame{0};
+            int prev = sCpDumpedFrame.fetch_add(1);
+            if (prev == 0 && !qwenDumpDir().empty())
+            {
+                CUDA_CHECK(cudaStreamSynchronize(stream));
+                dumpTensor("code_predictor_small_to_mtp_projection", "out", mCodePredictorPrefillInput.rawPointer(),
+                    mCodePredictorPrefillInput.getDataType(), {1, 2, mTalkerConfig.codePredictorHiddenSize}, stream, 0);
+            }
+        }
+
         // NOTE: CodePredictor ONNX outputs FP32 logits directly (lm_head + cast in ONNX)
         // generationStep=0 corresponds to code_1 (using lm_head_0)
         if (!executeCodePredictorPrefillStep(
                 mCodePredictorPrefillInput, 0, mCodePredictorLogits, mCodePredictorHiddenStatesBuffer, stream))
         {
             return false;
+        }
+        {
+            static std::atomic<int> sCpHsDumpedFrame{0};
+            int prev = sCpHsDumpedFrame.fetch_add(1);
+            if (prev == 0 && !qwenDumpDir().empty())
+            {
+                CUDA_CHECK(cudaStreamSynchronize(stream));
+                auto sh = mCodePredictorHiddenStatesBuffer.getShape();
+                std::vector<int64_t> dims;
+                for (int32_t d = 0; d < sh.getNumDims(); ++d)
+                    dims.push_back(sh[d]);
+                dumpTensor("code_predictor_model", "out_last_hidden_state",
+                    mCodePredictorHiddenStatesBuffer.rawPointer(), mCodePredictorHiddenStatesBuffer.getDataType(), dims,
+                    stream, 0);
+            }
         }
 
         // Sample code_1
@@ -2190,9 +2538,12 @@ bool Qwen3OmniTTSRuntime::buildTalkerPrefillFromSegments(std::vector<int32_t> co
         rt::Tensor assistantSlice(const_cast<__half*>(assistantProjPtr), rt::Coords{assistantInputLen, hiddenSize},
             rt::DeviceType::kGPU, nvinfer1::DataType::kHALF);
 
+        // Omni segment path: language conditioning is not (yet) propagated through Omni; pass langId=-1
+        // to keep the legacy 8-row prefix.
         kernel::invokeAssistantPreamble(assistantSlice, mTtsPadEmbed, mTtsBosEmbed, mTtsEosEmbed, mTalkerEmbeddingTable,
-            mTalkerConfig.codecNothinkId, mTalkerConfig.codecThinkBosId, mTalkerConfig.codecThinkEosId, speakerId,
-            mTalkerConfig.codecPadId, mTalkerConfig.codecBosId, 1, preambleScratch, stream);
+            mTalkerConfig.codecNothinkId, mTalkerConfig.codecThinkId, mTalkerConfig.codecThinkBosId,
+            mTalkerConfig.codecThinkEosId, speakerId, mTalkerConfig.codecPadId, mTalkerConfig.codecBosId,
+            /*langId=*/-1, /*textLen=*/1, preambleScratch, stream);
 
         __half* const aOut = static_cast<__half*>(mTalkerInputEmbeds.rawPointer()) + userTotalLen * hiddenSize;
         CUDA_CHECK(cudaMemcpyAsync(aOut, scratchPtr, kAssistantRestructuredLen * hiddenSize * sizeof(__half),

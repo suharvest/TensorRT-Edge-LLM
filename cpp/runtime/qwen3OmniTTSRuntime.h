@@ -139,6 +139,10 @@ public:
         int32_t speakerId{-1};       //!< Speaker ID - if >= 0, overrides speakerName
         std::vector<float> speakerEmbedding; //!< Optional raw x-vector embedding [talkerHiddenSize]
 
+        //!< CustomVoice language conditioning (e.g., "chinese", "english"). Empty = no language path.
+        //!< Lower-cased by the runtime before lookup in TalkerConfig::codecLanguageId.
+        std::string language{""};
+
         // Input: conversation messages for this request (runtime tokenizes internally)
         std::vector<Message> messages;
         bool applyChatTemplate{true};   //!< Whether to apply chat template formatting
@@ -512,6 +516,7 @@ private:
 
         // Codec special tokens (from talker vocab, used directly)
         int32_t codecNothinkId{};  //!< Codec no-think control token (2155)
+        int32_t codecThinkId{};    //!< Codec think control token (CustomVoice + language path)
         int32_t codecThinkBosId{}; //!< Codec think begin-of-sequence (2156)
         int32_t codecThinkEosId{}; //!< Codec think end-of-sequence (2157)
         int32_t codecPadId{};      //!< Codec padding token (2148)
@@ -520,6 +525,10 @@ private:
 
         // Speaker configuration (read from config)
         int32_t defaultSpeakerId{}; //!< Default speaker ID (e.g., 2301 for f245)
+
+        //!< CustomVoice language conditioning: map of lower-case language name -> codec token ID.
+        //!< Empty when the model is not a CustomVoice language-conditioned variant.
+        std::unordered_map<std::string, int32_t> codecLanguageId{};
     };
 
     // ========== Configuration and Initialization ==========
@@ -690,7 +699,7 @@ private:
      * @param stream CUDA stream
      * @return True on success, false on failure
      */
-    bool projectToTalkerInput(rt::Tensor const& thinkerEmbed, int32_t speakerId, rt::Tensor& output,
+    bool projectToTalkerInput(rt::Tensor const& thinkerEmbed, int32_t speakerId, int32_t langId, rt::Tensor& output,
         int64_t& outputSeqLen, cudaStream_t stream);
 
     //! Embed token IDs, run MLP projection, and reshape buffers ready for Talker prefill.
