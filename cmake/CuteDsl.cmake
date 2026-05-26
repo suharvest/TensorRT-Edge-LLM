@@ -782,7 +782,11 @@ function(cute_dsl_setup)
                                             trt_edgellm_cutedsl_cudart_shim)
     endif()
     if(CUDA_DRIVER_LIB AND NOT CUDA_DRIVER_LIB MATCHES "-NOTFOUND$")
-      target_link_libraries(${_tgt} PRIVATE "${CUDA_DRIVER_LIB}")
+      if(_tgt_type STREQUAL "STATIC_LIBRARY")
+        target_link_libraries(${_tgt} PUBLIC "${CUDA_DRIVER_LIB}")
+      else()
+        target_link_libraries(${_tgt} PRIVATE "${CUDA_DRIVER_LIB}")
+      endif()
     endif()
     # CUDA < 12.8: wrap _cudaLaunchKernelEx (cudaKernel_t → CUfunction, e.g.
     # JetPack 6).
