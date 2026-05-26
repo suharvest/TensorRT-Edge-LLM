@@ -570,6 +570,101 @@ def _create_app(llm_instance):
             "messages_branch": messages_branch,
         }
 
+    @app.post("/v1/warmup")
+    def warmup(body: Dict[str, Any]):
+        """Run a tiny real forward pass to warm the TRT engine.
+
+        ``/v1/cache/system_prompt`` only saves KV blocks for the prefix; the
+        first real ``/v1/chat/completions`` still pays the TRT-LLM JIT /
+        CUDA-graph-capture / kernel-warm cost on its initial decode
+        (~2s observed on Qwen3-4B-AWQ Orin NX). This endpoint forces that
+        one-shot warm by running a 1-token generate through the same
+        ``handle_request`` path the real chat endpoint uses. The generated
+        token is discarded; only timing/metadata is returned.
+
+        Body shape mirrors ``/v1/chat/completions`` (``messages``, ``tools``,
+        ``enable_thinking``, ``lora_weights_name``). ``max_tokens`` is
+        forced to 1 and ``stream`` is forced off regardless of caller input.
+        """
+        import time as _time
+
+        messages = body.get("messages") or []
+        if not messages:
+            return JSONResponse(
+                status_code=400, content={"error": "messages required"})
+
+        tools = body.get("tools") or None
+        if tools:
+            try:
+                messages = _inject_tools_and_normalize(messages, tools)
+            except Exception as exc:
+                logger.exception("warmup: tool prompt rendering failed")
+                return JSONResponse(
+                    status_code=400,
+                    content={"error": f"Invalid tools schema: {exc}"})
+        else:
+            messages = [_flatten_message_for_runtime(m) for m in messages]
+
+        enable_thinking = bool(body.get("enable_thinking", False))
+        lora_weights_name = body.get(
+            "lora_weights_name", body.get("lora_name", ""))
+
+        rt = llm_instance._rt
+        from .engine import _convert_messages_to_cpp, _load_image_buffers
+        try:
+            cpp_messages = _convert_messages_to_cpp(rt, messages)
+        except (ValueError, KeyError) as exc:
+            return JSONResponse(
+                status_code=400,
+                content={"error": f"Invalid messages: {exc}"})
+        image_buffers = _load_image_buffers(rt, messages)
+
+        trt_request = rt.LLMGenerationRequest()
+        req = rt.Request(messages=cpp_messages)
+        req.image_buffers = image_buffers
+        trt_request.requests = [req]
+        # Greedy + 1 token: cheapest possible real forward.
+        trt_request.temperature = 0.0
+        trt_request.top_p = 1.0
+        trt_request.top_k = 1
+        trt_request.max_generate_length = 1
+        trt_request.apply_chat_template = True
+        trt_request.add_generation_prompt = True
+        trt_request.enable_thinking = enable_thinking
+        trt_request.save_system_prompt_kv_cache = False
+        trt_request.lora_weights_name = lora_weights_name
+        trt_request.disable_spec_decode = bool(
+            body.get("disable_spec_decode", False))
+
+        t0 = _time.perf_counter()
+        try:
+            response = llm_instance._runtime.handle_request(trt_request)
+        except Exception as exc:
+            logger.exception("warmup decode failed")
+            return JSONResponse(status_code=500, content={"error": str(exc)})
+        took_ms = int((_time.perf_counter() - t0) * 1000)
+
+        output_ids = response.output_ids[0] if response.output_ids else []
+        prompt_tokens = 0
+        try:
+            # Best-effort: some runtimes expose prompt token counts directly.
+            prompt_tokens = int(getattr(response, "prompt_token_count", 0) or 0)
+        except Exception:
+            prompt_tokens = 0
+
+        logger.info(
+            "warmup_decode took %d ms (generated_tokens=%d, has_tools=%s)",
+            took_ms, len(output_ids), bool(tools))
+
+        return {
+            "object": "warmup",
+            "warmed": True,
+            "took_ms": took_ms,
+            "generated_tokens": len(output_ids),
+            "prompt_tokens": prompt_tokens,
+            "has_tools": bool(tools),
+        }
+
     @app.post("/v1/chat/completions")
     def chat_completions(body: Dict[str, Any], request: Request):
         messages = body.get("messages", [])
