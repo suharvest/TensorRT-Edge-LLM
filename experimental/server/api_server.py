@@ -246,6 +246,173 @@ def _extract_tool_calls(text: str):
     return tool_calls, cleaned
 
 
+class _ToolCallStreamParser:
+    """Incremental scanner for ``<tool_call>{...}</tool_call>`` blocks.
+
+    The goal is **early emit of the function name delta** so downstream
+    consumers (voice preamble, UI spinners, etc.) can react ~one token after
+    the model commits to a tool call, instead of waiting for the entire
+    arguments JSON to materialize.
+
+    State machine (per tool_call index):
+        TEXT              — outside any <tool_call> block
+        IN_TOOL_BODY      — saw opening tag, scanning for "name" key
+        IN_NAME_STRING    — inside the name string literal
+        NAME_EMITTED      — name flushed; just wait for closing </tool_call>
+
+    Cross-chunk safety: only the un-consumed tail is held in ``_buf``; once
+    a closing tag (or completed name) is consumed, the corresponding prefix
+    is dropped so the buffer cannot grow unboundedly.
+
+    On the canonical tool-call delta emitted at stream end the caller will
+    re-emit ``function.name`` for the same index; the OpenAI-compatible
+    client (runner.py:_ToolCallAcc) overwrites ``slot.name`` with the same
+    string — harmless duplicate.
+    """
+
+    _NAME_KEY_RE = re.compile(r'"name"\s*:\s*"')
+
+    def __init__(self) -> None:
+        self._state = "TEXT"
+        self._buf = ""
+        self._idx = -1            # current tool_call index (incremented on open)
+        self._name_chars: List[str] = []
+        # Track whether the current open block came from the XML wrapper
+        # (``<tool_call>...</tool_call>``) or the bare-JSON fallback path
+        # (AWQ/quantized models often drop the wrapper). Bare-JSON has no
+        # explicit closing tag, so we transition back to TEXT immediately
+        # after emitting the name.
+        self._in_xml_wrapper = False
+
+    def feed(self, text: str) -> List[Dict[str, Any]]:
+        """Consume new text; return list of partial tool_calls deltas to emit.
+
+        Each returned dict is the inner ``delta`` payload (matching the
+        canonical shape at line ~851) — caller wraps it in ``_sse_chunk``.
+        Currently only emits a name-only partial. Arguments and id are filled
+        by the canonical end-of-stream delta.
+        """
+        emits: List[Dict[str, Any]] = []
+        if not text:
+            return emits
+        self._buf += text
+        # Loop because one chunk may complete several state transitions.
+        while True:
+            if self._state == "TEXT":
+                pos_xml = self._buf.find(TOOL_CALL_OPEN)
+                # Bare-JSON fallback: detect a ``{"name":`` style opening
+                # anywhere in the buffer. This is the common AWQ failure
+                # mode where the model drops <tool_call>...</tool_call>
+                # entirely. Conservative: only triggers when the JSON
+                # appears to start with ``{`` and contains a name key
+                # before any text-like content.
+                pos_bare = -1
+                m_bare = self._NAME_KEY_RE.search(self._buf)
+                if m_bare is not None:
+                    # Walk back to the nearest ``{`` to confirm we're
+                    # inside an object.
+                    brace = self._buf.rfind("{", 0, m_bare.start())
+                    if brace != -1:
+                        between = self._buf[brace + 1:m_bare.start()].strip()
+                        # Allow only whitespace between '{' and '"name"'
+                        # (the typical bare-JSON head: ``{"name":``).
+                        # If the model emitted some other key first,
+                        # we'll still match on the canonical end-of-
+                        # stream path; here we stay conservative.
+                        if between == "":
+                            pos_bare = brace
+                if pos_xml == -1 and pos_bare == -1:
+                    keep = len(TOOL_CALL_OPEN) - 1
+                    if len(self._buf) > keep:
+                        self._buf = self._buf[-keep:] if keep > 0 else ""
+                    break
+                # Prefer whichever opens earlier in the buffer.
+                use_xml = pos_xml != -1 and (
+                    pos_bare == -1 or pos_xml <= pos_bare)
+                if use_xml:
+                    self._buf = self._buf[pos_xml + len(TOOL_CALL_OPEN):]
+                    self._in_xml_wrapper = True
+                    self._state = "IN_TOOL_BODY"
+                else:
+                    # Skip into the JSON body just past the '{'.
+                    self._buf = self._buf[pos_bare + 1:]
+                    self._in_xml_wrapper = False
+                    self._state = "IN_TOOL_BODY"
+                self._idx += 1
+                self._name_chars = []
+                continue
+            if self._state == "IN_TOOL_BODY":
+                m = self._NAME_KEY_RE.search(self._buf)
+                if not m:
+                    # Same boundary-safety trick: keep enough tail for a
+                    # split ``"name":"`` sequence (worst case 9 chars).
+                    keep = 16
+                    if len(self._buf) > keep:
+                        self._buf = self._buf[-keep:]
+                    break
+                self._buf = self._buf[m.end():]
+                self._state = "IN_NAME_STRING"
+                continue
+            if self._state == "IN_NAME_STRING":
+                # Scan for unescaped closing quote.
+                i = 0
+                while i < len(self._buf):
+                    ch = self._buf[i]
+                    if ch == "\\" and i + 1 < len(self._buf):
+                        self._name_chars.append(self._buf[i:i + 2])
+                        i += 2
+                        continue
+                    if ch == '"':
+                        # Name complete — emit partial delta.
+                        name = "".join(self._name_chars)
+                        # Unescape common JSON escapes for the emitted name.
+                        try:
+                            name = json.loads('"' + name + '"')
+                        except json.JSONDecodeError:
+                            pass
+                        self._buf = self._buf[i + 1:]
+                        self._state = "NAME_EMITTED"
+                        if name:
+                            emits.append({
+                                "tool_calls": [{
+                                    "index": self._idx,
+                                    "type": "function",
+                                    "function": {
+                                        "name": name,
+                                        "arguments": "",
+                                    },
+                                }]
+                            })
+                        break
+                    self._name_chars.append(ch)
+                    i += 1
+                else:
+                    # Consumed all buffer chars into name; nothing left.
+                    self._buf = ""
+                    break
+                # state transitioned; loop again
+                continue
+            if self._state == "NAME_EMITTED":
+                if self._in_xml_wrapper:
+                    pos = self._buf.find(TOOL_CALL_CLOSE)
+                    if pos == -1:
+                        keep = len(TOOL_CALL_CLOSE) - 1
+                        if len(self._buf) > keep:
+                            self._buf = self._buf[-keep:] if keep > 0 else ""
+                        break
+                    self._buf = self._buf[pos + len(TOOL_CALL_CLOSE):]
+                    self._state = "TEXT"
+                    continue
+                # Bare-JSON: no explicit close. Drop buffer and return to
+                # TEXT — we don't try to detect multiple bare-JSON tool
+                # calls (the AWQ fallback only ever emits one).
+                self._buf = ""
+                self._state = "TEXT"
+                continue
+            break  # pragma: no cover - unreachable
+        return emits
+
+
 def _create_app(llm_instance):
     """Create a FastAPI app backed by the given LLM instance."""
     try:
@@ -795,6 +962,7 @@ async def _generate_stream_sse(request, llm_instance, messages, params,
     # it would be interpreted as raw assistant content and the eval would
     # never see a structured tool_call.
     content_buf: List[str] = []
+    tool_parser = _ToolCallStreamParser() if tools_enabled else None
 
     try:
         while True:
@@ -814,6 +982,14 @@ async def _generate_stream_sse(request, llm_instance, messages, params,
                 for field, text in sm.feed(delta.text):
                     if tools_enabled and field == "content":
                         content_buf.append(text)
+                        # Early-emit any tool_call name deltas as soon as
+                        # the streaming parser can identify them, so that
+                        # latency-sensitive consumers (voice preamble,
+                        # spinners) can react ~one token after the model
+                        # commits — instead of waiting for the full JSON
+                        # arguments to materialize at end-of-stream.
+                        for partial in tool_parser.feed(text):
+                            yield _sse_chunk(response_id, partial)
                     else:
                         yield _sse_chunk(response_id, {field: text})
             if delta.finished:
@@ -837,6 +1013,9 @@ async def _generate_stream_sse(request, llm_instance, messages, params,
     for field, text in sm.flush():
         if tools_enabled and field == "content":
             content_buf.append(text)
+            if tool_parser is not None:
+                for partial in tool_parser.feed(text):
+                    yield _sse_chunk(response_id, partial)
         else:
             yield _sse_chunk(response_id, {field: text})
 
