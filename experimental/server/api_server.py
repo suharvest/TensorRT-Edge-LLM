@@ -465,12 +465,39 @@ def _create_app(llm_instance):
         # the ~400 tokens of tool schema every turn.
         tools = body.get("tools") or None
         has_tools = bool(tools)
+        messages_branch = False
         if body.get("formatted_system_prompt") or body.get("formatted_prefix"):
             # Caller pre-formatted everything; trust it as-is. Tools must be
             # baked in by caller in this mode.
             prompt = body.get("formatted_system_prompt") or body["formatted_prefix"]
         elif body.get("prompt"):
             prompt = body["prompt"]
+        elif isinstance(body.get("messages"), list) and len(body["messages"]) >= 2:
+            # Prefix-consistent warmup: render the same prefix that
+            # /v1/chat/completions would emit via
+            # ``_build_prefix_formatted_request`` (messages[:-1] slice +
+            # ``make_prefix_formatted_request``). This guarantees the cached
+            # KV prefix is *byte-identical* to the first real chat turn so
+            # Run 1 hits the radix-tree prefix cache.
+            try:
+                msgs = body["messages"]
+                if has_tools:
+                    msgs = _inject_tools_and_normalize(msgs, tools)
+                else:
+                    msgs = [_flatten_message_for_runtime(m) for m in msgs]
+                enable_thinking = bool(body.get("enable_thinking", False))
+                formatted = _build_prefix_formatted_request(
+                    llm_instance,
+                    body,
+                    msgs,
+                    enable_thinking,
+                )
+                prompt = formatted["formatted_system_prompt"]
+                messages_branch = True
+            except Exception as exc:
+                logger.exception("messages-branch prefix render failed")
+                return JSONResponse(status_code=500,
+                                    content={"error": str(exc)})
         elif body.get("system_prompt") is not None or has_tools:
             try:
                 if has_tools:
@@ -540,6 +567,7 @@ def _create_app(llm_instance):
             "has_tools": has_tools,
             "tools_count": len(tools) if has_tools else 0,
             "prompt_chars": len(prompt),
+            "messages_branch": messages_branch,
         }
 
     @app.post("/v1/chat/completions")
