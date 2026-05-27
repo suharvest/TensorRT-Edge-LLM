@@ -135,13 +135,11 @@ public:
 
         // Speaker selection (optional, defaults to config default)
         std::string speakerName{""}; //!< Speaker name (e.g., "f245", "m02") - empty means use default
-        std::string language{""};    //!< Language hint (e.g., "chinese", "english")
-        int32_t speakerId{-1};       //!< Speaker ID - if >= 0, overrides speakerName
-        std::vector<float> speakerEmbedding; //!< Optional raw x-vector embedding [talkerHiddenSize]
-
         //!< CustomVoice language conditioning (e.g., "chinese", "english"). Empty = no language path.
         //!< Lower-cased by the runtime before lookup in TalkerConfig::codecLanguageId.
         std::string language{""};
+        int32_t speakerId{-1};       //!< Speaker ID - if >= 0, overrides speakerName
+        std::vector<float> speakerEmbedding; //!< Optional raw x-vector embedding [talkerHiddenSize]
 
         // Input: conversation messages for this request (runtime tokenizes internally)
         std::vector<Message> messages;
