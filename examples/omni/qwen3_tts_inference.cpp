@@ -390,6 +390,13 @@ int main(int argc, char** argv)
         talkerReq.language = input.requestLanguages[requestIdx];
         talkerReq.maxAudioLength = input.maxAudioLength;
         talkerReq.messages = input.requests[requestIdx];
+        // Qwen3-TTS talker prefill expects the assistant role prefix at
+        // input_ids[:3]; the text to synthesize is the assistant's content.
+        // A single user-role message is the common TTS input shape — coerce it.
+        if (talkerReq.messages.size() == 1 && talkerReq.messages[0].role == "user")
+        {
+            talkerReq.messages[0].role = "assistant";
+        }
 
         rt::Qwen3OmniTTSRuntime::TalkerGenerationResponse talkerResp;
         bool const requestStatus = ttsRuntime->handleAudioGeneration(talkerReq, talkerResp, stream);
