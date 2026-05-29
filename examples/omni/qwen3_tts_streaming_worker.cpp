@@ -48,6 +48,7 @@
 #include "multimodal/statefulCode2WavRunner.h"
 #include "runtime/llmRuntimeUtils.h"
 #include "runtime/qwen3OmniTTSRuntime.h"
+#include "runtime/slotPool.h"
 
 #include <algorithm>
 #include <atomic>
@@ -371,47 +372,27 @@ struct TtsSlot
 };
 
 int32_t gMaxSlots{1};
-std::vector<std::unique_ptr<TtsSlot>> gSlotPool;
-std::mutex gPoolMutex; //!< Guards slot bring-up/teardown bookkeeping.
 
-// id → slotId routing table. Bound when the reader assigns a request to a slot,
-// dropped when the worker finishes the request. Guarded by gSessionMapMutex.
-std::unordered_map<std::string, int32_t> gSessionToSlot;
-std::mutex gSessionMapMutex;
+// D-2.5: slot vector ownership, capacity, id→slot routing map (+its mutex),
+// CAS acquire, bind/unbind/lookup, and saturation are now provided by the
+// generic SlotPool<TtsSlot> template. Slot construction (runtime/Code2Wav/
+// stream/worker-thread), cancel map, queue, and JSON emit stay in this worker.
+namespace rt_slotpool = tensorrt_edge_llm::runtime;
+std::unique_ptr<rt_slotpool::SlotPool<TtsSlot>> gPool;
 
 void bindSession(std::string const& id, int32_t slotId)
 {
-    std::lock_guard<std::mutex> guard(gSessionMapMutex);
-    gSessionToSlot[id] = slotId;
+    gPool->bind(id, slotId);
 }
 
 void unbindSession(std::string const& id)
 {
-    std::lock_guard<std::mutex> guard(gSessionMapMutex);
-    gSessionToSlot.erase(id);
+    gPool->unbind(id);
 }
 
 [[maybe_unused]] int32_t lookupSlot(std::string const& id)
 {
-    std::lock_guard<std::mutex> guard(gSessionMapMutex);
-    auto it = gSessionToSlot.find(id);
-    return it == gSessionToSlot.end() ? -1 : it->second;
-}
-
-//! Claim a free slot via atomic CAS on inUse. Returns slot index or -1 when the
-//! pool is saturated (caller emits pool_saturated / 4429).
-int32_t acquireSlot()
-{
-    std::lock_guard<std::mutex> guard(gPoolMutex);
-    for (auto& slotPtr : gSlotPool)
-    {
-        bool expected = false;
-        if (slotPtr->inUse.compare_exchange_strong(expected, true))
-        {
-            return slotPtr->slotId;
-        }
-    }
-    return -1;
+    return gPool->lookup(id);
 }
 
 // ===== sample rate (read once at init; identical across slots) =====
@@ -672,10 +653,12 @@ void processRequest(TtsSlot& slot, Json const& item, bool useStateful, bool useA
         unregisterCancel(requestId);
         unbindSession(requestId);
     }
-    // Release the slot for reuse. Order matters: drop the id→slot mapping FIRST
-    // (above), then clear inUse, so a freed slot is never reachable by a stale
-    // routing entry pointing at a now-idle slot.
-    slot.inUse.store(false, std::memory_order_release);
+    // Release the slot for reuse. Order matters (RISK POINT 1): drop the id→slot
+    // mapping FIRST (above, via unbindSession→pool->unbind), THEN clear inUse
+    // (pool->release), so a freed slot is never reachable by a stale routing
+    // entry pointing at a now-idle slot. release() clears inUse ONLY — the
+    // worker keeps its own cancel/queue teardown above.
+    gPool->release(slot.slotId);
 }
 
 //! Worker thread body: blocks on the slot's queue, runs each request to
@@ -705,10 +688,9 @@ void slotWorkerLoop(TtsSlot* slot, bool useStateful, bool useAsyncVocode)
 //! + worker thread. Returns false on init failure.
 bool initSlotPool(Args const& args, bool useStateful, bool useAsyncVocode, int64_t& initMsOut)
 {
-    std::lock_guard<std::mutex> guard(gPoolMutex);
     int32_t const n = std::max(1, gMaxSlots);
-    gSlotPool.clear();
-    gSlotPool.reserve(static_cast<size_t>(n));
+    gPool = std::make_unique<rt_slotpool::SlotPool<TtsSlot>>(n);
+    auto& slots = gPool->slots();
 
     bool const enableCudaGraph = std::getenv("EDGE_LLM_TTS_CUDA_GRAPH") == nullptr
         || std::string(std::getenv("EDGE_LLM_TTS_CUDA_GRAPH")) != "0";
@@ -735,8 +717,8 @@ bool initSlotPool(Args const& args, bool useStateful, bool useAsyncVocode, int64
                 // Slots 1..N-1: SHARE slot 0's deserialized Talker + CodePredictor
                 // ICudaEngines (D2-1). Each still allocates its own execution
                 // contexts, KV/cache state, workspace tensors, tokenizer, embeds.
-                std::shared_ptr<nvinfer1::ICudaEngine> sharedTalker = gSlotPool[0]->runtime->getTalkerEngine();
-                std::shared_ptr<nvinfer1::ICudaEngine> sharedCp = gSlotPool[0]->runtime->getCodePredictorEngine();
+                std::shared_ptr<nvinfer1::ICudaEngine> sharedTalker = slots[0]->runtime->getTalkerEngine();
+                std::shared_ptr<nvinfer1::ICudaEngine> sharedCp = slots[0]->runtime->getCodePredictorEngine();
                 slot->runtime = std::make_unique<Qwen3OmniTTSRuntime>(
                     sharedTalker, sharedCp, args.talkerEngineDir, args.codePredictorEngineDir,
                     args.tokenizerDir, slot->stream);
@@ -755,7 +737,7 @@ bool initSlotPool(Args const& args, bool useStateful, bool useAsyncVocode, int64
             {
                 gSampleRate = slot->code2wav->getConfig().sampleRate;
             }
-            gSlotPool.push_back(std::move(slot));
+            slots.push_back(std::move(slot));
         }
     }
     catch (std::exception const& e)
@@ -770,7 +752,7 @@ bool initSlotPool(Args const& args, bool useStateful, bool useAsyncVocode, int64
     // Spawn one worker thread per slot AFTER all slots are constructed (so a
     // worker never observes a half-built pool). (void)useStateful: the slot-pool
     // path always uses per-slot stateless Code2Wav; the flag is kept for `ready`.
-    for (auto& slotPtr : gSlotPool)
+    for (auto& slotPtr : gPool->slots())
     {
         slotPtr->worker = std::thread(slotWorkerLoop, slotPtr.get(), useStateful, useAsyncVocode);
     }
@@ -780,23 +762,27 @@ bool initSlotPool(Args const& args, bool useStateful, bool useAsyncVocode, int64
 //! Stop + join every worker thread, destroy CUDA streams, free runtimes.
 void destroySlotPool()
 {
+    if (!gPool)
     {
-        std::lock_guard<std::mutex> guard(gPoolMutex);
-        for (auto& slotPtr : gSlotPool)
-        {
-            slotPtr->shutdown.store(true);
-            slotPtr->queueCv.notify_all();
-        }
+        return;
     }
-    for (auto& slotPtr : gSlotPool)
+    // Signal shutdown + wake every worker thread, then join. The slot vector is
+    // only mutated at init/teardown (no concurrent acquire here), so iterating
+    // gPool->slots() directly is safe.
+    for (auto& slotPtr : gPool->slots())
+    {
+        slotPtr->shutdown.store(true);
+        slotPtr->queueCv.notify_all();
+    }
+    for (auto& slotPtr : gPool->slots())
     {
         if (slotPtr->worker.joinable())
         {
             slotPtr->worker.join();
         }
     }
-    std::lock_guard<std::mutex> guard(gPoolMutex);
-    for (auto& slotPtr : gSlotPool)
+    // Worker keeps ownership of runtime/stream teardown (OUT of the template).
+    for (auto& slotPtr : gPool->slots())
     {
         slotPtr->code2wav.reset();
         slotPtr->runtime.reset();
@@ -806,7 +792,8 @@ void destroySlotPool()
             slotPtr->stream = nullptr;
         }
     }
-    gSlotPool.clear();
+    gPool->clear();
+    gPool.reset();
 }
 
 } // namespace
@@ -875,7 +862,7 @@ int main(int argc, char** argv)
 
         // Generation request: claim a free slot and hand it to that slot's worker.
         std::string const requestId = item.value("id", "");
-        int32_t const slotId = acquireSlot();
+        int32_t const slotId = gPool->acquireFree();
         if (slotId < 0)
         {
             // Pool saturated: every slot has an in-flight request. Surface a
@@ -895,7 +882,7 @@ int main(int argc, char** argv)
         {
             bindSession(requestId, slotId);
         }
-        TtsSlot& slot = *gSlotPool[static_cast<size_t>(slotId)];
+        TtsSlot& slot = *gPool->get(slotId);
         {
             std::lock_guard<std::mutex> lk(slot.queueMu);
             slot.queue.push_back(WorkItem{std::move(item)});
