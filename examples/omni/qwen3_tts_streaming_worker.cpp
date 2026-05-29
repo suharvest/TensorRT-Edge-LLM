@@ -13,10 +13,32 @@
  *   event on stdout.
  * - Supports per-id mid-stream cancel via {"type":"cancel","id":"..."} lines.
  *
- * This worker is intentionally simple (single in-flight request, single
- * Code2Wav runner) — it exists to validate the runtime streaming hook plumbing
- * end-to-end on Orin NX hardware. Concurrency / SlotPool plumbing is handled
- * by the heavier qwen3_tts_worker target.
+ * Concurrency (TTS slot-pool, D2-2)
+ * ---------------------------------
+ * Unlike the ASR worker (single stdin poll thread that interleaves short
+ * chunk-level work), TTS requests are LONG-RUNNING (seconds each). Serializing
+ * them on one thread would force the second concurrent request to wait for the
+ * first to finish. So this worker runs N WORKER THREADS, each bound to ONE slot:
+ *
+ *   * TtsSlot   = { Qwen3OmniTTSRuntime runtime, Code2WavRunner code2wav,
+ *                   cudaStream_t stream, std::thread worker, atomic<bool> inUse }.
+ *   * Slot 0 deserializes the Talker + CodePredictor engines once via the
+ *     path-based constructor; slots 1..N-1 SHARE those ICudaEngines via the
+ *     D2-1 shared-engine constructor (weight memory paid once; each slot keeps
+ *     its own IExecutionContexts, KV/cache state, workspace tensors, CUDA
+ *     stream). Each slot ALSO owns its own (stateless) Code2WavRunner so the
+ *     vocoder contexts never contend — this deliberately avoids the
+ *     StatefulCode2WavRunner concurrent-cudaMemset hazard at N>1.
+ *   * The stdin reader thread (main) parses each JSON line and routes it: a
+ *     generation request is enqueued onto the next free slot's queue (id→slot
+ *     binding); a cancel line trips the per-id cancel flag.
+ *   * A runtime instance is NEVER invoked from more than one thread: each slot
+ *     has exactly one worker thread, and a slot is bound to at most one
+ *     in-flight request at a time.
+ *
+ * Backward compatibility: --max_slots=1 yields a single slot + single worker
+ * thread == the original single-in-flight behavior. The OVS protocol
+ * (ready/chunk/done/cancelled/error events, request_id+id) is unchanged.
  */
 
 #include "common/checkMacros.h"
@@ -63,6 +85,7 @@ struct Args
     std::string codePredictorEngineDir;
     std::string code2wavEngineDir;
     std::string tokenizerDir;
+    int32_t maxSlots{1}; //!< TTS slot-pool size (D2 concurrency). Default 1 == original single-instance behavior.
     bool debug{false};
 };
 
@@ -73,15 +96,19 @@ enum OptionId : int
     CODE_PREDICTOR_ENGINE_DIR,
     CODE2WAV_ENGINE_DIR,
     TOKENIZER_DIR,
+    MAX_SLOTS,
     DEBUG,
 };
 
 void printUsage(char const* programName)
 {
     std::cerr << "Usage: " << programName << " --talkerEngineDir=<path> --code2wavEngineDir=<path>"
-              << " [--codePredictorEngineDir=<path>] [--tokenizerDir=<path>] [--debug]\n\n"
+              << " [--codePredictorEngineDir=<path>] [--tokenizerDir=<path>] [--max_slots=<N>] [--debug]\n\n"
               << "Standalone Qwen3-TTS streaming worker.\n"
               << "Reads JSON request lines from stdin and emits JSON events to stdout.\n"
+              << "--max_slots=<N> sets the TTS slot-pool size (default 1; D2 concurrency). Each slot is a\n"
+              << "  full TTS runtime + Code2Wav + CUDA stream + worker thread, sharing the Talker/CodePredictor\n"
+              << "  engine weights with slot 0.\n"
               << "Request schema:\n"
               << "  {\"id\":\"...\",\"text\":\"...\",\"speaker\":\"Vivian\",\n"
               << "   \"stream\":true,\"chunk_frames\":13,\n"
@@ -98,6 +125,7 @@ bool parseArgs(Args& args, int argc, char** argv)
         {"codePredictorEngineDir", required_argument, 0, CODE_PREDICTOR_ENGINE_DIR},
         {"code2wavEngineDir", required_argument, 0, CODE2WAV_ENGINE_DIR},
         {"tokenizerDir", required_argument, 0, TOKENIZER_DIR},
+        {"max_slots", required_argument, 0, MAX_SLOTS},
         {"debug", no_argument, 0, DEBUG},
         {0, 0, 0, 0}};
 
@@ -111,6 +139,12 @@ bool parseArgs(Args& args, int argc, char** argv)
         case CODE_PREDICTOR_ENGINE_DIR: args.codePredictorEngineDir = optarg; break;
         case CODE2WAV_ENGINE_DIR: args.code2wavEngineDir = optarg; break;
         case TOKENIZER_DIR: args.tokenizerDir = optarg; break;
+        case MAX_SLOTS:
+        {
+            int const v = std::atoi(optarg);
+            args.maxSlots = (v >= 1) ? v : 1; // clamp to >=1; 1 == single-instance behavior
+            break;
+        }
         case DEBUG: args.debug = true; break;
         default: return false;
         }
@@ -124,6 +158,16 @@ bool parseArgs(Args& args, int argc, char** argv)
     if (args.tokenizerDir.empty() && !args.talkerEngineDir.empty())
     {
         args.tokenizerDir = args.talkerEngineDir;
+    }
+    // D2 slot-pool size env fallback (matches the OVS EDGE_LLM_TTS_MAX_CONCURRENT
+    // convention). CLI --max_slots takes precedence when given (!= default 1).
+    if (args.maxSlots == 1)
+    {
+        if (char const* p = std::getenv("EDGE_LLM_TTS_MAX_CONCURRENT"))
+        {
+            int const v = std::atoi(p);
+            if (v >= 1) args.maxSlots = v;
+        }
     }
     return !args.talkerEngineDir.empty() && !args.codePredictorEngineDir.empty() && !args.code2wavEngineDir.empty();
 }
@@ -192,6 +236,9 @@ std::vector<std::vector<int32_t>> transposeFrames(std::vector<std::vector<int32_
 }
 
 // ===== stdout serialization =====
+//
+// Every worker thread emits events through emitEvent(); coutMutex serializes
+// the line writes so concurrent slots never interleave bytes on stdout.
 
 std::mutex coutMutex;
 
@@ -202,7 +249,13 @@ void emitEvent(Json payload)
     std::cout << line << std::endl;
 }
 
-// ===== cancel map =====
+// ===== cancel map (per-id → slot's cancel flag) =====
+//
+// A cancel line {"type":"cancel","id":X} trips the atomic<bool> belonging to
+// the in-flight request with that id. The flag lives on the slot (see TtsSlot)
+// and the request's shouldCancel lambda polls it. cancelMapMu guards the map;
+// the worker thread registers its flag when it starts a request and
+// unregisters at request end.
 
 std::mutex cancelMapMu;
 std::unordered_map<std::string, std::atomic<bool>*> cancelMap;
@@ -250,13 +303,510 @@ Qwen3OmniTTSRuntime::TalkerGenerationRequest buildRequest(Json const& item)
     req.speakerId = item.value("speaker_id", -1);
 
     Message msg;
-    msg.role = "user";
+    // Qwen3-TTS talker prefill expects the assistant role prefix
+    // ([<|im_start|>, assistant(77091), \n]) at input_ids[:3], not the user
+    // prefix (token 872). The text to synthesize is the assistant's content.
+    msg.role = "assistant";
     Message::MessageContent content;
     content.type = "text";
     content.content = item.value("text", "");
     msg.contents.push_back(std::move(content));
     req.messages.push_back(std::move(msg));
     return req;
+}
+
+// ===========================================================================
+// TTS slot-pool (D2-2).
+//
+// Each TtsSlot is a self-contained, single-threaded TTS lane:
+//   * runtime    — independent Qwen3OmniTTSRuntime. Slot 0 deserializes the
+//                  Talker + CodePredictor engines; slots 1..N-1 share those
+//                  ICudaEngines (D2-1 shared-engine ctor). Each slot has its own
+//                  IExecutionContexts, KV/cache state, workspace tensors.
+//   * code2wav   — independent (STATELESS) Code2WavRunner. Each slot owns its
+//                  own vocoder engine+context+buffers, so concurrent slots
+//                  never contend on Code2Wav state. We deliberately do NOT use
+//                  StatefulCode2WavRunner here: its per-request reset() does a
+//                  cudaMemset that is unsafe under concurrent slots (known N>1
+//                  hazard). Stateless generateWaveform() is pure given codes.
+//   * stream     — per-slot CUDA stream so independent slots can overlap on GPU.
+//   * worker     — the ONE OS thread that drives this slot's runtime. A runtime
+//                  instance is therefore never touched by >1 thread.
+//   * cancel     — per-slot atomic flag, registered in cancelMap under the
+//                  in-flight request id while a request runs.
+//   * queue/cv   — single-element handoff from the stdin reader to the worker.
+//                  inUse marks the slot busy from enqueue until the worker
+//                  finishes the request (so the reader won't double-assign).
+// ===========================================================================
+
+struct WorkItem
+{
+    Json request; //!< Parsed generation request JSON.
+};
+
+struct TtsSlot
+{
+    int32_t slotId{-1};
+    std::atomic<bool> inUse{false};   //!< True from enqueue until request completion.
+    std::atomic<bool> shutdown{false};//!< Set at teardown so the worker thread exits.
+
+    std::unique_ptr<Qwen3OmniTTSRuntime> runtime;
+    std::unique_ptr<Code2WavRunner> code2wav; //!< Per-slot stateless vocoder.
+    cudaStream_t stream{nullptr};
+
+    // Single-slot handoff queue (reader thread -> this slot's worker thread).
+    std::mutex queueMu;
+    std::condition_variable queueCv;
+    std::deque<WorkItem> queue;
+
+    // Per-slot cancel flag for the request currently running on this slot.
+    std::atomic<bool> cancelled{false};
+
+    std::thread worker;
+
+    TtsSlot() = default;
+    // Non-copyable / non-movable: holds std::atomic + CUDA stream + thread.
+    TtsSlot(TtsSlot const&) = delete;
+    TtsSlot& operator=(TtsSlot const&) = delete;
+};
+
+int32_t gMaxSlots{1};
+std::vector<std::unique_ptr<TtsSlot>> gSlotPool;
+std::mutex gPoolMutex; //!< Guards slot bring-up/teardown bookkeeping.
+
+// id → slotId routing table. Bound when the reader assigns a request to a slot,
+// dropped when the worker finishes the request. Guarded by gSessionMapMutex.
+std::unordered_map<std::string, int32_t> gSessionToSlot;
+std::mutex gSessionMapMutex;
+
+void bindSession(std::string const& id, int32_t slotId)
+{
+    std::lock_guard<std::mutex> guard(gSessionMapMutex);
+    gSessionToSlot[id] = slotId;
+}
+
+void unbindSession(std::string const& id)
+{
+    std::lock_guard<std::mutex> guard(gSessionMapMutex);
+    gSessionToSlot.erase(id);
+}
+
+[[maybe_unused]] int32_t lookupSlot(std::string const& id)
+{
+    std::lock_guard<std::mutex> guard(gSessionMapMutex);
+    auto it = gSessionToSlot.find(id);
+    return it == gSessionToSlot.end() ? -1 : it->second;
+}
+
+//! Claim a free slot via atomic CAS on inUse. Returns slot index or -1 when the
+//! pool is saturated (caller emits pool_saturated / 4429).
+int32_t acquireSlot()
+{
+    std::lock_guard<std::mutex> guard(gPoolMutex);
+    for (auto& slotPtr : gSlotPool)
+    {
+        bool expected = false;
+        if (slotPtr->inUse.compare_exchange_strong(expected, true))
+        {
+            return slotPtr->slotId;
+        }
+    }
+    return -1;
+}
+
+// ===== sample rate (read once at init; identical across slots) =====
+int32_t gSampleRate{24000};
+
+// ---------------------------------------------------------------------------
+// processRequest — run ONE generation request on a given slot.
+//
+// This is exactly the original main()-loop per-request body, factored out and
+// parameterized by slot so each worker thread runs it on its own runtime +
+// code2wav + stream + cancel flag. The async-vocode env path is preserved.
+// ---------------------------------------------------------------------------
+void processRequest(TtsSlot& slot, Json const& item, bool useStateful, bool useAsyncVocode,
+    StatefulCode2WavRunner* /*statefulShared (unused; per-slot path below)*/)
+{
+    Qwen3OmniTTSRuntime& ttsRuntime = *slot.runtime;
+    Code2WavRunner* code2wavRunner = slot.code2wav.get();
+    cudaStream_t const stream = slot.stream;
+
+    std::string const requestId = item.value("id", "");
+    // Reset and register this slot's cancel flag for the in-flight request.
+    slot.cancelled.store(false, std::memory_order_release);
+    std::atomic<bool>& cancelled = slot.cancelled;
+    if (!requestId.empty())
+    {
+        registerCancel(requestId, &cancelled);
+    }
+
+    int32_t chunkIndex = 0;
+    auto const requestStart = std::chrono::steady_clock::now();
+
+    struct VocodeJob
+    {
+        bool poison{false};
+        bool isFinal{false};
+        std::vector<std::vector<int32_t>> frames;
+        int32_t chunkIndex{0};
+        std::chrono::steady_clock::time_point enqueuedAt;
+    };
+    std::mutex vocodeMu;
+    std::condition_variable vocodeCv;
+    std::deque<VocodeJob> vocodeQ;
+    std::exception_ptr vocodeError{nullptr};
+    std::thread vocodeThread;
+    cudaStream_t vocodeStream{};
+    bool vocodeStreamCreated{false};
+
+    try
+    {
+        auto request = buildRequest(item);
+        int32_t const firstChunkFrames = std::max(1, item.value("first_chunk_frames", 8));
+        int32_t const subsequentChunkFrames = std::max(0, item.value("chunk_frames", 10));
+        bool const streaming = item.value("stream", true);
+        std::string const chunkFormat = item.value("chunk_format", "pcm_s16le");
+        std::string const chunkTransport = item.value("chunk_transport", "base64");
+
+        // Vocode lambda — uses THIS slot's code2wav. useStateful is not used at
+        // N>=1 in the slot-pool path (per-slot stateless vocoder avoids the
+        // StatefulCode2WavRunner concurrent-cudaMemset hazard). The flag is kept
+        // for the emitted `ready` metadata only.
+        auto runVocode = [&](std::vector<std::vector<int32_t>> const& chunkRvqCodes,
+                              bool /*isFinal*/, cudaStream_t s, std::vector<float>& samplesOut) -> bool {
+            rt::audioUtils::AudioData audioOutput;
+            auto const transposed = transposeFrames(chunkRvqCodes);
+            if (!code2wavRunner->generateWaveform(transposed, audioOutput, s))
+            {
+                return false;
+            }
+            samplesOut = audioToFloatSamples(audioOutput);
+            return true;
+        };
+
+        auto emitChunk = [&](std::vector<std::vector<int32_t>> const& chunkRvqCodes, bool isFinal,
+                              int32_t idx, std::chrono::steady_clock::time_point startTs,
+                              cudaStream_t vocStream) {
+            int32_t const frames = static_cast<int32_t>(chunkRvqCodes.size());
+            auto const c2wStart = std::chrono::steady_clock::now();
+            std::vector<float> samples;
+            if (frames > 0)
+            {
+                if (!runVocode(chunkRvqCodes, isFinal, vocStream, samples))
+                {
+                    emitEvent(Json{{"event", "error"}, {"ok", false},
+                        {"request_id", requestId}, {"id", requestId},
+                        {"error", "Code2Wav generateWaveform failed"}});
+                    return;
+                }
+            }
+            auto const c2wEnd = std::chrono::steady_clock::now();
+            int64_t const c2wMs
+                = std::chrono::duration_cast<std::chrono::milliseconds>(c2wEnd - c2wStart).count();
+
+            std::vector<int16_t> const pcm = floatToPcm16(samples);
+            std::string const b64 = base64Encode(
+                reinterpret_cast<uint8_t const*>(pcm.data()), pcm.size() * sizeof(int16_t));
+
+            int64_t const elapsedMs = std::chrono::duration_cast<std::chrono::milliseconds>(
+                c2wEnd - requestStart).count();
+            int64_t const queueMs = std::chrono::duration_cast<std::chrono::milliseconds>(
+                c2wStart - startTs).count();
+
+            Json evt = {
+                {"event", "chunk"},
+                {"ok", true},
+                {"request_id", requestId},
+                {"id", requestId},
+                {"chunk_index", idx},
+                {"chunk_format", chunkFormat},
+                {"chunk_transport", chunkTransport},
+                {"frames", frames},
+                {"samples", static_cast<int64_t>(pcm.size())},
+                {"sample_rate", gSampleRate},
+                {"is_final", isFinal},
+                {"code2wav_ms", c2wMs},
+                {"queue_ms", queueMs},
+                {"elapsed_ms", elapsedMs},
+                {"audio_b64", b64},
+            };
+            emitEvent(std::move(evt));
+        };
+
+        if (streaming && useAsyncVocode)
+        {
+            CUDA_CHECK(cudaStreamCreate(&vocodeStream));
+            vocodeStreamCreated = true;
+            vocodeThread = std::thread([&] {
+                while (true)
+                {
+                    VocodeJob job;
+                    {
+                        std::unique_lock<std::mutex> lk(vocodeMu);
+                        vocodeCv.wait(lk, [&] { return !vocodeQ.empty(); });
+                        job = std::move(vocodeQ.front());
+                        vocodeQ.pop_front();
+                    }
+                    if (job.poison)
+                    {
+                        break;
+                    }
+                    try
+                    {
+                        emitChunk(job.frames, job.isFinal, job.chunkIndex, job.enqueuedAt, vocodeStream);
+                    }
+                    catch (...)
+                    {
+                        vocodeError = std::current_exception();
+                    }
+                }
+            });
+        }
+
+        if (streaming)
+        {
+            request.codecChunkFrames = firstChunkFrames;
+            request.subsequentChunkFrames = subsequentChunkFrames;
+            request.shouldCancel = [&cancelled]() { return cancelled.load(std::memory_order_acquire); };
+            if (useAsyncVocode)
+            {
+                request.onAudioChunkReady = [&](std::vector<std::vector<int32_t>> const& chunkRvqCodes,
+                                                 int32_t /*batchIdx*/, bool isFinal) {
+                    VocodeJob job;
+                    job.poison = false;
+                    job.isFinal = isFinal;
+                    job.frames = chunkRvqCodes;
+                    job.chunkIndex = chunkIndex++;
+                    job.enqueuedAt = std::chrono::steady_clock::now();
+                    {
+                        std::lock_guard<std::mutex> lk(vocodeMu);
+                        vocodeQ.push_back(std::move(job));
+                    }
+                    vocodeCv.notify_one();
+                };
+            }
+            else
+            {
+                request.onAudioChunkReady = [&](std::vector<std::vector<int32_t>> const& chunkRvqCodes,
+                                                 int32_t /*batchIdx*/, bool isFinal) {
+                    emitChunk(chunkRvqCodes, isFinal, chunkIndex++,
+                        std::chrono::steady_clock::now(), stream);
+                };
+            }
+        }
+
+        Qwen3OmniTTSRuntime::TalkerGenerationResponse response;
+        bool const ok = ttsRuntime.handleAudioGeneration(request, response, stream);
+
+        // Drain async vocode thread before emitting done/cancelled/error.
+        if (vocodeThread.joinable())
+        {
+            {
+                std::lock_guard<std::mutex> lk(vocodeMu);
+                VocodeJob poison;
+                poison.poison = true;
+                vocodeQ.push_back(std::move(poison));
+            }
+            vocodeCv.notify_one();
+            vocodeThread.join();
+        }
+        if (vocodeStreamCreated)
+        {
+            cudaStreamDestroy(vocodeStream);
+            vocodeStreamCreated = false;
+        }
+        if (vocodeError)
+        {
+            std::rethrow_exception(vocodeError);
+        }
+
+        if (cancelled.load(std::memory_order_acquire))
+        {
+            emitEvent(Json{{"event", "cancelled"}, {"ok", true},
+                {"request_id", requestId}, {"id", requestId}, {"reason", "cancelled"}});
+        }
+        else if (!ok)
+        {
+            emitEvent(Json{{"event", "error"}, {"ok", false},
+                {"request_id", requestId}, {"id", requestId}, {"error", "handleAudioGeneration failed"}});
+        }
+        else
+        {
+            int64_t const totalMs = std::chrono::duration_cast<std::chrono::milliseconds>(
+                std::chrono::steady_clock::now() - requestStart)
+                                        .count();
+            int32_t const totalFrames
+                = response.numFramesPerSample.empty() ? 0 : response.numFramesPerSample[0];
+            emitEvent(Json{{"event", "done"}, {"ok", true},
+                {"request_id", requestId}, {"id", requestId},
+                {"chunks_emitted", chunkIndex},
+                {"total_frames", totalFrames},
+                {"sample_rate", gSampleRate},
+                {"elapsed_ms", totalMs}});
+        }
+    }
+    catch (std::exception const& e)
+    {
+        if (vocodeThread.joinable())
+        {
+            {
+                std::lock_guard<std::mutex> lk(vocodeMu);
+                VocodeJob poison;
+                poison.poison = true;
+                vocodeQ.push_back(std::move(poison));
+            }
+            vocodeCv.notify_one();
+            vocodeThread.join();
+        }
+        if (vocodeStreamCreated)
+        {
+            cudaStreamDestroy(vocodeStream);
+            vocodeStreamCreated = false;
+        }
+        emitEvent(Json{{"event", "error"}, {"ok", false},
+            {"request_id", requestId}, {"id", requestId}, {"error", e.what()}});
+    }
+
+    if (!requestId.empty())
+    {
+        unregisterCancel(requestId);
+        unbindSession(requestId);
+    }
+    // Release the slot for reuse. Order matters: drop the id→slot mapping FIRST
+    // (above), then clear inUse, so a freed slot is never reachable by a stale
+    // routing entry pointing at a now-idle slot.
+    slot.inUse.store(false, std::memory_order_release);
+}
+
+//! Worker thread body: blocks on the slot's queue, runs each request to
+//! completion (serially within the slot — one request at a time per slot).
+void slotWorkerLoop(TtsSlot* slot, bool useStateful, bool useAsyncVocode)
+{
+    while (true)
+    {
+        WorkItem item;
+        {
+            std::unique_lock<std::mutex> lk(slot->queueMu);
+            slot->queueCv.wait(lk, [&] { return !slot->queue.empty() || slot->shutdown.load(); });
+            if (slot->shutdown.load() && slot->queue.empty())
+            {
+                return;
+            }
+            item = std::move(slot->queue.front());
+            slot->queue.pop_front();
+        }
+        processRequest(*slot, item.request, useStateful, useAsyncVocode, nullptr);
+    }
+}
+
+//! Build the N-slot pool sharing the Talker + CodePredictor engines. Slot 0
+//! deserializes via the path-based ctor; slots 1..N-1 share its engines via the
+//! D2-1 shared-engine ctor. Each slot gets its own Code2WavRunner + CUDA stream
+//! + worker thread. Returns false on init failure.
+bool initSlotPool(Args const& args, bool useStateful, bool useAsyncVocode, int64_t& initMsOut)
+{
+    std::lock_guard<std::mutex> guard(gPoolMutex);
+    int32_t const n = std::max(1, gMaxSlots);
+    gSlotPool.clear();
+    gSlotPool.reserve(static_cast<size_t>(n));
+
+    bool const enableCudaGraph = std::getenv("EDGE_LLM_TTS_CUDA_GRAPH") == nullptr
+        || std::string(std::getenv("EDGE_LLM_TTS_CUDA_GRAPH")) != "0";
+
+    auto const initStart = std::chrono::steady_clock::now();
+    try
+    {
+        for (int32_t i = 0; i < n; ++i)
+        {
+            auto slot = std::make_unique<TtsSlot>();
+            slot->slotId = i;
+            slot->inUse.store(false);
+            CUDA_CHECK(cudaStreamCreate(&slot->stream));
+
+            if (i == 0)
+            {
+                // Slot 0: path-based ctor deserializes the Talker + CodePredictor
+                // engines once and loads weights / tokenizer / embeddings.
+                slot->runtime = std::make_unique<Qwen3OmniTTSRuntime>(
+                    args.talkerEngineDir, args.codePredictorEngineDir, args.tokenizerDir, slot->stream);
+            }
+            else
+            {
+                // Slots 1..N-1: SHARE slot 0's deserialized Talker + CodePredictor
+                // ICudaEngines (D2-1). Each still allocates its own execution
+                // contexts, KV/cache state, workspace tensors, tokenizer, embeds.
+                std::shared_ptr<nvinfer1::ICudaEngine> sharedTalker = gSlotPool[0]->runtime->getTalkerEngine();
+                std::shared_ptr<nvinfer1::ICudaEngine> sharedCp = gSlotPool[0]->runtime->getCodePredictorEngine();
+                slot->runtime = std::make_unique<Qwen3OmniTTSRuntime>(
+                    sharedTalker, sharedCp, args.talkerEngineDir, args.codePredictorEngineDir,
+                    args.tokenizerDir, slot->stream);
+            }
+
+            // Per-slot STATELESS Code2Wav. Each owns its own engine+context+buffers,
+            // so concurrent slots never contend (avoids the StatefulCode2WavRunner
+            // concurrent-cudaMemset hazard). useStateful only affects `ready` meta.
+            slot->code2wav = std::make_unique<Code2WavRunner>(args.code2wavEngineDir, slot->stream);
+
+            if (enableCudaGraph && !slot->runtime->captureDecodingCUDAGraph(slot->stream))
+            {
+                std::cerr << "warning: failed to capture talker decoding CUDA graph for slot " << i << std::endl;
+            }
+            if (i == 0)
+            {
+                gSampleRate = slot->code2wav->getConfig().sampleRate;
+            }
+            gSlotPool.push_back(std::move(slot));
+        }
+    }
+    catch (std::exception const& e)
+    {
+        emitEvent(Json{{"event", "error"}, {"ok", false}, {"error", std::string("init failed: ") + e.what()}});
+        return false;
+    }
+
+    initMsOut = std::chrono::duration_cast<std::chrono::milliseconds>(
+        std::chrono::steady_clock::now() - initStart).count();
+
+    // Spawn one worker thread per slot AFTER all slots are constructed (so a
+    // worker never observes a half-built pool). (void)useStateful: the slot-pool
+    // path always uses per-slot stateless Code2Wav; the flag is kept for `ready`.
+    for (auto& slotPtr : gSlotPool)
+    {
+        slotPtr->worker = std::thread(slotWorkerLoop, slotPtr.get(), useStateful, useAsyncVocode);
+    }
+    return true;
+}
+
+//! Stop + join every worker thread, destroy CUDA streams, free runtimes.
+void destroySlotPool()
+{
+    {
+        std::lock_guard<std::mutex> guard(gPoolMutex);
+        for (auto& slotPtr : gSlotPool)
+        {
+            slotPtr->shutdown.store(true);
+            slotPtr->queueCv.notify_all();
+        }
+    }
+    for (auto& slotPtr : gSlotPool)
+    {
+        if (slotPtr->worker.joinable())
+        {
+            slotPtr->worker.join();
+        }
+    }
+    std::lock_guard<std::mutex> guard(gPoolMutex);
+    for (auto& slotPtr : gSlotPool)
+    {
+        slotPtr->code2wav.reset();
+        slotPtr->runtime.reset();
+        if (slotPtr->stream != nullptr)
+        {
+            cudaStreamDestroy(slotPtr->stream);
+            slotPtr->stream = nullptr;
+        }
+    }
+    gSlotPool.clear();
 }
 
 } // namespace
@@ -275,62 +825,28 @@ int main(int argc, char** argv)
 
     auto pluginHandles = loadEdgellmPluginLib();
 
-    cudaStream_t stream;
-    CUDA_CHECK(cudaStreamCreate(&stream));
-
     auto envIsOne = [](char const* name) {
         auto* v = std::getenv(name);
         return v != nullptr && std::string(v) == "1";
     };
     bool const useStateful = envIsOne("EDGE_LLM_TTS_STATEFUL_CODE2WAV");
     bool const useAsyncVocode = envIsOne("EDGE_LLM_TTS_ASYNC_VOCODE");
-    std::string statefulEngineDir = args.code2wavEngineDir;
-    if (auto* env = std::getenv("EDGE_LLM_TTS_STATEFUL_CODE2WAV_ENGINE_DIR"))
-    {
-        statefulEngineDir = env;
-    }
 
-    std::unique_ptr<Qwen3OmniTTSRuntime> ttsRuntime;
-    std::unique_ptr<Code2WavRunner> code2wavRunner;
-    std::unique_ptr<StatefulCode2WavRunner> statefulCode2wavRunner;
-
-    auto const initStart = std::chrono::steady_clock::now();
-    try
+    gMaxSlots = args.maxSlots;
+    int64_t initMs = 0;
+    if (!initSlotPool(args, useStateful, useAsyncVocode, initMs))
     {
-        ttsRuntime = std::make_unique<Qwen3OmniTTSRuntime>(
-            args.talkerEngineDir, args.codePredictorEngineDir, args.tokenizerDir, stream);
-        if (useStateful)
-        {
-            statefulCode2wavRunner = std::make_unique<StatefulCode2WavRunner>(statefulEngineDir, stream);
-        }
-        else
-        {
-            code2wavRunner = std::make_unique<Code2WavRunner>(args.code2wavEngineDir, stream);
-        }
-        if (std::getenv("EDGE_LLM_TTS_CUDA_GRAPH") == nullptr
-            || std::string(std::getenv("EDGE_LLM_TTS_CUDA_GRAPH")) != "0")
-        {
-            if (!ttsRuntime->captureDecodingCUDAGraph(stream))
-            {
-                std::cerr << "warning: failed to capture talker decoding CUDA graph" << std::endl;
-            }
-        }
-    }
-    catch (std::exception const& e)
-    {
-        emitEvent(Json{{"event", "error"}, {"ok", false}, {"error", std::string("init failed: ") + e.what()}});
         return EXIT_FAILURE;
     }
 
-    auto const initEnd = std::chrono::steady_clock::now();
-    int64_t const initMs
-        = std::chrono::duration_cast<std::chrono::milliseconds>(initEnd - initStart).count();
     emitEvent(Json{{"event", "ready"}, {"request_id", "__worker__"}, {"id", "__worker__"},
-        {"init_ms", initMs}, {"stateful_code2wav", useStateful}, {"async_vocode", useAsyncVocode}});
+        {"init_ms", initMs}, {"max_slots", gMaxSlots},
+        {"stateful_code2wav", useStateful}, {"async_vocode", useAsyncVocode}});
 
-    int32_t const sampleRate
-        = useStateful ? statefulCode2wavRunner->getConfig().sampleRate : code2wavRunner->getConfig().sampleRate;
-
+    // Single stdin reader thread: parse each JSON line and route it. Generation
+    // requests are dispatched to a free slot's worker thread (non-blocking — the
+    // reader keeps reading so cancel lines for in-flight requests are honored
+    // promptly). Cancel lines trip the per-id flag synchronously.
     std::string line;
     while (std::getline(std::cin, line))
     {
@@ -357,270 +873,37 @@ int main(int argc, char** argv)
             continue;
         }
 
+        // Generation request: claim a free slot and hand it to that slot's worker.
         std::string const requestId = item.value("id", "");
-        std::atomic<bool> cancelled{false};
-        if (!requestId.empty())
+        int32_t const slotId = acquireSlot();
+        if (slotId < 0)
         {
-            registerCancel(requestId, &cancelled);
-        }
-
-        // Streaming bookkeeping (per-request, thread-local since we run one request at a time).
-        int32_t chunkIndex = 0;
-        auto const requestStart = std::chrono::steady_clock::now();
-
-        // Async vocode worker plumbing (per-request, only constructed when enabled).
-        struct VocodeJob
-        {
-            bool poison{false};
-            bool isFinal{false};
-            std::vector<std::vector<int32_t>> frames;
-            int32_t chunkIndex{0};
-            std::chrono::steady_clock::time_point enqueuedAt;
-        };
-        std::mutex vocodeMu;
-        std::condition_variable vocodeCv;
-        std::deque<VocodeJob> vocodeQ;
-        std::exception_ptr vocodeError{nullptr};
-        std::thread vocodeThread;
-        cudaStream_t vocodeStream{};
-        bool vocodeStreamCreated{false};
-
-        try
-        {
-            auto request = buildRequest(item);
-            // Adaptive chunk growth: first_chunk_frames sizes the FIRST emitted
-            // RVQ chunk (low TTFA target, default 8), chunk_frames sizes all
-            // subsequent chunks (steady-state stability, default 10). When
-            // chunk_frames <= 0 the runtime reuses first_chunk_frames for every
-            // chunk (legacy method-ii behavior). max_chunk_frames /
-            // chunk_growth_frames are accepted for forward-compat but unused.
-            int32_t const firstChunkFrames = std::max(1, item.value("first_chunk_frames", 8));
-            int32_t const subsequentChunkFrames = std::max(0, item.value("chunk_frames", 10));
-            bool const streaming = item.value("stream", true);
-            std::string const chunkFormat = item.value("chunk_format", "pcm_s16le");
-            std::string const chunkTransport = item.value("chunk_transport", "base64");
-
-            // Reset stateful Code2Wav state at request start so each request is independent.
-            if (useStateful && statefulCode2wavRunner)
+            // Pool saturated: every slot has an in-flight request. Surface a
+            // 4429-style structured error so OVS / the session-limiter backs off.
+            Json ev = {{"event", "error"}, {"ok", false}, {"error", "pool_saturated"},
+                {"status", 4429}, {"max_slots", gMaxSlots}};
+            if (!requestId.empty())
             {
-                statefulCode2wavRunner->reset(stream);
+                ev["request_id"] = requestId;
+                ev["id"] = requestId;
             }
-
-            // Vocode lambda — runs on whichever stream is active (sync = main stream,
-            // async = dedicated vocodeStream).
-            auto runVocode = [&](std::vector<std::vector<int32_t>> const& chunkRvqCodes,
-                                  bool isFinal, cudaStream_t s, std::vector<float>& samplesOut) -> bool {
-                rt::audioUtils::AudioData audioOutput;
-                auto const transposed = transposeFrames(chunkRvqCodes);
-                bool ok = false;
-                if (useStateful)
-                {
-                    ok = statefulCode2wavRunner->generateChunk(transposed, isFinal, audioOutput, s);
-                }
-                else
-                {
-                    ok = code2wavRunner->generateWaveform(transposed, audioOutput, s);
-                }
-                if (!ok)
-                {
-                    return false;
-                }
-                samplesOut = audioToFloatSamples(audioOutput);
-                return true;
-            };
-
-            auto emitChunk = [&](std::vector<std::vector<int32_t>> const& chunkRvqCodes, bool isFinal,
-                                  int32_t idx, std::chrono::steady_clock::time_point startTs,
-                                  cudaStream_t vocStream) {
-                int32_t const frames = static_cast<int32_t>(chunkRvqCodes.size());
-                auto const c2wStart = std::chrono::steady_clock::now();
-                std::vector<float> samples;
-                if (frames > 0)
-                {
-                    if (!runVocode(chunkRvqCodes, isFinal, vocStream, samples))
-                    {
-                        emitEvent(Json{{"event", "error"}, {"ok", false},
-                            {"request_id", requestId}, {"id", requestId},
-                            {"error", "Code2Wav generateWaveform failed"}});
-                        return;
-                    }
-                }
-                auto const c2wEnd = std::chrono::steady_clock::now();
-                int64_t const c2wMs
-                    = std::chrono::duration_cast<std::chrono::milliseconds>(c2wEnd - c2wStart).count();
-
-                std::vector<int16_t> const pcm = floatToPcm16(samples);
-                std::string const b64 = base64Encode(
-                    reinterpret_cast<uint8_t const*>(pcm.data()), pcm.size() * sizeof(int16_t));
-
-                int64_t const elapsedMs = std::chrono::duration_cast<std::chrono::milliseconds>(
-                    c2wEnd - requestStart).count();
-                int64_t const queueMs = std::chrono::duration_cast<std::chrono::milliseconds>(
-                    c2wStart - startTs).count();
-
-                Json evt = {
-                    {"event", "chunk"},
-                    {"ok", true},
-                    {"request_id", requestId},
-                    {"id", requestId},
-                    {"chunk_index", idx},
-                    {"chunk_format", chunkFormat},
-                    {"chunk_transport", chunkTransport},
-                    {"frames", frames},
-                    {"samples", static_cast<int64_t>(pcm.size())},
-                    {"sample_rate", sampleRate},
-                    {"is_final", isFinal},
-                    {"code2wav_ms", c2wMs},
-                    {"queue_ms", queueMs},
-                    {"elapsed_ms", elapsedMs},
-                    {"audio_b64", b64},
-                };
-                emitEvent(std::move(evt));
-            };
-
-            if (streaming && useAsyncVocode)
-            {
-                CUDA_CHECK(cudaStreamCreate(&vocodeStream));
-                vocodeStreamCreated = true;
-                vocodeThread = std::thread([&] {
-                    while (true)
-                    {
-                        VocodeJob job;
-                        {
-                            std::unique_lock<std::mutex> lk(vocodeMu);
-                            vocodeCv.wait(lk, [&] { return !vocodeQ.empty(); });
-                            job = std::move(vocodeQ.front());
-                            vocodeQ.pop_front();
-                        }
-                        if (job.poison)
-                        {
-                            break;
-                        }
-                        try
-                        {
-                            emitChunk(job.frames, job.isFinal, job.chunkIndex, job.enqueuedAt, vocodeStream);
-                        }
-                        catch (...)
-                        {
-                            vocodeError = std::current_exception();
-                            // drain remaining jobs but keep loop alive until poison.
-                        }
-                    }
-                });
-            }
-
-            if (streaming)
-            {
-                request.codecChunkFrames = firstChunkFrames;
-                request.subsequentChunkFrames = subsequentChunkFrames;
-                request.shouldCancel = [&cancelled]() { return cancelled.load(std::memory_order_acquire); };
-                if (useAsyncVocode)
-                {
-                    request.onAudioChunkReady = [&](std::vector<std::vector<int32_t>> const& chunkRvqCodes,
-                                                     int32_t /*batchIdx*/, bool isFinal) {
-                        VocodeJob job;
-                        job.poison = false;
-                        job.isFinal = isFinal;
-                        job.frames = chunkRvqCodes;
-                        job.chunkIndex = chunkIndex++;
-                        job.enqueuedAt = std::chrono::steady_clock::now();
-                        {
-                            std::lock_guard<std::mutex> lk(vocodeMu);
-                            vocodeQ.push_back(std::move(job));
-                        }
-                        vocodeCv.notify_one();
-                    };
-                }
-                else
-                {
-                    request.onAudioChunkReady = [&](std::vector<std::vector<int32_t>> const& chunkRvqCodes,
-                                                     int32_t /*batchIdx*/, bool isFinal) {
-                        emitChunk(chunkRvqCodes, isFinal, chunkIndex++,
-                            std::chrono::steady_clock::now(), stream);
-                    };
-                }
-            }
-
-            Qwen3OmniTTSRuntime::TalkerGenerationResponse response;
-            bool const ok = ttsRuntime->handleAudioGeneration(request, response, stream);
-
-            // Drain async vocode thread before emitting done/cancelled/error.
-            if (vocodeThread.joinable())
-            {
-                {
-                    std::lock_guard<std::mutex> lk(vocodeMu);
-                    VocodeJob poison;
-                    poison.poison = true;
-                    vocodeQ.push_back(std::move(poison));
-                }
-                vocodeCv.notify_one();
-                vocodeThread.join();
-            }
-            if (vocodeStreamCreated)
-            {
-                cudaStreamDestroy(vocodeStream);
-                vocodeStreamCreated = false;
-            }
-            if (vocodeError)
-            {
-                std::rethrow_exception(vocodeError);
-            }
-
-            if (cancelled.load(std::memory_order_acquire))
-            {
-                emitEvent(Json{{"event", "cancelled"}, {"ok", true},
-                    {"request_id", requestId}, {"id", requestId}, {"reason", "cancelled"}});
-            }
-            else if (!ok)
-            {
-                emitEvent(Json{{"event", "error"}, {"ok", false},
-                    {"request_id", requestId}, {"id", requestId}, {"error", "handleAudioGeneration failed"}});
-            }
-            else
-            {
-                int64_t const totalMs = std::chrono::duration_cast<std::chrono::milliseconds>(
-                    std::chrono::steady_clock::now() - requestStart)
-                                            .count();
-                int32_t const totalFrames
-                    = response.numFramesPerSample.empty() ? 0 : response.numFramesPerSample[0];
-                emitEvent(Json{{"event", "done"}, {"ok", true},
-                    {"request_id", requestId}, {"id", requestId},
-                    {"chunks_emitted", chunkIndex},
-                    {"total_frames", totalFrames},
-                    {"sample_rate", sampleRate},
-                    {"elapsed_ms", totalMs}});
-            }
-        }
-        catch (std::exception const& e)
-        {
-            // Best-effort drain of async vocode thread on exception so we don't
-            // leak a detached worker into the next request.
-            if (vocodeThread.joinable())
-            {
-                {
-                    std::lock_guard<std::mutex> lk(vocodeMu);
-                    VocodeJob poison;
-                    poison.poison = true;
-                    vocodeQ.push_back(std::move(poison));
-                }
-                vocodeCv.notify_one();
-                vocodeThread.join();
-            }
-            if (vocodeStreamCreated)
-            {
-                cudaStreamDestroy(vocodeStream);
-                vocodeStreamCreated = false;
-            }
-            emitEvent(Json{{"event", "error"}, {"ok", false},
-                {"request_id", requestId}, {"id", requestId}, {"error", e.what()}});
+            emitEvent(std::move(ev));
+            continue;
         }
 
         if (!requestId.empty())
         {
-            unregisterCancel(requestId);
+            bindSession(requestId, slotId);
         }
+        TtsSlot& slot = *gSlotPool[static_cast<size_t>(slotId)];
+        {
+            std::lock_guard<std::mutex> lk(slot.queueMu);
+            slot.queue.push_back(WorkItem{std::move(item)});
+        }
+        slot.queueCv.notify_one();
     }
 
-    cudaStreamDestroy(stream);
+    // EOF on stdin: drain + join all worker threads, free GPU resources.
+    destroySlotPool();
     return EXIT_SUCCESS;
 }
