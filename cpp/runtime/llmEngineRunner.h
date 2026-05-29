@@ -102,6 +102,24 @@ public:
     LLMEngineRunner(std::filesystem::path const& enginePath, std::filesystem::path const& configPath,
         std::unordered_map<std::string, std::string> const& loraWeightsMap, cudaStream_t stream);
 
+    /*!
+     * @brief Construct LLM engine runner from an already-deserialized, shared ICudaEngine (ASR slot-pool, D1).
+     *
+     * Reuses the supplied engine instead of deserializing a new one, so N runners can share one set of
+     * engine weights while each builds its own user-managed IExecutionContext. The deserializing owner of
+     * @p engine (the runner created via the path-based constructor) MUST outlive every runner built this way,
+     * because it owns the TensorRT IRuntime that backs the engine. This overload does NOT own an IRuntime.
+     *
+     * @param engine Shared, already-deserialized TensorRT engine (must be non-null)
+     * @param configPath Path to model configuration file
+     * @param loraWeightsMap Map of LoRA weight names to file paths
+     * @param stream CUDA stream for operations
+     * @throws std::runtime_error If @p engine is null, configuration parsing, or initialization fails, or a
+     * CUDA operation fails
+     */
+    LLMEngineRunner(std::shared_ptr<nvinfer1::ICudaEngine> engine, std::filesystem::path const& configPath,
+        std::unordered_map<std::string, std::string> const& loraWeightsMap, cudaStream_t stream);
+
     //! @brief Destructor
     ~LLMEngineRunner() noexcept;
 
@@ -131,6 +149,12 @@ public:
     //! @brief Get engine configuration
     //! @return Engine configuration structure
     LLMEngineRunnerConfig getEngineConfig() const noexcept;
+
+    //! @brief Get the shared TensorRT engine backing this runner (ASR slot-pool, D1).
+    //! @return Shared pointer to the ICudaEngine. Allows constructing additional runners that share these
+    //! engine weights via the shared-engine constructor overload.
+    //! @note The returned engine is only valid while this runner (the deserializing owner) is alive.
+    std::shared_ptr<nvinfer1::ICudaEngine> getEngine() const noexcept;
 
     //! @brief Bind a dynamic lm_head weight tensor to the engine
     //!
@@ -251,7 +275,11 @@ public:
 
 private:
     std::unique_ptr<nvinfer1::IRuntime> mRuntime;                      //!< TensorRT runtime
-    std::unique_ptr<nvinfer1::ICudaEngine> mEngine;                    //!< TensorRT engine
+    //! TensorRT engine. shared_ptr so multiple LLMEngineRunner instances (ASR slot-pool, D1) can share
+    //! one deserialized ICudaEngine (saving weight memory) while each owns an independent execution context.
+    //! For the deserializing constructor this runner also keeps mRuntime alive; the shared-engine overload
+    //! relies on the original deserializing owner keeping its mRuntime alive for the engine's lifetime.
+    std::shared_ptr<nvinfer1::ICudaEngine> mEngine;                    //!< TensorRT engine (shared across runners)
     std::unique_ptr<nvinfer1::IExecutionContext> mTRTExecutionContext; //!< Prefill and Generation execution context
 
     //! Holds the CUDA graph captured for the decoding step. Each CUDA graph is associated with a unique key value

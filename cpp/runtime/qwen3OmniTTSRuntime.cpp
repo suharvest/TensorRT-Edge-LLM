@@ -337,6 +337,28 @@ Qwen3OmniTTSRuntime::Qwen3OmniTTSRuntime(std::string const& talkerEngineDir, std
     std::string const& tokenizerDir, cudaStream_t stream)
     : mStream(stream)
 {
+    // Path-based init: deserialize both engines from disk (no shared engines).
+    initializeCommon(talkerEngineDir, codePredictorEngineDir, tokenizerDir, stream);
+}
+
+Qwen3OmniTTSRuntime::Qwen3OmniTTSRuntime(std::shared_ptr<nvinfer1::ICudaEngine> sharedTalkerEngine,
+    std::shared_ptr<nvinfer1::ICudaEngine> sharedCodePredictorEngine, std::string const& talkerEngineDir,
+    std::string const& codePredictorEngineDir, std::string const& tokenizerDir, cudaStream_t stream)
+    : mStream(stream)
+{
+    // Shared-engine init (TTS slot-pool, D2): reuse the supplied Talker + CodePredictor engines instead of
+    // deserializing from disk. All other initialization is identical to the path-based constructor.
+    ELLM_CHECK(sharedTalkerEngine != nullptr, "Shared Talker engine must be non-null");
+    ELLM_CHECK(sharedCodePredictorEngine != nullptr, "Shared CodePredictor engine must be non-null");
+    initializeCommon(talkerEngineDir, codePredictorEngineDir, tokenizerDir, stream, std::move(sharedTalkerEngine),
+        std::move(sharedCodePredictorEngine));
+}
+
+void Qwen3OmniTTSRuntime::initializeCommon(std::string const& talkerEngineDir,
+    std::string const& codePredictorEngineDir, std::string const& tokenizerDir, cudaStream_t stream,
+    std::shared_ptr<nvinfer1::ICudaEngine> sharedTalkerEngine,
+    std::shared_ptr<nvinfer1::ICudaEngine> sharedCodePredictorEngine)
+{
     NVTX_SCOPED_RANGE(nvtx_range, "TalkerRunner::init", nvtx_colors::YELLOW);
     LOG_INFO("Initializing Qwen3-Omni Talker runner");
     LOG_INFO("  Talker: %s", talkerEngineDir.c_str());
@@ -354,7 +376,8 @@ Qwen3OmniTTSRuntime::Qwen3OmniTTSRuntime(std::string const& talkerEngineDir, std
     bool const configValid = validateAndFillConfig(talkerEngineDir);
     ELLM_CHECK(configValid, "Failed to validate and fill config");
 
-    bool const runnersInitialized = initializeEngineRunners(talkerEngineDir, codePredictorEngineDir);
+    bool const runnersInitialized = initializeEngineRunners(
+        talkerEngineDir, codePredictorEngineDir, std::move(sharedTalkerEngine), std::move(sharedCodePredictorEngine));
     ELLM_CHECK(runnersInitialized, "Failed to initialize engine runners");
 
     // Setup shared execution context memory for Talker and CodePredictor engines.
@@ -463,8 +486,9 @@ Qwen3OmniTTSRuntime::~Qwen3OmniTTSRuntime()
     }
 }
 
-bool Qwen3OmniTTSRuntime::initializeEngineRunners(
-    std::string const& talkerEngineDir, std::string const& codePredictorEngineDir)
+bool Qwen3OmniTTSRuntime::initializeEngineRunners(std::string const& talkerEngineDir,
+    std::string const& codePredictorEngineDir, std::shared_ptr<nvinfer1::ICudaEngine> sharedTalkerEngine,
+    std::shared_ptr<nvinfer1::ICudaEngine> sharedCodePredictorEngine)
 {
     // Load Talker LLM engine
     std::filesystem::path talkerEnginePath = std::filesystem::path(talkerEngineDir) / "llm.engine";
@@ -475,7 +499,19 @@ bool Qwen3OmniTTSRuntime::initializeEngineRunners(
     try
     {
         std::unordered_map<std::string, std::string> emptyLoraMap;
-        mTalkerLLMRunner = std::make_unique<LLMEngineRunner>(talkerEnginePath, talkerConfigPath, emptyLoraMap, mStream);
+        if (sharedTalkerEngine != nullptr)
+        {
+            // TTS slot-pool (D2): build the Talker runner from the shared, already-deserialized engine so this
+            // slot reuses the Talker engine weights while owning its own execution context / KV state.
+            mTalkerLLMRunner = std::make_unique<LLMEngineRunner>(
+                std::move(sharedTalkerEngine), talkerConfigPath, emptyLoraMap, mStream);
+            LOG_INFO("Talker LLM runner initialized from shared engine (TTS slot-pool).");
+        }
+        else
+        {
+            mTalkerLLMRunner
+                = std::make_unique<LLMEngineRunner>(talkerEnginePath, talkerConfigPath, emptyLoraMap, mStream);
+        }
         mTalkerLLMConfig = mTalkerLLMRunner->getEngineConfig();
 
         LOG_INFO("Talker LLM engine loaded: vocabSize=%d, hiddenSize=%d", mTalkerLLMConfig.vocabSize,
@@ -500,8 +536,18 @@ bool Qwen3OmniTTSRuntime::initializeEngineRunners(
     try
     {
         std::unordered_map<std::string, std::string> emptyLoraMap;
-        mCodePredictorRunner = std::make_unique<LLMEngineRunner>(
-            codePredictorEnginePath, codePredictorConfigPath, emptyLoraMap, mStream);
+        if (sharedCodePredictorEngine != nullptr)
+        {
+            // TTS slot-pool (D2): build the CodePredictor runner from the shared, already-deserialized engine.
+            mCodePredictorRunner = std::make_unique<LLMEngineRunner>(
+                std::move(sharedCodePredictorEngine), codePredictorConfigPath, emptyLoraMap, mStream);
+            LOG_INFO("CodePredictor runner initialized from shared engine (TTS slot-pool).");
+        }
+        else
+        {
+            mCodePredictorRunner = std::make_unique<LLMEngineRunner>(
+                codePredictorEnginePath, codePredictorConfigPath, emptyLoraMap, mStream);
+        }
 
         // NOTE: CodePredictor ONNX now outputs FP32 logits directly (lm_head + cast in ONNX),
         // so standard logits shape validation applies.

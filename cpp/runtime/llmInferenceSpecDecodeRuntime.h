@@ -169,6 +169,34 @@ public:
     LLMInferenceSpecDecodeRuntime(std::string const& engineDir, std::string const& multimodalEngineDir,
         std::unordered_map<std::string, std::string> const& loraWeightsMap, cudaStream_t stream);
 
+    /*!
+     * @brief Construct vanilla-only runtime that SHARES a base ICudaEngine with another runtime (ASR slot-pool, D1).
+     *
+     * Used to build N decoder/thinker slots that share one deserialized base engine (saving weight memory)
+     * while each slot owns an independent IExecutionContext, KV/cache manager state, runtime tensors, and
+     * shared-execution-context memory. The supplied @p sharedBaseEngine must come from another live
+     * LLMEngineRunner (via getEngine()), whose deserializing owner must outlive this runtime.
+     *
+     * This path is vanilla-only (no Eagle draft). It still loads its own embedding table, tokenizer, and
+     * (if present) multimodal runners from @p engineDir / @p multimodalEngineDir, exactly like the vanilla
+     * path-based constructor — only the base LLM engine weights are shared.
+     *
+     * @param sharedBaseEngine Shared, already-deserialized base TensorRT engine (must be non-null)
+     * @param engineDir Directory containing engine files (embedding.safetensors, config.json, etc.)
+     * @param multimodalEngineDir Directory containing multimodal engine files
+     * @param loraWeightsMap Map of LoRA weight names to file paths
+     * @param stream CUDA stream for operations
+     * @throws std::runtime_error if directories do not contain expected data, or runner initialization fails
+     */
+    LLMInferenceSpecDecodeRuntime(std::shared_ptr<nvinfer1::ICudaEngine> sharedBaseEngine,
+        std::string const& engineDir, std::string const& multimodalEngineDir,
+        std::unordered_map<std::string, std::string> const& loraWeightsMap, cudaStream_t stream);
+
+    //! @brief Get the shared base TensorRT engine backing this runtime (ASR slot-pool, D1).
+    //! @return Shared pointer to the base ICudaEngine, for constructing additional slot runtimes that share it.
+    //! @note Valid only while this runtime (and its deserializing owner) is alive.
+    std::shared_ptr<nvinfer1::ICudaEngine> getBaseEngine() const noexcept;
+
     //! @brief Destructor
     ~LLMInferenceSpecDecodeRuntime() noexcept = default;
 
@@ -281,7 +309,13 @@ public:
     //! @param context  Inference context to bind.
     //! @param stream   CUDA stream for MRope init. If 0 (default), MRope init
     //!                 is skipped — preserves the M2 spike_m2 API.
-    bool beginAsrSession(SpecDecodeInferenceContext& context, cudaStream_t stream = 0);
+    //! @param activeBatchSize  Number of concurrent ASR lanes sharing this
+    //!                 single context (single-context batched ASR). Default 1
+    //!                 keeps existing single-session callers unchanged; the
+    //!                 value is forwarded to the audio runner's MRope session
+    //!                 init so the cos/sin cache spans all N lanes.
+    bool beginAsrSession(
+        SpecDecodeInferenceContext& context, cudaStream_t stream = 0, int32_t activeBatchSize = 1);
 
     /*!
      * @brief End an in-flight streaming-ASR session and release its state.
@@ -339,6 +373,92 @@ public:
      */
     bool appendPrefillEmbeds(SpecDecodeInferenceContext& context, Tensor const& audioEmbedsDelta,
         int32_t audioIndexBase, std::vector<int32_t> const& tokenSliceDelta, cudaStream_t stream);
+
+    /*!
+     * @brief Per-lane streaming-ASR bookkeeping for the batched append-prefill
+     *        path. Modeled after PerBatchTalkerState
+     *        (qwen3OmniTTSRuntime.h:398-409): one instance per concurrent ASR
+     *        session occupying a batch slot/lane. Owned by the product-level
+     *        micro-batch scheduler (qwen3-edgellm-jetson worker), NOT by this
+     *        runtime; appendPrefillEmbedsBatched only writes appendStatus /
+     *        currentKvLen back into it as a convenience. The remaining fields
+     *        (emitted cursors, stream channel) are carried for the scheduler's
+     *        per-session decode/emit loop and are not consumed by the prefill
+     *        call itself.
+     *
+     * NOTE: In the single-context + activeBatchSize=N model, every lane shares
+     * ONE SpecDecodeInferenceContext (per-lane data lives in that context's
+     * [N] structures: tokenIds[b], effectivePrefillLengths[b]). The `laneIndex`
+     * field identifies which row b of the shared context this session occupies;
+     * `context` points at the (shared) context the lane belongs to.
+     */
+    struct PerBatchAsrState
+    {
+        int32_t sessionId{-1};                  //!< Caller-assigned stream/session identifier.
+        SpecDecodeInferenceContext* context{};  //!< Shared context this lane belongs to (activeBatchSize=N).
+        int32_t laneIndex{0};                   //!< Row b of the shared [N] context structures.
+        int32_t audioIndexBase{0};              //!< Cumulative audio tokens consumed by prior chunks.
+        int32_t chunkLen{0};                    //!< Token slice length staged for the most recent chunk.
+        int32_t currentKvLen{0};                //!< KV length snapshot read at entry of the most recent append.
+        bool finished{false};                   //!< True once this session's decode reached EOS / final.
+        AppendPrefillStatus appendStatus{AppendPrefillStatus::kOk}; //!< Per-lane status of the last append.
+        int32_t emittedTokenCursor{0};          //!< Count of decoded tokens already emitted to the caller.
+        int32_t emittedTextCursor{0};           //!< Byte/char offset of partial text already emitted.
+        std::shared_ptr<StreamChannel> streamChannel; //!< Per-slot streaming sink (StreamChannel is per-slot).
+    };
+
+    /*!
+     * @brief Batched variant of appendPrefillEmbeds: append one chunk of
+     *        audio-bearing prefill embeddings for N concurrent ASR lanes in a
+     *        single executePrefillStep call (Phase D-1a, spec §3).
+     *
+     * SINGLE-CONTEXT MODEL. One SpecDecodeInferenceContext carries
+     * activeBatchSize == N lanes; per-lane data lives in that context's [N]
+     * structures (context.tokenIds[b], context.effectivePrefillLengths[b]).
+     * This is the SAME model the official batched normal-prefill path uses
+     * (runBaseModelPrefill, llmInferenceSpecDecodeRuntime.cpp:1183-1224):
+     * a single `context.activeBatchSize` drives [N,...] reshapes of the runtime
+     * member tensors, and per-lane lengths/ids are read from the context's [N]
+     * vectors. We do NOT take N independent contexts — that would mean N copies
+     * of activation state and cannot be executed by a single executePrefillStep.
+     *
+     * Packing contract (mirrors runBaseModelPrefill:1187-1223):
+     *  - N = context.activeBatchSize; maxChunkLen = max over lanes of chunk
+     *    length (== max_element(context.effectivePrefillLengths), the same
+     *    `inputIdsLength` the normal path computes at :1187-1188).
+     *  - Token ids staged as [N, maxChunkLen] in pinned host memory, padded
+     *    with 0; padding is excluded from the engine's last-token selection by
+     *    per-lane context lengths (:1211-1216).
+     *  - Embeddings staged as [N, maxChunkLen, H]; logits bound as [N, vocab].
+     *  - contextLengths[b] = chunkLen[b] (the per-chunk effective prefill
+     *    length, matching the single-lane contract — engine adds the live KV
+     *    start index internally, llmEngineRunner.cpp:1247-1264).
+     *  - The N per-lane audioEmbedsDeltas are concatenated row-wise into one
+     *    flat audio-embeds buffer because the multimodal kernel indexes a
+     *    single audioEmbeds tensor globally (embeddingKernels.cu:414). Lane b's
+     *    multimodal indices are biased by (concatRowBase[b] + audioIndexBases[b]).
+     *
+     * The old single-lane appendPrefillEmbeds is retained as an N=1 wrapper
+     * (sets context.activeBatchSize=1, builds 1-element vectors, delegates here).
+     *
+     * @param context           Single shared context with activeBatchSize == N.
+     *                           Lane b's accumulated token list is context.tokenIds[b];
+     *                           the same context object must be reused across a
+     *                           session's chunks (tokenIds[b] extended in place).
+     * @param audioEmbedsDeltas N device-FP16 audio-embedding tensors, one per
+     *                          lane, [audioRows_b, H]. Concatenated internally.
+     *                          size() must equal context.activeBatchSize.
+     * @param audioIndexBases   N cumulative audio-token counts (one per lane).
+     * @param tokenSliceDeltas  N token-id slices for this chunk (one per lane).
+     *                          Appended to context.tokenIds[b].
+     * @param stream            CUDA stream (must match the context's stream).
+     * @return True if every lane's append succeeded; false on any per-lane
+     *         capacity refusal or engine prefill failure (mLastAppendStatus and
+     *         mLastObservedKvLength reflect the FIRST failing lane).
+     */
+    bool appendPrefillEmbedsBatched(SpecDecodeInferenceContext& context,
+        std::vector<Tensor const*> const& audioEmbedsDeltas, std::vector<int32_t> const& audioIndexBases,
+        std::vector<std::vector<int32_t>> const& tokenSliceDeltas, cudaStream_t stream);
 
     //! Get LLM prefill stage metrics
     metrics::LLMPrefillMetrics const& getPrefillMetrics() const noexcept
@@ -467,10 +587,14 @@ public:
     }
 
 private:
-    //! @brief Common initialization logic shared between both constructors
+    //! @brief Common initialization logic shared between all constructors
+    //! @param sharedBaseEngine Optional pre-deserialized base engine (ASR slot-pool, D1). When non-null, the
+    //! base LLMEngineRunner is built via the shared-engine overload instead of deserializing a new engine.
+    //! Only supported in vanilla mode (draftingConfig must be nullopt when sharedBaseEngine is provided).
     void initializeCommon(std::string const& engineDir, std::string const& multimodalEngineDir,
         std::unordered_map<std::string, std::string> const& loraWeightsMap,
-        std::optional<EagleDraftingConfig> const& draftingConfig, cudaStream_t stream);
+        std::optional<EagleDraftingConfig> const& draftingConfig, cudaStream_t stream,
+        std::shared_ptr<nvinfer1::ICudaEngine> sharedBaseEngine = nullptr);
 
     rt::Tensor mSharedExecContextMemory{};              //!< Shared device memory for all execution contexts
     int32_t mMaxRuntimeBatchSize{1};                    //!< Maximum runtime batch size

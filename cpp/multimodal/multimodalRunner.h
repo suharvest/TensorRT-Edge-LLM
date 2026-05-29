@@ -132,10 +132,13 @@ public:
      * @param maxAudioTokens          Upper bound on cumulative audio tokens for this session.
      * @param ropeRotaryCosSinDevice  RoPE cache tensor.
      * @param stream                  CUDA stream.
+     * @param activeBatchSize         Number of concurrent lanes sharing the
+     *                                session (single-context batched ASR). Default 1.
      * @return True on success, false on failure.
      */
     virtual bool initializeMRopeForSession([[maybe_unused]] int32_t maxAudioTokens,
-        [[maybe_unused]] rt::Tensor& ropeRotaryCosSinDevice, [[maybe_unused]] cudaStream_t stream)
+        [[maybe_unused]] rt::Tensor& ropeRotaryCosSinDevice, [[maybe_unused]] cudaStream_t stream,
+        [[maybe_unused]] int32_t activeBatchSize = 1)
     {
         return true;
     }

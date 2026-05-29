@@ -143,7 +143,7 @@ LLMEngineRunner::LLMEngineRunner(std::filesystem::path const& enginePath, std::f
         LOG_ERROR("Failed to use MMap to read engine from file path: %s", enginePath.string().c_str());
         throw std::runtime_error("Failed to use MMap to read engine from file path: " + enginePath.string());
     }
-    mEngine = std::unique_ptr<nvinfer1::ICudaEngine>(
+    mEngine = std::shared_ptr<nvinfer1::ICudaEngine>(
         mRuntime->deserializeCudaEngine(mmapReader->getData(), mmapReader->getSize()));
 
     // Apply weight streaming budget (no-op unless EDGELLM_WEIGHT_STREAMING_BUDGET is set
@@ -405,6 +405,310 @@ LLMEngineRunner::LLMEngineRunner(std::filesystem::path const& enginePath, std::f
 
     // Synchronize the stream to ensure all the operations have completed.
     CUDA_CHECK(cudaStreamSynchronize(stream));
+}
+
+//! Shared-engine constructor (ASR slot-pool, D1).
+//!
+//! Mirrors the path-based constructor above, with three deliberate differences:
+//!   1. It does NOT create an IRuntime (mRuntime stays null) and does NOT deserialize an engine;
+//!      it adopts the supplied shared ICudaEngine instead.
+//!   2. It does NOT re-apply applyWeightStreamingBudget — the deserializing owner already applied
+//!      the (optional) weight-streaming budget once, before any execution context existed. Re-applying
+//!      it here, after other runners already hold execution contexts on the same engine, is unsafe.
+//!   3. Everything from createExecutionContext(kUSER_MANAGED) onward is identical to the path-based
+//!      constructor, so each shared-engine runner builds its own independent execution context, KV/cache
+//!      manager, rope cache, and runtime tensors. Context memory remains user-managed and must be supplied
+//!      per-runner via setContextMemory() before execution (see LLMInferenceSpecDecodeRuntime).
+LLMEngineRunner::LLMEngineRunner(std::shared_ptr<nvinfer1::ICudaEngine> engine,
+    std::filesystem::path const& configPath, std::unordered_map<std::string, std::string> const& loraWeightsMap,
+    cudaStream_t stream)
+{
+    if (engine == nullptr)
+    {
+        LOG_ERROR("Shared-engine LLMEngineRunner constructed with a null ICudaEngine");
+        throw std::runtime_error("Shared-engine LLMEngineRunner constructed with a null ICudaEngine");
+    }
+
+    LOG_INFO("Loading config file %s", configPath.string().c_str());
+
+    // Parse configuration from JSON file
+    Json configJson;
+    std::ifstream configFileStream(configPath);
+    if (!configFileStream.is_open())
+    {
+        LOG_ERROR("Failed to open config file: %s", configPath.string().c_str());
+        throw std::runtime_error("Failed to open config file: " + configPath.string());
+    }
+    try
+    {
+        configJson = Json::parse(configFileStream);
+        configFileStream.close();
+    }
+    catch (Json::parse_error const& e)
+    {
+        LOG_ERROR("Failed to parse config file with error: %s", e.what());
+        throw std::runtime_error("Failed to parse config file: " + configPath.string());
+    }
+
+    if (!this->initializeConfigFromJson(configJson))
+    {
+        LOG_ERROR("Failed to initialize LLMEngineRunner from config file: %s", configPath.string().c_str());
+        throw std::runtime_error("Failed to initialize LLMEngineRunner from config file: " + configPath.string());
+    }
+
+    // Adopt the shared, already-deserialized engine. mRuntime intentionally stays null: the deserializing
+    // owner keeps its IRuntime alive for the engine's lifetime. Weight streaming budget was already applied
+    // by that owner and must NOT be re-applied here.
+    LOG_INFO("Reusing shared TensorRT engine (slot-pool runner)");
+    mEngine = std::move(engine);
+
+    // Use single executionContext for both prefill and generation.
+    // Context memory is user-managed to enable sharing with other engines.
+    // The caller must provide shared context memory via setContextMemory() before execution.
+    mTRTExecutionContext = std::unique_ptr<nvinfer1::IExecutionContext>(
+        mEngine->createExecutionContext(ExecutionContextAllocationStrategy::kUSER_MANAGED));
+
+    if (trt_edgellm::layerProfiler::LayerProfiler::getInstance().isEnabled())
+    {
+        mTRTExecutionContext->setProfiler(&trt_edgellm::layerProfiler::LayerProfiler::getInstance());
+    }
+
+    if (!this->validateConfigFromEngine())
+    {
+        LOG_ERROR("Failed to match config file %s with the shared engine", configPath.string().c_str());
+        throw std::runtime_error(
+            "Failed to match config file " + configPath.string() + " with the shared engine");
+    }
+
+    RopeConfig const& ropeConfig = mConfig.ropeConfig;
+    switch (ropeConfig.type)
+    {
+    case RopeType::kLongRope:
+    {
+        LOG_DEBUG("Initialize long Rope CosSinCache.");
+        check::check(ropeConfig.longRope.has_value() && ropeConfig.longRope.value().originalMaxPositionEmbeddings != -1,
+            "longRope is not set correctly");
+
+        rt::Tensor shortCosSinCache = rt::Tensor({1, mConfig.maxKVCacheCapacity, mConfig.rotaryDim},
+            rt::DeviceType::kGPU, DataType::kFLOAT, "LLMEngineRunner::shortCosSinCache");
+        rt::Tensor longCosSinCache = rt::Tensor({1, mConfig.maxKVCacheCapacity, mConfig.rotaryDim},
+            rt::DeviceType::kGPU, DataType::kFLOAT, "LLMEngineRunner::longCosSinCache");
+        bool const initRopeStatus
+            = initializeLongRopeCosSinCache(shortCosSinCache, longCosSinCache, ropeConfig, stream);
+        if (!initRopeStatus)
+        {
+            LOG_ERROR("Failed to initialize long Rope CosSinCache.");
+            throw std::runtime_error("Failed to initialize long Rope CosSinCache.");
+        }
+        if (mConfig.maxKVCacheCapacity <= ropeConfig.longRope.value().originalMaxPositionEmbeddings)
+        {
+            mPosEncCosSinCache = std::move(shortCosSinCache);
+        }
+        else
+        {
+            mPosEncCosSinCache = std::move(longCosSinCache);
+        }
+        break;
+    }
+    case RopeType::kMRope:
+    {
+        this->mPosEncCosSinCache
+            = rt::Tensor({mConfig.maxSupportedBatchSize, mConfig.maxKVCacheCapacity, mConfig.rotaryDim},
+                rt::DeviceType::kGPU, DataType::kFLOAT, "LLMEngineRunner::mPosEncCosSinCache");
+
+        // Initialize MRoPE cache for all batch slots using text-only sequential positions.
+        kernel::initializeTextOnlyMRopeCosSin(mPosEncCosSinCache.dataPointer<float>(), ropeConfig.rotaryTheta,
+            mConfig.rotaryDim, mConfig.maxKVCacheCapacity, mConfig.maxSupportedBatchSize, stream);
+        break;
+    }
+    case RopeType::kNoRope:
+    {
+        LOG_DEBUG("No RoPE: initializing identity CosSinCache (cos=1, sin=0).");
+        this->mPosEncCosSinCache = rt::Tensor({1, mConfig.maxKVCacheCapacity, mConfig.rotaryDim}, rt::DeviceType::kGPU,
+            DataType::kFLOAT, "LLMEngineRunner::mPosEncCosSinCache");
+        bool const initStatus = initializeNopeCosSinCache(mPosEncCosSinCache, stream);
+        if (!initStatus)
+        {
+            LOG_ERROR("Failed to initialize identity CosSinCache.");
+            throw std::runtime_error("Failed to initialize identity CosSinCache.");
+        }
+        break;
+    }
+    default:
+    {
+        LOG_DEBUG("Initialize persistent Rope CosSinCache.");
+        this->mPosEncCosSinCache = rt::Tensor({1, mConfig.maxKVCacheCapacity, mConfig.rotaryDim}, rt::DeviceType::kGPU,
+            DataType::kFLOAT, "LLMEngineRunner::mPosEncCosSinCache");
+        bool const initRopeStatus = initializeRopeCosSinCache(mPosEncCosSinCache, ropeConfig, stream);
+        if (!initRopeStatus)
+        {
+            LOG_ERROR("Failed to initialize persistent Rope CosSinCache.");
+            throw std::runtime_error("Failed to initialize persistent Rope CosSinCache.");
+        }
+        break;
+    }
+    }
+    // Bind RopeCosSin cache
+    bool setRopeCosSinCacheStatus{true};
+    setRopeCosSinCacheStatus
+        &= mTRTExecutionContext->setTensorAddress(binding_names::kRopeCosSin, mPosEncCosSinCache.rawPointer());
+    if (!setRopeCosSinCacheStatus)
+    {
+        LOG_ERROR("Failed to set rope cos sin cache to the engine");
+        throw std::runtime_error("Failed to set rope cos sin cache to the engine");
+    }
+
+    if (!validateKVCacheType())
+    {
+        LOG_ERROR("Failed to validate KV cache type");
+        throw std::runtime_error("Failed to validate KV cache type");
+    }
+
+    // Detect KV cache storage dtype from engine bindings.
+    nvinfer1::DataType kvCacheType = getKVCacheType();
+
+    DataType const recurrentStateType = (mConfig.numLinearAttnLayers > 0) ? getRecurrentStateType() : DataType::kHALF;
+    DataType const convStateType = (mConfig.numLinearAttnLayers > 0) ? getConvStateType() : DataType::kHALF;
+
+    // MTP intermediate state seq_len: only allocated when the engine is an MTP base
+    // MTP kernels require maxVerifyTreeSize <= 8 (kMTPMaxSeqLen).
+    int32_t const maxIntermediateSeqLen
+        = (mConfig.mtpBase && mConfig.numLinearAttnLayers > 0) ? mConfig.maxVerifyTreeSize : 0;
+    if (maxIntermediateSeqLen > 8)
+    {
+        LOG_ERROR("MTP base model requires maxVerifyTreeSize <= 8, got %d", maxIntermediateSeqLen);
+        throw std::runtime_error("MTP maxVerifyTreeSize exceeds kernel limit (8)");
+    }
+
+    // Build HybridCacheManager config from parsed per-layer configuration
+    int32_t const numAttnLayers = static_cast<int32_t>(mConfig.kvLayerConfigs.size());
+    rt::KVCacheManager::Config kvCacheConfig{
+        numAttnLayers, mConfig.maxSupportedBatchSize, mConfig.maxKVCacheCapacity, mConfig.kvLayerConfigs, kvCacheType};
+    rt::MambaCacheManager::Config mambaConfig{mConfig.numLinearAttnLayers, mConfig.maxSupportedBatchSize,
+        mConfig.recurrentStateNumHeads, mConfig.recurrentStateHeadDim, mConfig.recurrentStateSize, mConfig.convDim,
+        mConfig.convKernel, maxIntermediateSeqLen, recurrentStateType, convStateType};
+    rt::HybridCacheManager::Config cacheManagerConfig{
+        mConfig.layerTypes, kvCacheConfig, mambaConfig, mConfig.maxSupportedBatchSize};
+    this->mCacheManager = rt::HybridCacheManager(cacheManagerConfig, stream);
+
+    // Instantiate other GPU memory input that needed by the Engine execution.
+    this->mSequenceContextLengths = rt::Tensor({mConfig.maxSupportedBatchSize}, rt::DeviceType::kGPU, DataType::kINT32,
+        "LLMEngineRunner::mSequenceContextLengths");
+    CUDA_CHECK(
+        cudaMemsetAsync(mSequenceContextLengths.rawPointer(), 0, mSequenceContextLengths.getMemoryCapacity(), stream));
+
+    if (mConfig.enableEagleSpecDecode)
+    {
+        // For EAGLE: last_token_ids is 2D [batch_size, num_selected_tokens] to support multi-batch
+        this->mSelectTokenIndices = rt::Tensor({mConfig.maxSupportedBatchSize, mConfig.maxVerifyTreeSize},
+            rt::DeviceType::kGPU, DataType::kINT64, "LLMEngineRunner::mSelectTokenIndices");
+        CUDA_CHECK(
+            cudaMemsetAsync(mSelectTokenIndices.rawPointer(), 0, mSelectTokenIndices.getMemoryCapacity(), stream));
+        this->mHostSelectTokenIndices = rt::Tensor({mConfig.maxSupportedBatchSize, mConfig.maxVerifyTreeSize},
+            rt::DeviceType::kCPU, DataType::kINT64, "LLMEngineRunner::mHostSelectTokenIndices");
+        // Allocate position IDs to support both prefill and tree decoding
+        int32_t const maxSeqLen = std::max(mConfig.maxSupportedInputLength, mConfig.maxVerifyTreeSize);
+        this->mEagleBasePositionIds = rt::Tensor({mConfig.maxSupportedBatchSize, maxSeqLen}, rt::DeviceType::kGPU,
+            DataType::kINT32, "LLMEngineRunner::mEagleBasePositionIds");
+        CUDA_CHECK(
+            cudaMemsetAsync(mEagleBasePositionIds.rawPointer(), 0, mEagleBasePositionIds.getMemoryCapacity(), stream));
+        int32_t const packedMaskSize = divUp(mConfig.maxVerifyTreeSize, 32);
+        this->mEagleBasePackedMask
+            = rt::Tensor({mConfig.maxSupportedBatchSize, mConfig.maxVerifyTreeSize, packedMaskSize},
+                rt::DeviceType::kGPU, DataType::kINT32, "LLMEngineRunner::mEagleBasePackedMask");
+        CUDA_CHECK(
+            cudaMemsetAsync(mEagleBasePackedMask.rawPointer(), 0, mEagleBasePackedMask.getMemoryCapacity(), stream));
+    }
+    else
+    {
+        this->mSelectTokenIndices = rt::Tensor({mConfig.maxSupportedBatchSize, 1}, rt::DeviceType::kGPU,
+            DataType::kINT64, "LLMEngineRunner::mSelectTokenIndices");
+        CUDA_CHECK(
+            cudaMemsetAsync(mSelectTokenIndices.rawPointer(), 0, mSelectTokenIndices.getMemoryCapacity(), stream));
+        this->mHostSelectTokenIndices = rt::Tensor({mConfig.maxSupportedBatchSize, 1}, rt::DeviceType::kCPU,
+            DataType::kINT64, "LLMEngineRunner::mHostSelectTokenIndices");
+    }
+
+    // Add the LoRA weights to the engine.
+    if (isLoraWeightsSupported())
+    {
+        for (auto const& [loraWeightsName, loraWeightsPath] : loraWeightsMap)
+        {
+            if (loraWeightsPath.empty())
+            {
+                continue;
+            }
+            if (!this->addLoraWeights(loraWeightsName, loraWeightsPath, stream))
+            {
+                LOG_ERROR("Failed to add LoRA weights: %s", loraWeightsName.c_str());
+                throw std::runtime_error("Failed to add LoRA weights: " + loraWeightsName);
+            }
+        }
+    }
+
+    // Initialize the dummy tensor as TensorRT does not support nullptr for binding
+    std::vector<int64_t> dummyInputSizes = {
+        static_cast<int64_t>(
+            mConfig.maxSupportedBatchSize), // attention mask/attention position IDs/KV cache start index
+        static_cast<int64_t>(getMaxLoraWeightsDimension() * kEMPTY_LORA_RANK), // LoRA weights
+    };
+
+    // Add deepstack_embeds size for generation profile
+    if (mConfig.numDeepstackFeatures > 0)
+    {
+        int64_t const deepstackSeqLen = mConfig.enableEagleSpecDecode ? mConfig.maxVerifyTreeSize : 1;
+        int64_t const deepstackSize
+            = static_cast<int64_t>(mConfig.maxSupportedBatchSize) * deepstackSeqLen * mConfig.hiddenSize;
+        dummyInputSizes.push_back(deepstackSize);
+    }
+
+    int64_t maxDummyElements = *std::max_element(dummyInputSizes.begin(), dummyInputSizes.end());
+    mDummyInputTensor = rt::Tensor(
+        {maxDummyElements}, rt::DeviceType::kGPU, nvinfer1::DataType::kHALF, "LLMEngineRunner::mDummyInputTensor");
+    // Initialize dummy tensor memory to zero
+    CUDA_CHECK(cudaMemsetAsync(mDummyInputTensor.rawPointer(), 0, mDummyInputTensor.getMemoryCapacity(), stream));
+
+    // Allocate dummy output tensor for hidden_states when the engine has that output binding.
+    {
+        bool const engineHasHiddenStates = engineHasOutputTensor(mEngine.get(), binding_names::kOutputHiddenStates);
+        if (mConfig.enableEagleSpecDecode || engineHasHiddenStates)
+        {
+            int64_t outputHiddenDim = mConfig.enableEagleSpecDecode ? mConfig.outputHiddenDim : mConfig.hiddenSize;
+            int64_t dummyOutputSize = static_cast<int64_t>(mConfig.maxSupportedBatchSize) * outputHiddenDim;
+            mDummyOutputTensor = rt::Tensor({dummyOutputSize}, rt::DeviceType::kGPU, nvinfer1::DataType::kHALF,
+                "LLMEngineRunner::mDummyOutputTensor");
+            LOG_INFO("Allocated dummy hidden_states output buffer: %lld elements (engineHasHiddenStates=%d)",
+                dummyOutputSize, engineHasHiddenStates);
+        }
+    }
+
+    // Initialize kKVCacheStartIndex to dummy tensor for both profiles to avoid "address not set" error
+    {
+        bool setKVCacheStartIndexStatus{true};
+        setKVCacheStartIndexStatus &= mTRTExecutionContext->setTensorAddress(
+            binding_names::kKVCacheStartIndex, mDummyInputTensor.rawPointer());
+        setKVCacheStartIndexStatus &= mTRTExecutionContext->setInputShape(
+            binding_names::kKVCacheStartIndex, rt::Coords{mConfig.maxSupportedBatchSize}.getTRTDims());
+        if (!setKVCacheStartIndexStatus)
+        {
+            LOG_ERROR("Failed to set kKVCacheStartIndex dummy tensor for initialization");
+            throw std::runtime_error("Failed to set kKVCacheStartIndex dummy tensor for initialization");
+        }
+    }
+    // Reset the LoRA weights to zero tensors.
+    if (!this->resetLoraWeights())
+    {
+        LOG_ERROR("Failed to initialize LoRA weights to zero tensors");
+        throw std::runtime_error("Failed to initialize LoRA weights to zero tensors");
+    }
+
+    // Synchronize the stream to ensure all the operations have completed.
+    CUDA_CHECK(cudaStreamSynchronize(stream));
+}
+
+std::shared_ptr<nvinfer1::ICudaEngine> LLMEngineRunner::getEngine() const noexcept
+{
+    return mEngine;
 }
 
 int64_t LLMEngineRunner::getRequiredContextMemorySize() const

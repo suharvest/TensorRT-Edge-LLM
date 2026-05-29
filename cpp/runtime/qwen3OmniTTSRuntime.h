@@ -102,8 +102,51 @@ public:
     Qwen3OmniTTSRuntime(std::string const& talkerEngineDir, std::string const& codePredictorEngineDir,
         std::string const& tokenizerDir, cudaStream_t stream);
 
+    /*!
+     * @brief Construct a TTS runtime that SHARES the Talker + CodePredictor ICudaEngines (TTS slot-pool, D2).
+     *
+     * Mirrors the ASR slot-pool shared-engine constructor (LLMInferenceSpecDecodeRuntime). Builds N TTS
+     * slots that share one deserialized Talker engine and one deserialized CodePredictor engine (saving
+     * weight memory) while each slot owns independent IExecutionContexts, KV/cache state, and workspace
+     * tensors (mTalkerInputEmbeds etc., which are instance members → naturally isolated per slot).
+     *
+     * The supplied engines must come from another live runtime (via getTalkerEngine() / getCodePredictorEngine()),
+     * whose deserializing owner (the runtime built with the path-based constructor) MUST outlive every runtime
+     * built this way, because that owner holds the TensorRT IRuntime backing the engines.
+     *
+     * All non-engine initialization (config, weights, embedding tables, workspace, tokenizer) is performed
+     * exactly like the path-based constructor — only the Talker + CodePredictor engine weights are shared.
+     *
+     * @param sharedTalkerEngine        Shared, already-deserialized Talker engine (must be non-null)
+     * @param sharedCodePredictorEngine Shared, already-deserialized CodePredictor engine (must be non-null)
+     * @param talkerEngineDir Directory containing talker engine, MLP weights, embedding table, etc.
+     * @param codePredictorEngineDir Directory containing code_predictor engine and codec embeddings
+     * @param tokenizerDir Directory containing tokenizer files. If empty, defaults to talkerEngineDir/../
+     * @param stream CUDA stream for operations
+     * @throws std::runtime_error if either engine is null or any initialization step fails
+     */
+    Qwen3OmniTTSRuntime(std::shared_ptr<nvinfer1::ICudaEngine> sharedTalkerEngine,
+        std::shared_ptr<nvinfer1::ICudaEngine> sharedCodePredictorEngine, std::string const& talkerEngineDir,
+        std::string const& codePredictorEngineDir, std::string const& tokenizerDir, cudaStream_t stream);
+
     //! @brief Destructor
     ~Qwen3OmniTTSRuntime();
+
+    //! @brief Get the shared Talker TensorRT engine backing this runtime (TTS slot-pool, D2).
+    //! @return Shared pointer to the Talker ICudaEngine, for constructing additional slot runtimes that share it.
+    //! @note Valid only while this runtime (the deserializing owner) is alive.
+    std::shared_ptr<nvinfer1::ICudaEngine> getTalkerEngine() const noexcept
+    {
+        return mTalkerLLMRunner ? mTalkerLLMRunner->getEngine() : nullptr;
+    }
+
+    //! @brief Get the shared CodePredictor TensorRT engine backing this runtime (TTS slot-pool, D2).
+    //! @return Shared pointer to the CodePredictor ICudaEngine, for constructing additional slot runtimes.
+    //! @note Valid only while this runtime (the deserializing owner) is alive.
+    std::shared_ptr<nvinfer1::ICudaEngine> getCodePredictorEngine() const noexcept
+    {
+        return mCodePredictorRunner ? mCodePredictorRunner->getEngine() : nullptr;
+    }
 
     // ========== Core API ==========
 
@@ -361,6 +404,15 @@ public:
 private:
     // ========== Internal Methods ==========
 
+    //! @brief Shared constructor body for the path-based and shared-engine (TTS slot-pool, D2) constructors.
+    //!        When @p sharedTalkerEngine / @p sharedCodePredictorEngine are non-null, the engine runners are
+    //!        built from the shared engines instead of deserializing from disk. All other initialization is
+    //!        identical regardless of the engine source.
+    void initializeCommon(std::string const& talkerEngineDir, std::string const& codePredictorEngineDir,
+        std::string const& tokenizerDir, cudaStream_t stream,
+        std::shared_ptr<nvinfer1::ICudaEngine> sharedTalkerEngine = nullptr,
+        std::shared_ptr<nvinfer1::ICudaEngine> sharedCodePredictorEngine = nullptr);
+
     void initializeTTSEmbeddings(cudaStream_t stream);
 
     //! @param perBatchContextLengths Optional per-batch context lengths for padded batched prefill.
@@ -540,11 +592,21 @@ private:
 
     /*!
      * @brief Initialize Talker and CodePredictor engine runners
+     *
+     * When @p sharedTalkerEngine / @p sharedCodePredictorEngine are non-null (TTS slot-pool, D2), the
+     * corresponding LLMEngineRunner is built from the shared, already-deserialized engine (skipping
+     * deserialization) instead of loading llm.engine from disk. Config paths are still read from the
+     * given directories. When both are null this behaves exactly as the original path-based init.
+     *
      * @param talkerEngineDir Directory containing talker engine files
      * @param codePredictorEngineDir Directory containing code predictor engine files
+     * @param sharedTalkerEngine Optional shared Talker engine (null = deserialize from disk)
+     * @param sharedCodePredictorEngine Optional shared CodePredictor engine (null = deserialize from disk)
      * @return True on success, false on failure
      */
-    bool initializeEngineRunners(std::string const& talkerEngineDir, std::string const& codePredictorEngineDir);
+    bool initializeEngineRunners(std::string const& talkerEngineDir, std::string const& codePredictorEngineDir,
+        std::shared_ptr<nvinfer1::ICudaEngine> sharedTalkerEngine = nullptr,
+        std::shared_ptr<nvinfer1::ICudaEngine> sharedCodePredictorEngine = nullptr);
 
     /*!
      * @brief Load CodePredictor lm_head weights and small_to_mtp_projection

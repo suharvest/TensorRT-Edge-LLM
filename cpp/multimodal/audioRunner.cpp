@@ -567,14 +567,17 @@ bool Qwen3OmniAudioRunner::preprocessSystemPrompt(std::string const& systemPromp
     return initializeSequentialMRopeCache(1, ropeRotaryCosSinDevice, stream);
 }
 
-// Session-scoped MRope init for streaming ASR. Streaming batch is always 1
-// (single sequence per session); the underlying cache layout matches the
-// one-shot path. `maxAudioTokens` bounds the worst-case session length and is
-// validated against `ropeRotaryCosSinDevice`'s maxPositionEmbeddings so a
-// session that would outgrow the cache fails fast at begin-time instead of
-// silently corrupting MRope mid-session.
+// Session-scoped MRope init for streaming ASR. `maxAudioTokens` bounds the
+// worst-case session length and is validated against `ropeRotaryCosSinDevice`'s
+// maxPositionEmbeddings so a session that would outgrow the cache fails fast at
+// begin-time instead of silently corrupting MRope mid-session. `activeBatchSize`
+// is the number of concurrent lanes sharing this session (single-context
+// batched ASR); it defaults to 1, preserving the original single-session
+// behavior, and is forwarded verbatim to initializeSequentialMRopeCache, which
+// already builds the [activeBatchSize, 3, maxPositionEmbeddings] position-id
+// layout and launches the kernel with that batch count.
 bool Qwen3OmniAudioRunner::initializeMRopeForSession(
-    int32_t maxAudioTokens, rt::Tensor& ropeRotaryCosSinDevice, cudaStream_t stream)
+    int32_t maxAudioTokens, rt::Tensor& ropeRotaryCosSinDevice, cudaStream_t stream, int32_t activeBatchSize)
 {
     if (mConfig.mropeTheta <= 0.0F)
     {
@@ -600,11 +603,13 @@ bool Qwen3OmniAudioRunner::initializeMRopeForSession(
         return false;
     }
 
-    // Streaming sessions are always batch=1. Layout (positions, dimensions) is
-    // identical to the one-shot path used by preprocess(), so a session-init
-    // call here is interchangeable with the per-call init that the one-shot
-    // path performs.
-    return initializeSequentialMRopeCache(/*activeBatchSize*/ 1, ropeRotaryCosSinDevice, stream);
+    // Layout (positions, dimensions) is identical to the one-shot path used by
+    // preprocess(), so a session-init call here is interchangeable with the
+    // per-call init that the one-shot path performs. For batched ASR, N lanes
+    // share one context: pass activeBatchSize through so the cache spans all
+    // lanes (initializeSequentialMRopeCache loops b<activeBatchSize and the
+    // kernel consumes activeBatchSize, audioRunner.cpp:628-656).
+    return initializeSequentialMRopeCache(activeBatchSize, ropeRotaryCosSinDevice, stream);
 }
 
 bool Qwen3OmniAudioRunner::initializeSequentialMRopeCache(

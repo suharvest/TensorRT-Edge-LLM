@@ -129,9 +129,12 @@ public:
     //! \param[in,out]  ropeRotaryCosSinDevice  RoPE cache tensor (e.g.
     //!                                         `LLMEngineRunner::getRopeCosSinCacheTensor()`).
     //! \param[in]      stream                  CUDA stream.
+    //! \param[in]      activeBatchSize         Number of concurrent lanes sharing the session
+    //!                                         (single-context batched ASR). Default 1 keeps the
+    //!                                         existing single-session callers unchanged.
     //! \return True on success, false otherwise.
-    bool initializeMRopeForSession(
-        int32_t maxAudioTokens, rt::Tensor& ropeRotaryCosSinDevice, cudaStream_t stream) override;
+    bool initializeMRopeForSession(int32_t maxAudioTokens, rt::Tensor& ropeRotaryCosSinDevice, cudaStream_t stream,
+        int32_t activeBatchSize = 1) override;
 
 private:
     //! \brief Preprocess audio buffers and run encoder inference
