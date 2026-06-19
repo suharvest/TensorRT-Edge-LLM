@@ -275,6 +275,70 @@ void invokeAddBias(rt::Tensor& data, rt::Tensor const& bias, cudaStream_t stream
     CUDA_CHECK(cudaPeekAtLastError());
 }
 
+//! \brief Tiled FP16 GEMM (FP32 accumulate) with fused bias + optional SiLU epilogue.
+//!
+//! Computes C[M,N] = A[M,K] @ B[N,K]^T (+ bias[N]) (+ SiLU), all row-major FP16.
+//! Self-contained fallback used when CuTe-DSL GEMM is unavailable — notably Jetson Orin
+//! (sm_87), where the prebuilt CuTe-DSL "Ampere" GEMM cubin is not sm_87-runnable
+//! (kernel launch -> "invalid device function"). Handles arbitrary M/N/K (no alignment
+//! or multiple-of-8 constraints); accuracy-oriented (FP32 accumulation), not micro-tuned.
+template <int32_t TILE>
+__global__ void gemmNTBiasActKernel(half const* __restrict__ A, half const* __restrict__ B,
+    half const* __restrict__ bias, half* __restrict__ C, int32_t M, int32_t N, int32_t K, bool applySiLU)
+{
+    __shared__ half As[TILE][TILE];
+    __shared__ half Bs[TILE][TILE];
+
+    int32_t const row = blockIdx.y * TILE + threadIdx.y; // m in [0, M)
+    int32_t const col = blockIdx.x * TILE + threadIdx.x; // n in [0, N)
+
+    float acc = 0.0f;
+    int32_t const numTiles = (K + TILE - 1) / TILE;
+    for (int32_t t = 0; t < numTiles; ++t)
+    {
+        int32_t const kA = t * TILE + threadIdx.x;
+        As[threadIdx.y][threadIdx.x]
+            = (row < M && kA < K) ? A[static_cast<int64_t>(row) * K + kA] : __float2half(0.0f);
+
+        int32_t const kB = t * TILE + threadIdx.y; // B[col, kB] (B is [N, K] row-major)
+        Bs[threadIdx.y][threadIdx.x]
+            = (col < N && kB < K) ? B[static_cast<int64_t>(col) * K + kB] : __float2half(0.0f);
+
+        __syncthreads();
+#pragma unroll
+        for (int32_t i = 0; i < TILE; ++i)
+        {
+            acc += __half2float(As[threadIdx.y][i]) * __half2float(Bs[i][threadIdx.x]);
+        }
+        __syncthreads();
+    }
+
+    if (row < M && col < N)
+    {
+        if (bias != nullptr)
+        {
+            acc += __half2float(bias[col]);
+        }
+        if (applySiLU)
+        {
+            acc = acc / (1.0f + __expf(-acc));
+        }
+        C[static_cast<int64_t>(row) * N + col] = __float2half(acc);
+    }
+}
+
+//! \brief Host wrapper for gemmNTBiasActKernel. C[M,N] = A[M,K] @ B[N,K]^T (+bias) (+SiLU).
+//! \param bias optional [N] bias (nullptr to skip)
+void invokeGemmNTBiasAct(half const* A, half const* B, half const* bias, half* C, int32_t M, int32_t N, int32_t K,
+    bool applySiLU, cudaStream_t stream)
+{
+    constexpr int32_t TILE = 16;
+    dim3 const block(TILE, TILE);
+    dim3 const grid((N + TILE - 1) / TILE, (M + TILE - 1) / TILE);
+    gemmNTBiasActKernel<TILE><<<grid, block, 0, stream>>>(A, B, bias, C, M, N, K, applySiLU);
+    CUDA_CHECK(cudaPeekAtLastError());
+}
+
 } // namespace
 
 void invokeTalkerMLP(rt::Tensor const& input, rt::Tensor const& fc1Weight, rt::Tensor const& fc1Bias,
@@ -338,8 +402,15 @@ void invokeTalkerMLP(rt::Tensor const& input, rt::Tensor const& fc1Weight, rt::T
         return;
     }
 #else
-    LOG_ERROR("CuTe DSL GEMM not compiled. Rebuild with -DENABLE_CUTE_DSL=gemm (or ALL).");
-    return;
+    // CuTe-DSL-free fallback (e.g. Jetson sm_87): tiled FP16 GEMM + fused bias/SiLU epilogue.
+    // FC1: workspace = SiLU(input @ fc1Weight^T + fc1Bias)
+    invokeGemmNTBiasAct(static_cast<half const*>(input.rawPointer()),
+        static_cast<half const*>(fc1Weight.rawPointer()), static_cast<half const*>(fc1Bias.rawPointer()),
+        static_cast<half*>(workspace.rawPointer()), numTokens, hiddenDim, inputDim, /*applySiLU=*/true, stream);
+    // FC2: output = workspace @ fc2Weight^T + fc2Bias
+    invokeGemmNTBiasAct(static_cast<half const*>(workspace.rawPointer()),
+        static_cast<half const*>(fc2Weight.rawPointer()), static_cast<half const*>(fc2Bias.rawPointer()),
+        static_cast<half*>(output.rawPointer()), numTokens, outputDim, hiddenDim, /*applySiLU=*/false, stream);
 #endif
 }
 
@@ -382,8 +453,10 @@ void invokeLinearLayer(
         return;
     }
 #else
-    LOG_ERROR("CuTe DSL GEMM not compiled. Rebuild with -DENABLE_CUTE_DSL=gemm (or ALL).");
-    return;
+    // CuTe-DSL-free fallback: output = input @ weight^T + bias
+    invokeGemmNTBiasAct(static_cast<half const*>(input.rawPointer()), static_cast<half const*>(weight.rawPointer()),
+        static_cast<half const*>(bias.rawPointer()), static_cast<half*>(output.rawPointer()), numTokens, outputDim,
+        inputDim, /*applySiLU=*/false, stream);
 #endif
 }
 
