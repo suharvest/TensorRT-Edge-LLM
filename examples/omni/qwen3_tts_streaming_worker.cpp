@@ -174,6 +174,55 @@ bool parseArgs(Args& args, int argc, char** argv)
 
 // ===== base64 + PCM helpers =====
 
+// BASE PORT: decode base64 → raw bytes (used for the precomputed speaker embedding).
+std::vector<uint8_t> base64Decode(std::string const& in)
+{
+    auto val = [](char c) -> int {
+        if (c >= 'A' && c <= 'Z') return c - 'A';
+        if (c >= 'a' && c <= 'z') return c - 'a' + 26;
+        if (c >= '0' && c <= '9') return c - '0' + 52;
+        if (c == '+') return 62;
+        if (c == '/') return 63;
+        return -1; // '=' padding or whitespace
+    };
+    std::vector<uint8_t> out;
+    out.reserve((in.size() / 4) * 3);
+    int buf = 0, bits = 0;
+    for (char const c : in)
+    {
+        int const d = val(c);
+        if (d < 0) continue;
+        buf = (buf << 6) | d;
+        bits += 6;
+        if (bits >= 8)
+        {
+            bits -= 8;
+            out.push_back(static_cast<uint8_t>((buf >> bits) & 0xFF));
+        }
+    }
+    return out;
+}
+
+// BASE PORT: decode a base64 little-endian float32 array → float vector (speaker embedding).
+std::vector<float> base64ToFloatVec(std::string const& b64)
+{
+    std::vector<uint8_t> const bytes = base64Decode(b64);
+    size_t const n = bytes.size() / sizeof(float);
+    std::vector<float> out(n);
+    for (size_t i = 0; i < n; ++i)
+    {
+        union
+        {
+            uint32_t u;
+            float f;
+        } conv;
+        conv.u = static_cast<uint32_t>(bytes[i * 4]) | (static_cast<uint32_t>(bytes[i * 4 + 1]) << 8)
+            | (static_cast<uint32_t>(bytes[i * 4 + 2]) << 16) | (static_cast<uint32_t>(bytes[i * 4 + 3]) << 24);
+        out[i] = conv.f;
+    }
+    return out;
+}
+
 std::string base64Encode(uint8_t const* data, size_t len)
 {
     static constexpr char kTable[]
@@ -298,6 +347,16 @@ Qwen3OmniTTSRuntime::TalkerGenerationRequest buildRequest(Json const& item)
     // on the v0.8.0 base TalkerGenerationRequest — intentionally dropped. Base uses a fixed speaker.
     req.speakerName = item.value("speaker", "");
     req.speakerId = item.value("speaker_id", -1);
+    // BASE PORT: optional precomputed external speaker embedding (base64 LE float32 array). When present,
+    // the runtime uses it as the row-6 conditioning vector instead of a CustomVoice speaker token.
+    // (Embedding-PASSTHROUGH milestone: precomputed offline; on-device speaker_encoder inference is a follow-up.)
+    {
+        std::string const spkB64 = item.value("speaker_embedding_b64", "");
+        if (!spkB64.empty())
+        {
+            req.speakerEmbedding = base64ToFloatVec(spkB64);
+        }
+    }
 
     Message msg;
     // Qwen3-TTS talker prefill expects the assistant role prefix

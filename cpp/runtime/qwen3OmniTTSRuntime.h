@@ -126,6 +126,10 @@ public:
         // Speaker selection (optional, defaults to config default)
         std::string speakerName{""}; //!< Speaker name (e.g., "f245", "m02") - empty means use default
         int32_t speakerId{-1};       //!< Speaker ID - if >= 0, overrides speakerName
+        //! BASE PORT: optional external speaker embedding [talkerHiddenSize] (from speaker_encoder /
+        //! reference audio). When non-empty, row-6 of the assistant preamble uses this vector directly
+        //! instead of the CustomVoice speakerId embedding-table lookup. Empty = CustomVoice token path.
+        std::vector<float> speakerEmbedding;
 
         // Input: conversation messages for this request (runtime tokenizes internally)
         std::vector<Message> messages;
@@ -581,6 +585,7 @@ private:
     // TTS special token embeddings (initialized from thinker embedding table)
     // Initialized in constructor from Thinker embedding table
     rt::Tensor mTtsPadEmbed; //!< TTS pad embedding [talkerHiddenSize] FP16
+    rt::Tensor mSpeakerEmbeddingBuffer; //!< BASE PORT: external speaker embedding [talkerHiddenSize] FP16 (row-6 conditioning)
     rt::Tensor mTtsBosEmbed; //!< TTS bos embedding [talkerHiddenSize] FP16
     rt::Tensor mTtsEosEmbed; //!< TTS eos embedding [talkerHiddenSize] FP16
 
@@ -649,7 +654,8 @@ private:
      * @return True on success, false on failure
      */
     bool projectToTalkerInput(rt::Tensor const& thinkerEmbed, int32_t speakerId, rt::Tensor& output,
-        int64_t& outputSeqLen, cudaStream_t stream);
+        int64_t& outputSeqLen, cudaStream_t stream,
+        std::vector<float> const& speakerEmbedding = {});
 
     //! Embed token IDs, run MLP projection, and reshape buffers ready for Talker prefill.
     //! Populates mTalkerInputEmbeds and mTalkerHiddenStatesBuffer as side effects.
