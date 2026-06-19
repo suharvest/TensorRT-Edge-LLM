@@ -327,11 +327,82 @@ __global__ void gemmNTBiasActKernel(half const* __restrict__ A, half const* __re
     }
 }
 
+//! \brief Decode-path GEMV: C[1,N] = A[1,K] @ B[N,K]^T (+bias) (+SiLU). One warp per output
+//! column n; 32 lanes stride over K with FP32 accumulation + warp-reduce. half2 loads when K is
+//! even (talker dims are; B base is device-aligned so B+n*K stays 2-aligned). Numerically equivalent
+//! to gemmNTBiasActKernel (same FP32-accumulated A·B + bias + SiLU; only the summation order differs).
+//! Avoids the 16x16 tiled kernel wasting 15/16 row lanes at M==1 (the autoregressive decode hot path).
+__global__ void gemvNTBiasActM1Kernel(half const* __restrict__ A, half const* __restrict__ B,
+    half const* __restrict__ bias, half* __restrict__ C, int32_t N, int32_t K, bool applySiLU)
+{
+    int32_t const warpsPerBlock = blockDim.x / warpSize;
+    int32_t const n = blockIdx.x * warpsPerBlock + (threadIdx.x / warpSize); // output column (warp-uniform)
+    int32_t const lane = threadIdx.x % warpSize;
+    if (n >= N) // warp-uniform: all 32 lanes return together (safe for the shfl below)
+    {
+        return;
+    }
+
+    half const* __restrict__ Brow = B + static_cast<int64_t>(n) * K;
+    float acc = 0.0f;
+    if ((K & 1) == 0)
+    {
+        half2 const* __restrict__ A2 = reinterpret_cast<half2 const*>(A);
+        half2 const* __restrict__ B2 = reinterpret_cast<half2 const*>(Brow);
+        int32_t const K2 = K >> 1;
+        for (int32_t j = lane; j < K2; j += warpSize)
+        {
+            float2 const a = __half22float2(A2[j]);
+            float2 const b = __half22float2(B2[j]);
+            acc += a.x * b.x + a.y * b.y;
+        }
+    }
+    else
+    {
+        for (int32_t k = lane; k < K; k += warpSize)
+        {
+            acc += __half2float(A[k]) * __half2float(Brow[k]);
+        }
+    }
+
+#pragma unroll
+    for (int32_t offset = warpSize / 2; offset > 0; offset >>= 1)
+    {
+        acc += __shfl_down_sync(0xffffffffu, acc, offset);
+    }
+
+    if (lane == 0)
+    {
+        if (bias != nullptr)
+        {
+            acc += __half2float(bias[n]);
+        }
+        if (applySiLU)
+        {
+            acc = acc / (1.0f + __expf(-acc));
+        }
+        C[n] = __float2half(acc);
+    }
+}
+
 //! \brief Host wrapper for gemmNTBiasActKernel. C[M,N] = A[M,K] @ B[N,K]^T (+bias) (+SiLU).
 //! \param bias optional [N] bias (nullptr to skip)
 void invokeGemmNTBiasAct(half const* A, half const* B, half const* bias, half* C, int32_t M, int32_t N, int32_t K,
     bool applySiLU, cudaStream_t stream)
 {
+    if (M == 1)
+    {
+        // Autoregressive decode hot path: dedicated GEMV (warp-per-column) instead of the
+        // 16x16 tiled GEMM which would use only 1/16 of each block's rows.
+        constexpr int32_t kThreads = 256; // 8 warps/block
+        int32_t const warpsPerBlock = kThreads / 32;
+        dim3 const block(kThreads);
+        dim3 const grid((N + warpsPerBlock - 1) / warpsPerBlock);
+        gemvNTBiasActM1Kernel<<<grid, block, 0, stream>>>(A, B, bias, C, N, K, applySiLU);
+        CUDA_CHECK(cudaPeekAtLastError());
+        return;
+    }
+
     constexpr int32_t TILE = 16;
     dim3 const block(TILE, TILE);
     dim3 const grid((N + TILE - 1) / TILE, (M + TILE - 1) / TILE);
