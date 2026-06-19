@@ -1127,8 +1127,32 @@ bool Qwen3OmniTTSRuntime::handleAudioGeneration(
     }
 
     std::vector<rt::Tensor const*> trailingPtrs(activeBatchSize, nullptr);
+
+    // Wire optional streaming hooks from each request (empty/disabled by default = identical behavior).
+    std::vector<PerBatchStreamingHooks> streamingHooks;
+    bool anyStreaming = false;
+    for (auto const& r : requests)
+    {
+        if (r.codecChunkFrames > 0 && r.onAudioChunkReady)
+        {
+            anyStreaming = true;
+            break;
+        }
+    }
+    if (anyStreaming)
+    {
+        streamingHooks.resize(activeBatchSize);
+        for (int32_t b = 0; b < activeBatchSize; ++b)
+        {
+            streamingHooks[b].codecChunkFrames = requests[b].codecChunkFrames;
+            streamingHooks[b].subsequentChunkFrames = requests[b].subsequentChunkFrames;
+            streamingHooks[b].onAudioChunkReady = requests[b].onAudioChunkReady;
+            streamingHooks[b].shouldCancel = requests[b].shouldCancel;
+        }
+    }
+
     if (!runTalkerGenerationLoop(states, activeBatchSize, effectiveMaxFrames, talkerSamplingParams,
-            predictorSamplingParams, repetitionPenalty, trailingPtrs, stream))
+            predictorSamplingParams, repetitionPenalty, trailingPtrs, stream, /*prefillSeqLens=*/{}, streamingHooks))
     {
         return false;
     }
@@ -1380,7 +1404,7 @@ bool Qwen3OmniTTSRuntime::handleAudioGenerationFromThinker(
 bool Qwen3OmniTTSRuntime::runTalkerGenerationLoop(std::vector<PerBatchTalkerState>& states, int32_t activeBatchSize,
     int32_t maxFrames, SamplingParams const& talkerSamplingParams, SamplingParams const& predictorSamplingParams,
     float repetitionPenalty, std::vector<rt::Tensor const*> const& trailingTextHiddens, cudaStream_t stream,
-    std::vector<int64_t> const& prefillSeqLens)
+    std::vector<int64_t> const& prefillSeqLens, std::vector<PerBatchStreamingHooks> const& streamingHooks)
 {
     NVTX_SCOPED_RANGE(nvtx_range, "TalkerRunner::runTalkerGenerationLoop", nvtx_colors::PURPLE);
 
@@ -1534,6 +1558,32 @@ bool Qwen3OmniTTSRuntime::runTalkerGenerationLoop(std::vector<PerBatchTalkerStat
                 states[b].codecToken = hostTokens[b];
                 states[b].talkerFrames++;
 
+                // ===== Standalone-TTS streaming: cancel + per-chunk emission =====
+                bool const hasHook = (b < static_cast<int32_t>(streamingHooks.size()));
+                if (hasHook)
+                {
+                    auto const& hook = streamingHooks[b];
+                    if (hook.shouldCancel && hook.shouldCancel())
+                    {
+                        states[b].finished = true;
+                        unfinished--;
+                        continue;
+                    }
+                    // Adaptive chunk size: first emitted chunk uses codecChunkFrames (low TTFA),
+                    // subsequent chunks use subsequentChunkFrames if set (>0), else fall back to codecChunkFrames.
+                    int32_t const threshold = (states[b].lastChunkEnd == 0 || hook.subsequentChunkFrames <= 0)
+                        ? hook.codecChunkFrames
+                        : hook.subsequentChunkFrames;
+                    if (hook.codecChunkFrames > 0 && hook.onAudioChunkReady
+                        && (states[b].talkerFrames - states[b].lastChunkEnd) >= threshold)
+                    {
+                        std::vector<std::vector<int32_t>> chunk(states[b].rvqCodes.begin() + states[b].lastChunkEnd,
+                            states[b].rvqCodes.begin() + states[b].talkerFrames);
+                        hook.onAudioChunkReady(chunk, b, false);
+                        states[b].lastChunkEnd = states[b].talkerFrames;
+                    }
+                }
+
                 if (states[b].codecToken == codecEosId || states[b].talkerFrames >= maxFrames)
                 {
                     states[b].finished = true;
@@ -1541,6 +1591,27 @@ bool Qwen3OmniTTSRuntime::runTalkerGenerationLoop(std::vector<PerBatchTalkerStat
                 }
             }
             globalFrame++;
+        }
+    }
+
+    // ===== Flush remainder chunks (standalone-TTS streaming path) =====
+    for (int32_t b = 0; b < activeBatchSize; ++b)
+    {
+        if (b < static_cast<int32_t>(streamingHooks.size()))
+        {
+            auto const& hook = streamingHooks[b];
+            if (hook.onAudioChunkReady && states[b].lastChunkEnd < states[b].talkerFrames)
+            {
+                std::vector<std::vector<int32_t>> chunk(states[b].rvqCodes.begin() + states[b].lastChunkEnd,
+                    states[b].rvqCodes.begin() + states[b].talkerFrames);
+                hook.onAudioChunkReady(chunk, b, true);
+                states[b].lastChunkEnd = states[b].talkerFrames;
+            }
+            else if (hook.onAudioChunkReady && states[b].lastChunkEnd == states[b].talkerFrames)
+            {
+                // Emit empty final marker so consumers know the stream ended without unflushed frames.
+                hook.onAudioChunkReady(std::vector<std::vector<int32_t>>{}, b, true);
+            }
         }
     }
 
