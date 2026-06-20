@@ -734,9 +734,13 @@ def quantize_and_export(
     os.makedirs(output_dir, exist_ok=True)
     with torch.inference_mode(), _skip_resmooth_for_hybrid(
             model, quantization or ""):
+        import inspect as _inspect
+        _ehc_kwargs = {}
+        if mtp_state_dict is not None and "extra_state_dict" in _inspect.signature(export_hf_checkpoint).parameters:
+            _ehc_kwargs["extra_state_dict"] = mtp_state_dict
         export_hf_checkpoint(model,
                              export_dir=output_dir,
-                             extra_state_dict=mtp_state_dict)
+                             **_ehc_kwargs)
     tokenizer.save_pretrained(output_dir)
     if processor is not None:
         if _is_phi4mm_model(model_dir):
