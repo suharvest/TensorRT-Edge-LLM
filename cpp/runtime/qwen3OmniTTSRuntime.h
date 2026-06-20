@@ -573,6 +573,8 @@ private:
 
     // ========== Embedding Tables ==========
     rt::Tensor mTextEmbeddingTable; //!< Text embedding table [thinkerVocabSize, thinkerHiddenSize] (for standalone TTS)
+    rt::Tensor mTextEmbeddingScales; //!< FP8 per-group scales [vocabSize, hiddenSize/blockSize] FP32 (empty when table is FP16)
+    bool mTextEmbeddingIsFp8{false}; //!< true when mTextEmbeddingTable is FP8 e4m3 (then mTextEmbeddingScales is used)
     rt::Tensor mTalkerEmbeddingTable; //!< Talker LLM embedding table [vocabSize, hiddenSize]
     std::vector<rt::Tensor>
         mCodePredictorEmbeddingTables; //!< CodePredictor embedding tables (mNumRvqLayers) [codebookSize, hiddenSize]
@@ -718,6 +720,10 @@ private:
      */
     void appendTrailingToken(int32_t tokenId, rt::Tensor const& thinkerEmbedTable, rt::Tensor& trailingTextHidden,
         int32_t trailingIdx, cudaStream_t stream);
+
+    //! \brief Returns the FP8 dequant scales iff \p table is the FP8 text-embedding table (by pointer identity);
+    //! otherwise std::nullopt. Lets every embeddingLookup call attach scales uniformly and safely.
+    rt::OptionalInputTensor scalesFor(rt::Tensor const& table) const;
 
     /*!
      * @brief Append tts_eos embedding at the end of trailingTextHidden

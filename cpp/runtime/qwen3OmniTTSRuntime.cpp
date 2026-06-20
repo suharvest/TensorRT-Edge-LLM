@@ -37,6 +37,7 @@
 #include <cuda_runtime.h>
 #include <filesystem>
 #include <fstream>
+#include <functional>
 #include <nlohmann/json.hpp>
 #include <unordered_set>
 
@@ -168,11 +169,34 @@ Qwen3OmniTTSRuntime::Qwen3OmniTTSRuntime(std::string const& talkerEngineDir, std
         bool const textEmbedLoaded = safetensors::loadSafetensors(textEmbedPath, textEmbedTensors, stream);
         ELLM_CHECK(textEmbedLoaded, "Failed to load text embedding from: " + textEmbedPath.string());
         check::check(!textEmbedTensors.empty(), "text embedding file is empty");
-        check::check(textEmbedTensors[0].getShape().getNumDims() == 2,
+        // The file holds the embedding table (FP16, or FP8 e4m3 for a quantized table) and, for the
+        // FP8 case, a separate FP32 per-group scales tensor. loadSafetensors returns no names, so
+        // classify by dtype: table = FP16/FP8 2D tensor, scales = FP32 2D tensor.
+        int tableIdx = -1, scalesIdx = -1;
+        for (size_t i = 0; i < textEmbedTensors.size(); ++i)
+        {
+            auto const dt = textEmbedTensors[i].getDataType();
+            if (dt == nvinfer1::DataType::kHALF || dt == nvinfer1::DataType::kFP8)
+                tableIdx = static_cast<int>(i);
+            else if (dt == nvinfer1::DataType::kFLOAT)
+                scalesIdx = static_cast<int>(i);
+        }
+        check::check(tableIdx >= 0, "text embedding file has no FP16/FP8 table tensor");
+        check::check(textEmbedTensors[tableIdx].getShape().getNumDims() == 2,
             "text embedding tensor should be 2D [vocabSize, hiddenSize]");
-        mTextEmbeddingTable = std::move(textEmbedTensors[0]);
-        LOG_INFO("Text embedding table loaded: [%lld, %lld]", mTextEmbeddingTable.getShape()[0],
-            mTextEmbeddingTable.getShape()[1]);
+        mTextEmbeddingIsFp8 = (textEmbedTensors[tableIdx].getDataType() == nvinfer1::DataType::kFP8);
+        if (mTextEmbeddingIsFp8)
+        {
+            check::check(scalesIdx >= 0, "FP8 text embedding requires an FP32 scales tensor in the same file");
+            check::check(textEmbedTensors[scalesIdx].getShape().getNumDims() == 2,
+                "text embedding scales should be 2D [vocabSize, hiddenSize/blockSize]");
+            check::check(textEmbedTensors[scalesIdx].getShape()[0] == textEmbedTensors[tableIdx].getShape()[0],
+                "scales vocab dim must match table vocab dim");
+            mTextEmbeddingScales = std::move(textEmbedTensors[scalesIdx]);
+        }
+        mTextEmbeddingTable = std::move(textEmbedTensors[tableIdx]);
+        LOG_INFO("Text embedding table loaded: [%lld, %lld] (%s)", mTextEmbeddingTable.getShape()[0],
+            mTextEmbeddingTable.getShape()[1], mTextEmbeddingIsFp8 ? "FP8+scales" : "FP16");
     }
 
     // Note: mTalkerEmbeddingTable is loaded by loadTalkerWeights() above.
@@ -726,7 +750,7 @@ void Qwen3OmniTTSRuntime::initializeTTSEmbeddings(cudaStream_t stream)
     CUDA_CHECK(cudaMemcpyAsync(
         ttsIds.rawPointer(), hostTtsIds.data(), kNumTtsTokens * sizeof(int32_t), cudaMemcpyHostToDevice, stream));
 
-    kernel::embeddingLookup(ttsIds, mTextEmbeddingTable, std::nullopt, ttsRaw, stream);
+    kernel::embeddingLookup(ttsIds, mTextEmbeddingTable, scalesFor(mTextEmbeddingTable), ttsRaw, stream);
     // Reshape from [1, 3, hidden] to [3, hidden] for MLP (expects 2D input)
     check::check(ttsRaw.reshape({kNumTtsTokens, thinkerHiddenSize}), "Tensor reshape failed");
     kernel::invokeTalkerMLP(
@@ -1040,7 +1064,7 @@ bool Qwen3OmniTTSRuntime::prepareTalkerInput(std::vector<int32_t> const& textTok
     CUDA_CHECK(cudaMemcpyAsync(mGpuTokenIdsBuffer.rawPointer(), textTokenIds.data(), seqLen * sizeof(int32_t),
         cudaMemcpyHostToDevice, stream));
     check::check(mThinkerEmbedBuffer.reshape({1, seqLen, thinkerHiddenSize}), "Tensor reshape failed");
-    kernel::embeddingLookup(mGpuTokenIdsBuffer, mTextEmbeddingTable, std::nullopt, mThinkerEmbedBuffer, stream);
+    kernel::embeddingLookup(mGpuTokenIdsBuffer, mTextEmbeddingTable, scalesFor(mTextEmbeddingTable), mThinkerEmbedBuffer, stream);
     check::check(mThinkerEmbedBuffer.reshape({seqLen, thinkerHiddenSize}), "Tensor reshape failed");
 
     // Determine speaker ID
@@ -1961,7 +1985,7 @@ bool Qwen3OmniTTSRuntime::buildTalkerPrefillFromSegments(std::vector<int32_t> co
             __half* genDst = static_cast<__half*>(mThinkerEmbedBuffer.rawPointer()) + copyLen * thinkerHiddenSize;
             rt::Tensor genEmbedView(genDst, rt::Coords{1, static_cast<int64_t>(genLen), thinkerHiddenSize},
                 rt::DeviceType::kGPU, nvinfer1::DataType::kHALF);
-            kernel::embeddingLookup(mGpuTokenIdsBuffer, thinkerEmbedTable, std::nullopt, genEmbedView, stream);
+            kernel::embeddingLookup(mGpuTokenIdsBuffer, thinkerEmbedTable, scalesFor(thinkerEmbedTable), genEmbedView, stream);
         }
     }
     else
@@ -1971,7 +1995,7 @@ bool Qwen3OmniTTSRuntime::buildTalkerPrefillFromSegments(std::vector<int32_t> co
             cudaMemcpyHostToDevice, stream));
         rt::Tensor embedView(mThinkerEmbedBuffer.rawPointer(), rt::Coords{1, seqLen, thinkerHiddenSize},
             rt::DeviceType::kGPU, nvinfer1::DataType::kHALF);
-        kernel::embeddingLookup(mGpuTokenIdsBuffer, thinkerEmbedTable, std::nullopt, embedView, stream);
+        kernel::embeddingLookup(mGpuTokenIdsBuffer, thinkerEmbedTable, scalesFor(thinkerEmbedTable), embedView, stream);
     }
 
     // Step 2: Project ALL tokens through text_projection MLP
@@ -2145,6 +2169,18 @@ bool Qwen3OmniTTSRuntime::buildTalkerPrefillFromSegments(std::vector<int32_t> co
 //        Incremental Trailing Hidden Helpers (for streaming)
 // ═══════════════════════════════════════════════════════════════════════════
 
+rt::OptionalInputTensor Qwen3OmniTTSRuntime::scalesFor(rt::Tensor const& table) const
+{
+    // The only FP8 table in the runtime is the text-embedding table (everything else stays FP16), so
+    // attach mTextEmbeddingScales to any FP8 table. FP16/other tables -> nullopt (unchanged behavior).
+    // Keying off dtype (not pointer identity) is robust even if a caller passes a view/copy of the table.
+    if (mTextEmbeddingIsFp8 && table.getDataType() == nvinfer1::DataType::kFP8)
+    {
+        return std::cref(mTextEmbeddingScales);
+    }
+    return std::nullopt;
+}
+
 void Qwen3OmniTTSRuntime::appendTrailingToken(int32_t tokenId, rt::Tensor const& thinkerEmbedTable,
     rt::Tensor& trailingTextHidden, int32_t trailingIdx, cudaStream_t stream)
 {
@@ -2158,7 +2194,7 @@ void Qwen3OmniTTSRuntime::appendTrailingToken(int32_t tokenId, rt::Tensor const&
     // embeddingLookup expects [1, 1, H] output; mStreamingTokenEmbed is [1, H] — same memory, just reshape for kernel
     rt::Tensor embedView(mStreamingTokenEmbed.rawPointer(), rt::Coords{1, 1, mTalkerConfig.thinkerHiddenSize},
         rt::DeviceType::kGPU, nvinfer1::DataType::kHALF);
-    kernel::embeddingLookup(mStreamingTokenId, thinkerEmbedTable, std::nullopt, embedView, stream);
+    kernel::embeddingLookup(mStreamingTokenId, thinkerEmbedTable, scalesFor(thinkerEmbedTable), embedView, stream);
 
     // text_projection: mStreamingTokenEmbed [1, thinkerH] → mStreamingProjOut [1, talkerH]
     kernel::invokeTalkerMLP(mStreamingTokenEmbed, mTextFC1Weight, mTextFC1Bias, mTextFC2Weight, mTextFC2Bias,
