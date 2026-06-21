@@ -207,6 +207,15 @@ public:
         return mDecoderRegistry && mDecoderRegistry->hasSpeculativeDecoder();
     }
 
+    //! @brief Number of physical batch lanes this runtime supports (KV capacity dimension).
+    //! @details Exposes the engine's maxSupportedBatchSize so the N>1 voice worker can size its
+    //!          SessionLaneManager to the engine's physical batch capacity. Read-only accessor on
+    //!          an existing deployment field — no streaming/runtime state involved.
+    int32_t maxSessionBatchSize() const noexcept
+    {
+        return mDeployment.base.maxSupportedBatchSize;
+    }
+
 private:
     //! @brief Common initialization logic shared between both constructors
     void initializeCommon(std::string const& engineDir, std::string const& multimodalEngineDir,
