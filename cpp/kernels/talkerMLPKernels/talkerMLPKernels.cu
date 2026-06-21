@@ -275,6 +275,141 @@ void invokeAddBias(rt::Tensor& data, rt::Tensor const& bias, cudaStream_t stream
     CUDA_CHECK(cudaPeekAtLastError());
 }
 
+//! \brief Tiled FP16 GEMM (FP32 accumulate) with fused bias + optional SiLU epilogue.
+//!
+//! Computes C[M,N] = A[M,K] @ B[N,K]^T (+ bias[N]) (+ SiLU), all row-major FP16.
+//! Self-contained fallback used when CuTe-DSL GEMM is unavailable — notably Jetson Orin
+//! (sm_87), where the prebuilt CuTe-DSL "Ampere" GEMM cubin is not sm_87-runnable
+//! (kernel launch -> "invalid device function"). Handles arbitrary M/N/K (no alignment
+//! or multiple-of-8 constraints); accuracy-oriented (FP32 accumulation), not micro-tuned.
+template <int32_t TILE>
+__global__ void gemmNTBiasActKernel(half const* __restrict__ A, half const* __restrict__ B,
+    half const* __restrict__ bias, half* __restrict__ C, int32_t M, int32_t N, int32_t K, bool applySiLU)
+{
+    __shared__ half As[TILE][TILE];
+    __shared__ half Bs[TILE][TILE];
+
+    int32_t const row = blockIdx.y * TILE + threadIdx.y; // m in [0, M)
+    int32_t const col = blockIdx.x * TILE + threadIdx.x; // n in [0, N)
+
+    float acc = 0.0f;
+    int32_t const numTiles = (K + TILE - 1) / TILE;
+    for (int32_t t = 0; t < numTiles; ++t)
+    {
+        int32_t const kA = t * TILE + threadIdx.x;
+        As[threadIdx.y][threadIdx.x]
+            = (row < M && kA < K) ? A[static_cast<int64_t>(row) * K + kA] : __float2half(0.0f);
+
+        int32_t const kB = t * TILE + threadIdx.y; // B[col, kB] (B is [N, K] row-major)
+        Bs[threadIdx.y][threadIdx.x]
+            = (col < N && kB < K) ? B[static_cast<int64_t>(col) * K + kB] : __float2half(0.0f);
+
+        __syncthreads();
+#pragma unroll
+        for (int32_t i = 0; i < TILE; ++i)
+        {
+            acc += __half2float(As[threadIdx.y][i]) * __half2float(Bs[i][threadIdx.x]);
+        }
+        __syncthreads();
+    }
+
+    if (row < M && col < N)
+    {
+        if (bias != nullptr)
+        {
+            acc += __half2float(bias[col]);
+        }
+        if (applySiLU)
+        {
+            acc = acc / (1.0f + __expf(-acc));
+        }
+        C[static_cast<int64_t>(row) * N + col] = __float2half(acc);
+    }
+}
+
+//! \brief Decode-path GEMV: C[1,N] = A[1,K] @ B[N,K]^T (+bias) (+SiLU). One warp per output
+//! column n; 32 lanes stride over K with FP32 accumulation + warp-reduce. half2 loads when K is
+//! even (talker dims are; B base is device-aligned so B+n*K stays 2-aligned). Numerically equivalent
+//! to gemmNTBiasActKernel (same FP32-accumulated A·B + bias + SiLU; only the summation order differs).
+//! Avoids the 16x16 tiled kernel wasting 15/16 row lanes at M==1 (the autoregressive decode hot path).
+__global__ void gemvNTBiasActM1Kernel(half const* __restrict__ A, half const* __restrict__ B,
+    half const* __restrict__ bias, half* __restrict__ C, int32_t N, int32_t K, bool applySiLU)
+{
+    int32_t const warpsPerBlock = blockDim.x / warpSize;
+    int32_t const n = blockIdx.x * warpsPerBlock + (threadIdx.x / warpSize); // output column (warp-uniform)
+    int32_t const lane = threadIdx.x % warpSize;
+    if (n >= N) // warp-uniform: all 32 lanes return together (safe for the shfl below)
+    {
+        return;
+    }
+
+    half const* __restrict__ Brow = B + static_cast<int64_t>(n) * K;
+    float acc = 0.0f;
+    if ((K & 1) == 0)
+    {
+        half2 const* __restrict__ A2 = reinterpret_cast<half2 const*>(A);
+        half2 const* __restrict__ B2 = reinterpret_cast<half2 const*>(Brow);
+        int32_t const K2 = K >> 1;
+        for (int32_t j = lane; j < K2; j += warpSize)
+        {
+            float2 const a = __half22float2(A2[j]);
+            float2 const b = __half22float2(B2[j]);
+            acc += a.x * b.x + a.y * b.y;
+        }
+    }
+    else
+    {
+        for (int32_t k = lane; k < K; k += warpSize)
+        {
+            acc += __half2float(A[k]) * __half2float(Brow[k]);
+        }
+    }
+
+#pragma unroll
+    for (int32_t offset = warpSize / 2; offset > 0; offset >>= 1)
+    {
+        acc += __shfl_down_sync(0xffffffffu, acc, offset);
+    }
+
+    if (lane == 0)
+    {
+        if (bias != nullptr)
+        {
+            acc += __half2float(bias[n]);
+        }
+        if (applySiLU)
+        {
+            acc = acc / (1.0f + __expf(-acc));
+        }
+        C[n] = __float2half(acc);
+    }
+}
+
+//! \brief Host wrapper for gemmNTBiasActKernel. C[M,N] = A[M,K] @ B[N,K]^T (+bias) (+SiLU).
+//! \param bias optional [N] bias (nullptr to skip)
+void invokeGemmNTBiasAct(half const* A, half const* B, half const* bias, half* C, int32_t M, int32_t N, int32_t K,
+    bool applySiLU, cudaStream_t stream)
+{
+    if (M == 1)
+    {
+        // Autoregressive decode hot path: dedicated GEMV (warp-per-column) instead of the
+        // 16x16 tiled GEMM which would use only 1/16 of each block's rows.
+        constexpr int32_t kThreads = 256; // 8 warps/block
+        int32_t const warpsPerBlock = kThreads / 32;
+        dim3 const block(kThreads);
+        dim3 const grid((N + warpsPerBlock - 1) / warpsPerBlock);
+        gemvNTBiasActM1Kernel<<<grid, block, 0, stream>>>(A, B, bias, C, N, K, applySiLU);
+        CUDA_CHECK(cudaPeekAtLastError());
+        return;
+    }
+
+    constexpr int32_t TILE = 16;
+    dim3 const block(TILE, TILE);
+    dim3 const grid((N + TILE - 1) / TILE, (M + TILE - 1) / TILE);
+    gemmNTBiasActKernel<TILE><<<grid, block, 0, stream>>>(A, B, bias, C, M, N, K, applySiLU);
+    CUDA_CHECK(cudaPeekAtLastError());
+}
+
 } // namespace
 
 void invokeTalkerMLP(rt::Tensor const& input, rt::Tensor const& fc1Weight, rt::Tensor const& fc1Bias,
@@ -338,8 +473,15 @@ void invokeTalkerMLP(rt::Tensor const& input, rt::Tensor const& fc1Weight, rt::T
         return;
     }
 #else
-    LOG_ERROR("CuTe DSL GEMM not compiled. Rebuild with -DENABLE_CUTE_DSL=gemm (or ALL).");
-    return;
+    // CuTe-DSL-free fallback (e.g. Jetson sm_87): tiled FP16 GEMM + fused bias/SiLU epilogue.
+    // FC1: workspace = SiLU(input @ fc1Weight^T + fc1Bias)
+    invokeGemmNTBiasAct(static_cast<half const*>(input.rawPointer()),
+        static_cast<half const*>(fc1Weight.rawPointer()), static_cast<half const*>(fc1Bias.rawPointer()),
+        static_cast<half*>(workspace.rawPointer()), numTokens, hiddenDim, inputDim, /*applySiLU=*/true, stream);
+    // FC2: output = workspace @ fc2Weight^T + fc2Bias
+    invokeGemmNTBiasAct(static_cast<half const*>(workspace.rawPointer()),
+        static_cast<half const*>(fc2Weight.rawPointer()), static_cast<half const*>(fc2Bias.rawPointer()),
+        static_cast<half*>(output.rawPointer()), numTokens, outputDim, hiddenDim, /*applySiLU=*/false, stream);
 #endif
 }
 
@@ -382,8 +524,10 @@ void invokeLinearLayer(
         return;
     }
 #else
-    LOG_ERROR("CuTe DSL GEMM not compiled. Rebuild with -DENABLE_CUTE_DSL=gemm (or ALL).");
-    return;
+    // CuTe-DSL-free fallback: output = input @ weight^T + bias
+    invokeGemmNTBiasAct(static_cast<half const*>(input.rawPointer()), static_cast<half const*>(weight.rawPointer()),
+        static_cast<half const*>(bias.rawPointer()), static_cast<half*>(output.rawPointer()), numTokens, outputDim,
+        inputDim, /*applySiLU=*/false, stream);
 #endif
 }
 
@@ -454,7 +598,8 @@ template <int32_t VEC_SIZE = 8>
 __global__ void assistantPreambleKernel(half const* __restrict__ projected, half const* __restrict__ ttsPadEmbed,
     half const* __restrict__ ttsBosEmbed, half const* __restrict__ ttsEosEmbed, half const* __restrict__ embTable,
     int32_t codecNothinkId, int32_t codecThinkBosId, int32_t codecThinkEosId, int32_t speakerId, int32_t codecPadId,
-    int32_t codecBosId, int32_t textLen, int32_t hiddenDim, half* __restrict__ output)
+    int32_t codecBosId, int32_t textLen, half const* __restrict__ speakerEmbedding, bool hasSpeakerEmbedding,
+    int32_t hiddenDim, half* __restrict__ output)
 {
     constexpr int32_t kFixedPrefixLen = 8; // rows 0-7
     int32_t const rowIdx = blockIdx.x;
@@ -486,8 +631,17 @@ __global__ void assistantPreambleKernel(half const* __restrict__ projected, half
             srcB = embTable + static_cast<int64_t>(codecThinkEosId) * hiddenDim;
             break;
         case 6:
-            srcA = ttsPadEmbed;
-            srcB = embTable + static_cast<int64_t>(speakerId) * hiddenDim;
+            // BASE PORT: external speaker embedding occupies row 6 directly (the row IS the
+            // embedding vector, no ttsPad add). Else CustomVoice path: ttsPad + embTable[speakerId].
+            if (hasSpeakerEmbedding)
+            {
+                srcA = speakerEmbedding;
+            }
+            else
+            {
+                srcA = ttsPadEmbed;
+                srcB = embTable + static_cast<int64_t>(speakerId) * hiddenDim;
+            }
             break;
         default: // rowIdx == 7
             srcA = ttsBosEmbed;
@@ -541,7 +695,7 @@ __global__ void assistantPreambleKernel(half const* __restrict__ projected, half
 void invokeAssistantPreamble(rt::Tensor const& projected, rt::Tensor const& ttsPadEmbed, rt::Tensor const& ttsBosEmbed,
     rt::Tensor const& ttsEosEmbed, rt::Tensor const& talkerEmbTable, int32_t codecNothinkId, int32_t codecThinkBosId,
     int32_t codecThinkEosId, int32_t speakerId, int32_t codecPadId, int32_t codecBosId, int32_t textLen,
-    rt::Tensor& output, cudaStream_t stream)
+    rt::Tensor& output, cudaStream_t stream, half const* speakerEmbeddingPtr, bool hasSpeakerEmbedding)
 {
     constexpr int32_t kVecSize = 8;
 
@@ -562,8 +716,8 @@ void invokeAssistantPreamble(rt::Tensor const& projected, rt::Tensor const& ttsP
     half* outPtr = static_cast<half*>(output.rawPointer());
 
     assistantPreambleKernel<kVecSize><<<grid, block, 0, stream>>>(projPtr, padPtr, bosPtr, eosPtr, embPtr,
-        codecNothinkId, codecThinkBosId, codecThinkEosId, speakerId, codecPadId, codecBosId, textLen, hiddenDim,
-        outPtr);
+        codecNothinkId, codecThinkBosId, codecThinkEosId, speakerId, codecPadId, codecBosId, textLen,
+        speakerEmbeddingPtr, hasSpeakerEmbedding, hiddenDim, outPtr);
     CUDA_CHECK(cudaPeekAtLastError());
 }
 

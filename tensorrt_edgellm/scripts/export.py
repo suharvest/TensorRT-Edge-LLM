@@ -1665,10 +1665,19 @@ def main() -> None:
     has_mtp_draft = _has_mtp(config)
     externalize_weights = resolve_externalize_weights(args.externalize_weights)
 
+    # BASE PORT: upstream v0.8.0 rejected non-CustomVoice Qwen3-TTS here. We extend
+    # support to the Base checkpoint, which conditions on an external speaker
+    # embedding (speaker_encoder / reference audio) instead of named-speaker tokens.
+    # Talker/CodePredictor/Code2Wav export via the LLM+code2wav pipeline is
+    # checkpoint-agnostic; the speaker_encoder ONNX is produced separately (the v0.8
+    # audio-export infra for it was removed upstream — see docs/specs port note).
     if (model_type == "qwen3_tts"
             and config.get("tts_model_type") != "custom_voice"):
-        p.error("Only Qwen3-TTS CustomVoice checkpoints are supported. "
-                f"Got tts_model_type={config.get('tts_model_type')!r}.")
+        logger.warning(
+            "Qwen3-TTS non-CustomVoice checkpoint (tts_model_type=%r): exporting "
+            "Talker/CodePredictor/Code2Wav for the BASE path. Speaker conditioning "
+            "uses an external embedding supplied at runtime.",
+            config.get("tts_model_type"))
 
     if args.eagle_base and args.mtp:
         p.error("--eagle-base and --mtp cannot be enabled together")

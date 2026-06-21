@@ -37,6 +37,7 @@
 #include <cuda_runtime.h>
 #include <filesystem>
 #include <fstream>
+#include <functional>
 #include <nlohmann/json.hpp>
 #include <unordered_set>
 
@@ -168,11 +169,176 @@ Qwen3OmniTTSRuntime::Qwen3OmniTTSRuntime(std::string const& talkerEngineDir, std
         bool const textEmbedLoaded = safetensors::loadSafetensors(textEmbedPath, textEmbedTensors, stream);
         ELLM_CHECK(textEmbedLoaded, "Failed to load text embedding from: " + textEmbedPath.string());
         check::check(!textEmbedTensors.empty(), "text embedding file is empty");
-        check::check(textEmbedTensors[0].getShape().getNumDims() == 2,
+        // The file holds the embedding table (FP16, or FP8 e4m3 for a quantized table) and, for the
+        // FP8 case, a separate FP32 per-group scales tensor. loadSafetensors returns no names, so
+        // classify by dtype: table = FP16/FP8 2D tensor, scales = FP32 2D tensor.
+        int tableIdx = -1, scalesIdx = -1;
+        for (size_t i = 0; i < textEmbedTensors.size(); ++i)
+        {
+            auto const dt = textEmbedTensors[i].getDataType();
+            if (dt == nvinfer1::DataType::kHALF || dt == nvinfer1::DataType::kFP8)
+                tableIdx = static_cast<int>(i);
+            else if (dt == nvinfer1::DataType::kFLOAT)
+                scalesIdx = static_cast<int>(i);
+        }
+        check::check(tableIdx >= 0, "text embedding file has no FP16/FP8 table tensor");
+        check::check(textEmbedTensors[tableIdx].getShape().getNumDims() == 2,
             "text embedding tensor should be 2D [vocabSize, hiddenSize]");
-        mTextEmbeddingTable = std::move(textEmbedTensors[0]);
-        LOG_INFO("Text embedding table loaded: [%lld, %lld]", mTextEmbeddingTable.getShape()[0],
-            mTextEmbeddingTable.getShape()[1]);
+        mTextEmbeddingIsFp8 = (textEmbedTensors[tableIdx].getDataType() == nvinfer1::DataType::kFP8);
+        if (mTextEmbeddingIsFp8)
+        {
+            check::check(scalesIdx >= 0, "FP8 text embedding requires an FP32 scales tensor in the same file");
+            check::check(textEmbedTensors[scalesIdx].getShape().getNumDims() == 2,
+                "text embedding scales should be 2D [vocabSize, hiddenSize/blockSize]");
+            check::check(textEmbedTensors[scalesIdx].getShape()[0] == textEmbedTensors[tableIdx].getShape()[0],
+                "scales vocab dim must match table vocab dim");
+            mTextEmbeddingScales = std::move(textEmbedTensors[scalesIdx]);
+        }
+        mTextEmbeddingTable = std::move(textEmbedTensors[tableIdx]);
+        LOG_INFO("Text embedding table loaded: [%lld, %lld] (%s)", mTextEmbeddingTable.getShape()[0],
+            mTextEmbeddingTable.getShape()[1], mTextEmbeddingIsFp8 ? "FP8+scales" : "FP16");
+    }
+
+    // Note: mTalkerEmbeddingTable is loaded by loadTalkerWeights() above.
+
+    // Load CodePredictor embedding tables from codec_embeddings.safetensors
+    // mNumRvqLayers is already set from config.json num_code_groups in validateAndFillConfig()
+    {
+        std::filesystem::path const embedPath
+            = std::filesystem::path(codePredictorEngineDir) / "codec_embeddings.safetensors";
+        std::vector<rt::Tensor> allEmbedTensors;
+        bool const codecEmbedLoaded = safetensors::loadSafetensors(embedPath, allEmbedTensors, stream);
+        ELLM_CHECK(codecEmbedLoaded, "Failed to load codec_embeddings.safetensors from: " + embedPath.string());
+        check::check(static_cast<int32_t>(allEmbedTensors.size()) == mNumRvqLayers,
+            "codec_embeddings.safetensors has " + std::to_string(allEmbedTensors.size()) + " tensors, expected "
+                + std::to_string(mNumRvqLayers) + " (num_code_groups - 1)");
+        mCodePredictorEmbeddingTables.resize(mNumRvqLayers);
+        for (int32_t i = 0; i < mNumRvqLayers; ++i)
+        {
+            std::string const key = "embedding_" + std::to_string(i);
+            auto it = std::find_if(allEmbedTensors.begin(), allEmbedTensors.end(),
+                [&key](rt::Tensor const& t) { return t.getName() == key; });
+            check::check(it != allEmbedTensors.end(), "Missing key '" + key + "' in codec_embeddings.safetensors");
+            check::check(it->getShape().getNumDims() == 2, key + " should be 2D [codebookSize, hiddenSize]");
+            mCodePredictorEmbeddingTables[i] = std::move(*it);
+        }
+    }
+    LOG_INFO("Loaded %d CodePredictor embedding tables (from config num_code_groups=%d)", mNumRvqLayers,
+        mTalkerConfig.numCodeGroups);
+
+    initializeTTSEmbeddings(stream);
+
+    CUDA_CHECK(cudaEventCreateWithFlags(&mTtfaStart, cudaEventDefault));
+    CUDA_CHECK(cudaEventCreateWithFlags(&mTtfaEnd, cudaEventDefault));
+
+    LOG_INFO("Qwen3-Omni TTS runtime initialized successfully");
+}
+
+Qwen3OmniTTSRuntime::Qwen3OmniTTSRuntime(nvinfer1::ICudaEngine* talkerEngine,
+    nvinfer1::ICudaEngine* codePredictorEngine, std::string const& talkerEngineDir,
+    std::string const& codePredictorEngineDir, std::string const& tokenizerDir, cudaStream_t stream)
+    : mStream(stream)
+{
+    ELLM_CHECK(talkerEngine != nullptr, "Shared-engine ctor requires a non-null Talker engine");
+    ELLM_CHECK(codePredictorEngine != nullptr, "Shared-engine ctor requires a non-null CodePredictor engine");
+    NVTX_SCOPED_RANGE(nvtx_range, "TalkerRunner::init", nvtx_colors::YELLOW);
+    LOG_INFO("Initializing Qwen3-Omni Talker runner (shared-engine ctor)");
+    LOG_INFO("  Talker: %s", talkerEngineDir.c_str());
+    LOG_INFO("  CodePredictor: %s", codePredictorEngineDir.c_str());
+
+    // Load tokenizer
+    std::filesystem::path const tokenizerPath = tokenizerDir.empty()
+        ? std::filesystem::path(talkerEngineDir).parent_path()
+        : std::filesystem::path(tokenizerDir);
+    LOG_INFO("  Tokenizer: %s", tokenizerPath.string().c_str());
+    mTokenizer = std::make_unique<tokenizer::Tokenizer>();
+    bool const tokenizerLoaded = mTokenizer->loadFromHF(tokenizerPath);
+    ELLM_CHECK(tokenizerLoaded, "Failed to load tokenizer from: " + tokenizerPath.string());
+
+    bool const configValid = validateAndFillConfig(talkerEngineDir);
+    ELLM_CHECK(configValid, "Failed to validate and fill config");
+
+    bool const runnersInitialized = initializeEngineRunnersShared(
+        talkerEngine, codePredictorEngine, talkerEngineDir, codePredictorEngineDir);
+    ELLM_CHECK(runnersInitialized, "Failed to initialize engine runners");
+
+    // Setup shared execution context memory for Talker and CodePredictor engines.
+    // LLMEngineRunner uses kUSER_MANAGED allocation and requires setContextMemory() before execution.
+    {
+        int64_t const talkerCtxSize = mTalkerLLMRunner->getRequiredContextMemorySize();
+        int64_t const cpCtxSize = mCodePredictorRunner ? mCodePredictorRunner->getRequiredContextMemorySize() : 0;
+        int64_t const sharedCtxSize = std::max(talkerCtxSize, cpCtxSize);
+        LOG_INFO("Setup shared execution context memory: %zu bytes (talker: %zu, code_predictor: %zu)",
+            static_cast<size_t>(sharedCtxSize), static_cast<size_t>(talkerCtxSize), static_cast<size_t>(cpCtxSize));
+        mSharedExecContextMemory = rt::Tensor({sharedCtxSize}, rt::DeviceType::kGPU, nvinfer1::DataType::kUINT8,
+            "Qwen3OmniTTSRuntime::mSharedExecContextMemory");
+        bool const talkerCtxSet = mTalkerLLMRunner->setContextMemory(mSharedExecContextMemory);
+        ELLM_CHECK(talkerCtxSet, "Failed to set context memory for Talker LLM engine");
+        ELLM_CHECK(!mCodePredictorRunner || mCodePredictorRunner->setContextMemory(mSharedExecContextMemory),
+            "Failed to set context memory for CodePredictor engine");
+    }
+
+    // Determine max batch size from engine configs (use the minimum of Talker and CodePredictor)
+    mMaxBatchSize = std::min(mTalkerLLMConfig.maxSupportedBatchSize, mCodePredictorConfig.maxSupportedBatchSize);
+    check::check(mMaxBatchSize >= 1, "maxBatchSize must be >= 1");
+    LOG_INFO("Max batch size: %d (Talker=%d, CodePredictor=%d)", mMaxBatchSize, mTalkerLLMConfig.maxSupportedBatchSize,
+        mCodePredictorConfig.maxSupportedBatchSize);
+
+    bool const codePredictorWeightsLoaded = loadCodePredictorWeights(codePredictorEngineDir);
+    ELLM_CHECK(codePredictorWeightsLoaded, "Failed to load CodePredictor weights");
+
+#ifdef CUTE_DSL_GEMM_ENABLED
+    bool const cuteDslLoaded = CuteDslGemmRunner::loadKernelModule();
+    ELLM_CHECK(cuteDslLoaded, "Failed to load CuTe DSL GEMM kernel module");
+#endif
+
+    bool const bufferAllocated = allocateBuffer();
+    ELLM_CHECK(bufferAllocated, "Failed to allocate buffers");
+
+    bool const talkerWeightsLoaded = loadTalkerWeights(talkerEngineDir, stream);
+    ELLM_CHECK(talkerWeightsLoaded, "Failed to load Talker weights");
+
+    // Load text embedding table (thinker vocab).
+    // Used for standalone TTS and for projecting TTS special tokens.
+    // TTS: text_embedding.safetensors in talkerEngineDir (copied by builder).
+    // Omni: use thinker's embedding.safetensors from tokenizerPath instead.
+    {
+        std::filesystem::path const textEmbedPath = mIsOmni
+            ? tokenizerPath / "embedding.safetensors"
+            : std::filesystem::path(talkerEngineDir) / "text_embedding.safetensors";
+        LOG_INFO("Loading text embedding from: %s", textEmbedPath.string().c_str());
+        std::vector<rt::Tensor> textEmbedTensors;
+        bool const textEmbedLoaded = safetensors::loadSafetensors(textEmbedPath, textEmbedTensors, stream);
+        ELLM_CHECK(textEmbedLoaded, "Failed to load text embedding from: " + textEmbedPath.string());
+        check::check(!textEmbedTensors.empty(), "text embedding file is empty");
+        // The file holds the embedding table (FP16, or FP8 e4m3 for a quantized table) and, for the
+        // FP8 case, a separate FP32 per-group scales tensor. loadSafetensors returns no names, so
+        // classify by dtype: table = FP16/FP8 2D tensor, scales = FP32 2D tensor.
+        int tableIdx = -1, scalesIdx = -1;
+        for (size_t i = 0; i < textEmbedTensors.size(); ++i)
+        {
+            auto const dt = textEmbedTensors[i].getDataType();
+            if (dt == nvinfer1::DataType::kHALF || dt == nvinfer1::DataType::kFP8)
+                tableIdx = static_cast<int>(i);
+            else if (dt == nvinfer1::DataType::kFLOAT)
+                scalesIdx = static_cast<int>(i);
+        }
+        check::check(tableIdx >= 0, "text embedding file has no FP16/FP8 table tensor");
+        check::check(textEmbedTensors[tableIdx].getShape().getNumDims() == 2,
+            "text embedding tensor should be 2D [vocabSize, hiddenSize]");
+        mTextEmbeddingIsFp8 = (textEmbedTensors[tableIdx].getDataType() == nvinfer1::DataType::kFP8);
+        if (mTextEmbeddingIsFp8)
+        {
+            check::check(scalesIdx >= 0, "FP8 text embedding requires an FP32 scales tensor in the same file");
+            check::check(textEmbedTensors[scalesIdx].getShape().getNumDims() == 2,
+                "text embedding scales should be 2D [vocabSize, hiddenSize/blockSize]");
+            check::check(textEmbedTensors[scalesIdx].getShape()[0] == textEmbedTensors[tableIdx].getShape()[0],
+                "scales vocab dim must match table vocab dim");
+            mTextEmbeddingScales = std::move(textEmbedTensors[scalesIdx]);
+        }
+        mTextEmbeddingTable = std::move(textEmbedTensors[tableIdx]);
+        LOG_INFO("Text embedding table loaded: [%lld, %lld] (%s)", mTextEmbeddingTable.getShape()[0],
+            mTextEmbeddingTable.getShape()[1], mTextEmbeddingIsFp8 ? "FP8+scales" : "FP16");
     }
 
     // Note: mTalkerEmbeddingTable is loaded by loadTalkerWeights() above.
@@ -223,6 +389,52 @@ Qwen3OmniTTSRuntime::~Qwen3OmniTTSRuntime()
     {
         cudaEventDestroy(mTtfaEnd);
     }
+}
+
+bool Qwen3OmniTTSRuntime::initializeEngineRunnersShared(nvinfer1::ICudaEngine* talkerEngine,
+    nvinfer1::ICudaEngine* codePredictorEngine, std::string const& talkerEngineDir,
+    std::string const& codePredictorEngineDir)
+{
+    // Reuse the borrowed Talker engine; config still read from disk (same dir as the owner).
+    std::filesystem::path talkerConfigPath = std::filesystem::path(talkerEngineDir) / "config.json";
+    LOG_INFO("Reusing shared Talker LLM engine (config: %s)", talkerConfigPath.string().c_str());
+
+    try
+    {
+        std::unordered_map<std::string, std::string> emptyLoraMap;
+        mTalkerLLMRunner = std::make_unique<LLMEngineRunner>(talkerEngine, talkerConfigPath, emptyLoraMap, mStream);
+        mTalkerLLMConfig = mTalkerLLMRunner->getEngineConfig();
+
+        LOG_INFO("Talker LLM engine (shared) ready: vocabSize=%d, hiddenSize=%d", mTalkerLLMConfig.vocabSize,
+            mTalkerLLMConfig.hiddenSize);
+    }
+    catch (std::exception const& e)
+    {
+        LOG_ERROR("Failed to init shared Talker LLM runner: %s", e.what());
+        return false;
+    }
+
+    std::filesystem::path codePredictorConfigPath = std::filesystem::path(codePredictorEngineDir) / "config.json";
+    LOG_INFO("Reusing shared CodePredictor engine (config: %s)", codePredictorConfigPath.string().c_str());
+
+    try
+    {
+        std::unordered_map<std::string, std::string> emptyLoraMap;
+        mCodePredictorRunner
+            = std::make_unique<LLMEngineRunner>(codePredictorEngine, codePredictorConfigPath, emptyLoraMap, mStream);
+        mCodePredictorConfig = mCodePredictorRunner->getEngineConfig();
+        mTalkerConfig.codePredictorHiddenSize = mCodePredictorConfig.hiddenSize;
+
+        LOG_INFO("CodePredictor engine (shared) ready: vocabSize=%d, hiddenSize=%d, numLayers=%d",
+            mCodePredictorConfig.vocabSize, mCodePredictorConfig.hiddenSize, mCodePredictorConfig.numDecoderLayers);
+    }
+    catch (std::exception const& e)
+    {
+        LOG_ERROR("Failed to init shared CodePredictor runner: %s", e.what());
+        return false;
+    }
+
+    return true;
 }
 
 bool Qwen3OmniTTSRuntime::initializeEngineRunners(
@@ -726,7 +938,7 @@ void Qwen3OmniTTSRuntime::initializeTTSEmbeddings(cudaStream_t stream)
     CUDA_CHECK(cudaMemcpyAsync(
         ttsIds.rawPointer(), hostTtsIds.data(), kNumTtsTokens * sizeof(int32_t), cudaMemcpyHostToDevice, stream));
 
-    kernel::embeddingLookup(ttsIds, mTextEmbeddingTable, std::nullopt, ttsRaw, stream);
+    kernel::embeddingLookup(ttsIds, mTextEmbeddingTable, scalesFor(mTextEmbeddingTable), ttsRaw, stream);
     // Reshape from [1, 3, hidden] to [3, hidden] for MLP (expects 2D input)
     check::check(ttsRaw.reshape({kNumTtsTokens, thinkerHiddenSize}), "Tensor reshape failed");
     kernel::invokeTalkerMLP(
@@ -734,6 +946,8 @@ void Qwen3OmniTTSRuntime::initializeTTSEmbeddings(cudaStream_t stream)
 
     int64_t const hiddenSize = mTalkerConfig.talkerHiddenSize;
     mTtsPadEmbed = rt::Tensor({hiddenSize}, rt::DeviceType::kGPU, nvinfer1::DataType::kHALF);
+    // BASE PORT: device buffer for the optional external speaker embedding (row-6 conditioning).
+    mSpeakerEmbeddingBuffer = rt::Tensor({hiddenSize}, rt::DeviceType::kGPU, nvinfer1::DataType::kHALF);
     mTtsBosEmbed = rt::Tensor({hiddenSize}, rt::DeviceType::kGPU, nvinfer1::DataType::kHALF);
     mTtsEosEmbed = rt::Tensor({hiddenSize}, rt::DeviceType::kGPU, nvinfer1::DataType::kHALF);
 
@@ -751,7 +965,8 @@ void Qwen3OmniTTSRuntime::initializeTTSEmbeddings(cudaStream_t stream)
 }
 
 bool Qwen3OmniTTSRuntime::projectToTalkerInput(
-    rt::Tensor const& thinkerEmbed, int32_t speakerId, rt::Tensor& output, int64_t& outputSeqLen, cudaStream_t stream)
+    rt::Tensor const& thinkerEmbed, int32_t speakerId, rt::Tensor& output, int64_t& outputSeqLen, cudaStream_t stream,
+    std::vector<float> const& speakerEmbedding)
 {
     int64_t const seqLen = thinkerEmbed.getShape()[0];
     int64_t const hiddenSize = mTalkerConfig.talkerHiddenSize;
@@ -764,17 +979,49 @@ bool Qwen3OmniTTSRuntime::projectToTalkerInput(
     LOG_INFO("projectToTalkerInput: seqLen=%ld, N=%ld (stripped prefix=%d suffix=%d), outputSeqLen=%ld, speakerId=%d",
         seqLen, N, kAssistantPrefixLen, kAssistantTrailingSuffix, outputSeqLen, speakerId);
 
+    // Defensive guard: N <= 0 means the request carried no synthesizable assistant text after
+    // stripping the fixed role prefix/suffix (e.g. an empty / malformed prompt, or a wrong-tokenizer
+    // chat template that collapses the assistant turn). Feeding such a prefill into the Talker
+    // produces garbage audio rather than silence. Reject early instead of decoding nonsense.
+    if (N <= 0)
+    {
+        LOG_ERROR("projectToTalkerInput: no synthesizable text (N=%ld <= 0, seqLen=%ld); skipping Talker prefill", N,
+            seqLen);
+        return false;
+    }
+
     // Project all tokens via text_projection MLP
     check::check(mProjectedBuffer.reshape({seqLen, hiddenSize}), "Tensor reshape failed");
     check::check(mMLPWorkspace.reshape({seqLen, thinkerHiddenSize}), "Tensor reshape failed");
     kernel::invokeTalkerMLP(thinkerEmbed, mTextFC1Weight, mTextFC1Bias, mTextFC2Weight, mTextFC2Bias, mProjectedBuffer,
         mMLPWorkspace, stream);
 
+    // BASE PORT: when an external speaker embedding is supplied (Base / speaker_encoder path),
+    // convert it to FP16 + upload; the preamble kernel uses it for row-6 instead of a speaker token.
+    bool const hasSpeakerEmbedding = !speakerEmbedding.empty();
+    if (hasSpeakerEmbedding)
+    {
+        if (static_cast<int64_t>(speakerEmbedding.size()) != hiddenSize)
+        {
+            LOG_ERROR("projectToTalkerInput: speaker embedding size %zu != hidden size %ld",
+                speakerEmbedding.size(), hiddenSize);
+            return false;
+        }
+        std::vector<__half> speakerHalf(speakerEmbedding.size());
+        for (size_t i = 0; i < speakerEmbedding.size(); ++i)
+        {
+            speakerHalf[i] = __float2half(speakerEmbedding[i]);
+        }
+        CUDA_CHECK(cudaMemcpyAsync(mSpeakerEmbeddingBuffer.rawPointer(), speakerHalf.data(),
+            speakerHalf.size() * sizeof(__half), cudaMemcpyHostToDevice, stream));
+    }
+
     // Fused kernel: build complete non-streaming prefill buffer
     check::check(output.reshape({outputSeqLen, hiddenSize}), "Tensor reshape failed");
     kernel::invokeAssistantPreamble(mProjectedBuffer, mTtsPadEmbed, mTtsBosEmbed, mTtsEosEmbed, mTalkerEmbeddingTable,
         mTalkerConfig.codecNothinkId, mTalkerConfig.codecThinkBosId, mTalkerConfig.codecThinkEosId, speakerId,
-        mTalkerConfig.codecPadId, mTalkerConfig.codecBosId, static_cast<int32_t>(N), output, stream);
+        mTalkerConfig.codecPadId, mTalkerConfig.codecBosId, static_cast<int32_t>(N), output, stream,
+        hasSpeakerEmbedding ? mSpeakerEmbeddingBuffer.dataPointer<__half>() : nullptr, hasSpeakerEmbedding);
 
     return true;
 }
@@ -1016,7 +1263,7 @@ bool Qwen3OmniTTSRuntime::prepareTalkerInput(std::vector<int32_t> const& textTok
     CUDA_CHECK(cudaMemcpyAsync(mGpuTokenIdsBuffer.rawPointer(), textTokenIds.data(), seqLen * sizeof(int32_t),
         cudaMemcpyHostToDevice, stream));
     check::check(mThinkerEmbedBuffer.reshape({1, seqLen, thinkerHiddenSize}), "Tensor reshape failed");
-    kernel::embeddingLookup(mGpuTokenIdsBuffer, mTextEmbeddingTable, std::nullopt, mThinkerEmbedBuffer, stream);
+    kernel::embeddingLookup(mGpuTokenIdsBuffer, mTextEmbeddingTable, scalesFor(mTextEmbeddingTable), mThinkerEmbedBuffer, stream);
     check::check(mThinkerEmbedBuffer.reshape({seqLen, thinkerHiddenSize}), "Tensor reshape failed");
 
     // Determine speaker ID
@@ -1032,7 +1279,8 @@ bool Qwen3OmniTTSRuntime::prepareTalkerInput(std::vector<int32_t> const& textTok
 
     // MLP projection: thinker embed → talker input embeds (non-streaming, outputSeqLen = seqLen + 2)
     int64_t const hiddenSize = mTalkerConfig.talkerHiddenSize;
-    if (!projectToTalkerInput(mThinkerEmbedBuffer, speakerId, mTalkerInputEmbeds, outSeqLen, stream))
+    if (!projectToTalkerInput(
+            mThinkerEmbedBuffer, speakerId, mTalkerInputEmbeds, outSeqLen, stream, request.speakerEmbedding))
     {
         LOG_ERROR("MLP projection failed");
         return false;
@@ -1127,8 +1375,32 @@ bool Qwen3OmniTTSRuntime::handleAudioGeneration(
     }
 
     std::vector<rt::Tensor const*> trailingPtrs(activeBatchSize, nullptr);
+
+    // Wire optional streaming hooks from each request (empty/disabled by default = identical behavior).
+    std::vector<PerBatchStreamingHooks> streamingHooks;
+    bool anyStreaming = false;
+    for (auto const& r : requests)
+    {
+        if (r.codecChunkFrames > 0 && r.onAudioChunkReady)
+        {
+            anyStreaming = true;
+            break;
+        }
+    }
+    if (anyStreaming)
+    {
+        streamingHooks.resize(activeBatchSize);
+        for (int32_t b = 0; b < activeBatchSize; ++b)
+        {
+            streamingHooks[b].codecChunkFrames = requests[b].codecChunkFrames;
+            streamingHooks[b].subsequentChunkFrames = requests[b].subsequentChunkFrames;
+            streamingHooks[b].onAudioChunkReady = requests[b].onAudioChunkReady;
+            streamingHooks[b].shouldCancel = requests[b].shouldCancel;
+        }
+    }
+
     if (!runTalkerGenerationLoop(states, activeBatchSize, effectiveMaxFrames, talkerSamplingParams,
-            predictorSamplingParams, repetitionPenalty, trailingPtrs, stream))
+            predictorSamplingParams, repetitionPenalty, trailingPtrs, stream, /*prefillSeqLens=*/{}, streamingHooks))
     {
         return false;
     }
@@ -1380,7 +1652,7 @@ bool Qwen3OmniTTSRuntime::handleAudioGenerationFromThinker(
 bool Qwen3OmniTTSRuntime::runTalkerGenerationLoop(std::vector<PerBatchTalkerState>& states, int32_t activeBatchSize,
     int32_t maxFrames, SamplingParams const& talkerSamplingParams, SamplingParams const& predictorSamplingParams,
     float repetitionPenalty, std::vector<rt::Tensor const*> const& trailingTextHiddens, cudaStream_t stream,
-    std::vector<int64_t> const& prefillSeqLens)
+    std::vector<int64_t> const& prefillSeqLens, std::vector<PerBatchStreamingHooks> const& streamingHooks)
 {
     NVTX_SCOPED_RANGE(nvtx_range, "TalkerRunner::runTalkerGenerationLoop", nvtx_colors::PURPLE);
 
@@ -1534,6 +1806,32 @@ bool Qwen3OmniTTSRuntime::runTalkerGenerationLoop(std::vector<PerBatchTalkerStat
                 states[b].codecToken = hostTokens[b];
                 states[b].talkerFrames++;
 
+                // ===== Standalone-TTS streaming: cancel + per-chunk emission =====
+                bool const hasHook = (b < static_cast<int32_t>(streamingHooks.size()));
+                if (hasHook)
+                {
+                    auto const& hook = streamingHooks[b];
+                    if (hook.shouldCancel && hook.shouldCancel())
+                    {
+                        states[b].finished = true;
+                        unfinished--;
+                        continue;
+                    }
+                    // Adaptive chunk size: first emitted chunk uses codecChunkFrames (low TTFA),
+                    // subsequent chunks use subsequentChunkFrames if set (>0), else fall back to codecChunkFrames.
+                    int32_t const threshold = (states[b].lastChunkEnd == 0 || hook.subsequentChunkFrames <= 0)
+                        ? hook.codecChunkFrames
+                        : hook.subsequentChunkFrames;
+                    if (hook.codecChunkFrames > 0 && hook.onAudioChunkReady
+                        && (states[b].talkerFrames - states[b].lastChunkEnd) >= threshold)
+                    {
+                        std::vector<std::vector<int32_t>> chunk(states[b].rvqCodes.begin() + states[b].lastChunkEnd,
+                            states[b].rvqCodes.begin() + states[b].talkerFrames);
+                        hook.onAudioChunkReady(chunk, b, false);
+                        states[b].lastChunkEnd = states[b].talkerFrames;
+                    }
+                }
+
                 if (states[b].codecToken == codecEosId || states[b].talkerFrames >= maxFrames)
                 {
                     states[b].finished = true;
@@ -1541,6 +1839,27 @@ bool Qwen3OmniTTSRuntime::runTalkerGenerationLoop(std::vector<PerBatchTalkerStat
                 }
             }
             globalFrame++;
+        }
+    }
+
+    // ===== Flush remainder chunks (standalone-TTS streaming path) =====
+    for (int32_t b = 0; b < activeBatchSize; ++b)
+    {
+        if (b < static_cast<int32_t>(streamingHooks.size()))
+        {
+            auto const& hook = streamingHooks[b];
+            if (hook.onAudioChunkReady && states[b].lastChunkEnd < states[b].talkerFrames)
+            {
+                std::vector<std::vector<int32_t>> chunk(states[b].rvqCodes.begin() + states[b].lastChunkEnd,
+                    states[b].rvqCodes.begin() + states[b].talkerFrames);
+                hook.onAudioChunkReady(chunk, b, true);
+                states[b].lastChunkEnd = states[b].talkerFrames;
+            }
+            else if (hook.onAudioChunkReady && states[b].lastChunkEnd == states[b].talkerFrames)
+            {
+                // Emit empty final marker so consumers know the stream ended without unflushed frames.
+                hook.onAudioChunkReady(std::vector<std::vector<int32_t>>{}, b, true);
+            }
         }
     }
 
@@ -1865,7 +2184,7 @@ bool Qwen3OmniTTSRuntime::buildTalkerPrefillFromSegments(std::vector<int32_t> co
             __half* genDst = static_cast<__half*>(mThinkerEmbedBuffer.rawPointer()) + copyLen * thinkerHiddenSize;
             rt::Tensor genEmbedView(genDst, rt::Coords{1, static_cast<int64_t>(genLen), thinkerHiddenSize},
                 rt::DeviceType::kGPU, nvinfer1::DataType::kHALF);
-            kernel::embeddingLookup(mGpuTokenIdsBuffer, thinkerEmbedTable, std::nullopt, genEmbedView, stream);
+            kernel::embeddingLookup(mGpuTokenIdsBuffer, thinkerEmbedTable, scalesFor(thinkerEmbedTable), genEmbedView, stream);
         }
     }
     else
@@ -1875,7 +2194,7 @@ bool Qwen3OmniTTSRuntime::buildTalkerPrefillFromSegments(std::vector<int32_t> co
             cudaMemcpyHostToDevice, stream));
         rt::Tensor embedView(mThinkerEmbedBuffer.rawPointer(), rt::Coords{1, seqLen, thinkerHiddenSize},
             rt::DeviceType::kGPU, nvinfer1::DataType::kHALF);
-        kernel::embeddingLookup(mGpuTokenIdsBuffer, thinkerEmbedTable, std::nullopt, embedView, stream);
+        kernel::embeddingLookup(mGpuTokenIdsBuffer, thinkerEmbedTable, scalesFor(thinkerEmbedTable), embedView, stream);
     }
 
     // Step 2: Project ALL tokens through text_projection MLP
@@ -2030,6 +2349,21 @@ bool Qwen3OmniTTSRuntime::buildTalkerPrefillFromSegments(std::vector<int32_t> co
 
     // Step 6: Fill trailing text hidden states
     int64_t const assistantSegLen = assistantSeg.endPos - assistantSeg.startPos;
+
+    // Defensive guard: the effective synthesizable text-token count is
+    // (assistantSegLen - kAssistantTrailingOffset). When it is <= 0 the assistant turn carried no
+    // real text after the fixed role prefix (empty / malformed prompt, or a wrong-tokenizer chat
+    // template that collapses the assistant content). Decoding such a prefill produces garbage audio
+    // instead of silence, so reject early and let the caller drop this batch.
+    int64_t const effectiveTextN = assistantSegLen - kAssistantTrailingOffset;
+    if (effectiveTextN <= 0)
+    {
+        LOG_ERROR("buildTalkerPrefillFromSegments: no synthesizable text (effective N=%ld <= 0, assistantSegLen=%ld, "
+                  "offset=%d); skipping Talker prefill",
+            effectiveTextN, assistantSegLen, kAssistantTrailingOffset);
+        return false;
+    }
+
     trailingCount = std::min(static_cast<int32_t>(assistantSegLen - kAssistantTrailingOffset),
         static_cast<int32_t>(trailingTextHidden.getShape()[0]) - 1);
     if (trailingCount > 0)
@@ -2049,6 +2383,18 @@ bool Qwen3OmniTTSRuntime::buildTalkerPrefillFromSegments(std::vector<int32_t> co
 //        Incremental Trailing Hidden Helpers (for streaming)
 // ═══════════════════════════════════════════════════════════════════════════
 
+rt::OptionalInputTensor Qwen3OmniTTSRuntime::scalesFor(rt::Tensor const& table) const
+{
+    // The only FP8 table in the runtime is the text-embedding table (everything else stays FP16), so
+    // attach mTextEmbeddingScales to any FP8 table. FP16/other tables -> nullopt (unchanged behavior).
+    // Keying off dtype (not pointer identity) is robust even if a caller passes a view/copy of the table.
+    if (mTextEmbeddingIsFp8 && table.getDataType() == nvinfer1::DataType::kFP8)
+    {
+        return std::cref(mTextEmbeddingScales);
+    }
+    return std::nullopt;
+}
+
 void Qwen3OmniTTSRuntime::appendTrailingToken(int32_t tokenId, rt::Tensor const& thinkerEmbedTable,
     rt::Tensor& trailingTextHidden, int32_t trailingIdx, cudaStream_t stream)
 {
@@ -2062,7 +2408,7 @@ void Qwen3OmniTTSRuntime::appendTrailingToken(int32_t tokenId, rt::Tensor const&
     // embeddingLookup expects [1, 1, H] output; mStreamingTokenEmbed is [1, H] — same memory, just reshape for kernel
     rt::Tensor embedView(mStreamingTokenEmbed.rawPointer(), rt::Coords{1, 1, mTalkerConfig.thinkerHiddenSize},
         rt::DeviceType::kGPU, nvinfer1::DataType::kHALF);
-    kernel::embeddingLookup(mStreamingTokenId, thinkerEmbedTable, std::nullopt, embedView, stream);
+    kernel::embeddingLookup(mStreamingTokenId, thinkerEmbedTable, scalesFor(thinkerEmbedTable), embedView, stream);
 
     // text_projection: mStreamingTokenEmbed [1, thinkerH] → mStreamingProjOut [1, talkerH]
     kernel::invokeTalkerMLP(mStreamingTokenEmbed, mTextFC1Weight, mTextFC1Bias, mTextFC2Weight, mTextFC2Bias,

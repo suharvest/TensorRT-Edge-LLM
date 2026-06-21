@@ -146,11 +146,62 @@ LLMEngineRunner::LLMEngineRunner(std::filesystem::path const& enginePath, std::f
     mEngine = std::unique_ptr<nvinfer1::ICudaEngine>(
         mRuntime->deserializeCudaEngine(mmapReader->getData(), mmapReader->getSize()));
 
+    // Engine is now available (owned). Run the shared per-instance initialization.
+    initFromEngine(configPath, loraWeightsMap, stream);
+}
+
+LLMEngineRunner::LLMEngineRunner(nvinfer1::ICudaEngine* borrowedEngine, std::filesystem::path const& configPath,
+    std::unordered_map<std::string, std::string> const& loraWeightsMap, cudaStream_t stream)
+{
+    if (borrowedEngine == nullptr)
+    {
+        LOG_ERROR("Shared-engine LLMEngineRunner constructed with a null borrowed engine");
+        throw std::runtime_error("Shared-engine LLMEngineRunner requires a non-null borrowed engine");
+    }
+
+    LOG_INFO("Loading config file %s (shared-engine ctor)", configPath.string().c_str());
+
+    // Parse configuration from JSON file (same as the path ctor; only the engine source differs).
+    Json configJson;
+    std::ifstream configFileStream(configPath);
+    if (!configFileStream.is_open())
+    {
+        LOG_ERROR("Failed to open config file: %s", configPath.string().c_str());
+        throw std::runtime_error("Failed to open config file: " + configPath.string());
+    }
+    try
+    {
+        configJson = Json::parse(configFileStream);
+        configFileStream.close();
+    }
+    catch (Json::parse_error const& e)
+    {
+        LOG_ERROR("Failed to parse config file with error: %s", e.what());
+        throw std::runtime_error("Failed to parse config file: " + configPath.string());
+    }
+
+    if (!this->initializeConfigFromJson(configJson))
+    {
+        LOG_ERROR("Failed to initialize LLMEngineRunner from config file: %s", configPath.string().c_str());
+        throw std::runtime_error("Failed to initialize LLMEngineRunner from config file: " + configPath.string());
+    }
+
+    // Reuse the borrowed (shared, read-only) engine weights. mRuntime/mEngine stay null:
+    // ownership remains with the slot-0 runner. Everything else (execution context, KV cache,
+    // RoPE cache, workspace) is allocated fresh and per-instance by initFromEngine().
+    mBorrowedEngine = borrowedEngine;
+
+    initFromEngine(configPath, loraWeightsMap, stream);
+}
+
+void LLMEngineRunner::initFromEngine(std::filesystem::path const& configPath,
+    std::unordered_map<std::string, std::string> const& loraWeightsMap, cudaStream_t stream)
+{
     // Use single executionContext for both prefill and generation.
     // Context memory is user-managed to enable sharing with other engines.
     // The caller must provide shared context memory via setContextMemory() before execution.
     mTRTExecutionContext = std::unique_ptr<nvinfer1::IExecutionContext>(
-        mEngine->createExecutionContext(ExecutionContextAllocationStrategy::kUSER_MANAGED));
+        enginePtr()->createExecutionContext(ExecutionContextAllocationStrategy::kUSER_MANAGED));
 
     if (trt_edgellm::layerProfiler::LayerProfiler::getInstance().isEnabled())
     {
@@ -159,10 +210,8 @@ LLMEngineRunner::LLMEngineRunner(std::filesystem::path const& enginePath, std::f
 
     if (!this->validateConfigFromEngine())
     {
-        LOG_ERROR("Failed to match config file %s with engine file: %s", configPath.string().c_str(),
-            enginePath.string().c_str());
-        throw std::runtime_error(
-            "Failed to match config file " + configPath.string() + " with engine file: " + enginePath.string());
+        LOG_ERROR("Failed to match config file %s with the loaded engine", configPath.string().c_str());
+        throw std::runtime_error("Failed to match config file " + configPath.string() + " with the loaded engine");
     }
 
     RopeConfig const& ropeConfig = mConfig.ropeConfig;
@@ -365,7 +414,7 @@ LLMEngineRunner::LLMEngineRunner(std::filesystem::path const& enginePath, std::f
     // The dummy buffer is used during CUDA graph capture and vanilla decoding when the caller
     // doesn't explicitly request hidden states output.
     {
-        bool const engineHasHiddenStates = engineHasOutputTensor(mEngine.get(), binding_names::kOutputHiddenStates);
+        bool const engineHasHiddenStates = engineHasOutputTensor(enginePtr(), binding_names::kOutputHiddenStates);
         if (mConfig.enableEagleSpecDecode || engineHasHiddenStates)
         {
             int64_t outputHiddenDim = mConfig.enableEagleSpecDecode ? mConfig.outputHiddenDim : mConfig.hiddenSize;
@@ -402,9 +451,10 @@ LLMEngineRunner::LLMEngineRunner(std::filesystem::path const& enginePath, std::f
     CUDA_CHECK(cudaStreamSynchronize(stream));
 }
 
+
 int64_t LLMEngineRunner::getRequiredContextMemorySize() const
 {
-    return mEngine->getDeviceMemorySizeV2();
+    return enginePtr()->getDeviceMemorySizeV2();
 }
 
 bool LLMEngineRunner::setContextMemory(rt::Tensor& sharedContextMemory)
@@ -425,25 +475,25 @@ nvinfer1::DataType LLMEngineRunner::getKVCacheType() const
     if (mConfig.useTrtNativeOps)
     {
         std::string const trtNativeKVBindingName0 = binding_names::formatKCacheName(/*layerIdx=*/0, /*isPast=*/true);
-        return mEngine->getTensorDataType(trtNativeKVBindingName0.c_str());
+        return enginePtr()->getTensorDataType(trtNativeKVBindingName0.c_str());
     }
     else
     {
         std::string const pluginKVBindingName0 = binding_names::formatKVCacheName(/*layerIdx=*/0, /*isPast=*/true);
-        return mEngine->getTensorDataType(pluginKVBindingName0.c_str());
+        return enginePtr()->getTensorDataType(pluginKVBindingName0.c_str());
     }
 }
 
 nvinfer1::DataType LLMEngineRunner::getRecurrentStateType() const
 {
     std::string const name = binding_names::formatRecurrentStateName(/*recurrentLayerIdx=*/0, /*isPast=*/true);
-    return mEngine->getTensorDataType(name.c_str());
+    return enginePtr()->getTensorDataType(name.c_str());
 }
 
 nvinfer1::DataType LLMEngineRunner::getConvStateType() const
 {
     std::string const name = binding_names::formatConvStateName(/*recurrentLayerIdx=*/0, /*isPast=*/true);
-    return mEngine->getTensorDataType(name.c_str());
+    return enginePtr()->getTensorDataType(name.c_str());
 }
 
 bool LLMEngineRunner::validateKVCacheType() const
@@ -453,13 +503,13 @@ bool LLMEngineRunner::validateKVCacheType() const
     if (mConfig.useTrtNativeOps)
     {
         auto kBindingName0 = binding_names::formatKCacheName(/*layerIdx=*/0, /*isPast=*/true);
-        DataType const kCacheType0 = mEngine->getTensorDataType(kBindingName0.c_str());
+        DataType const kCacheType0 = enginePtr()->getTensorDataType(kBindingName0.c_str());
         auto vBindingName0 = binding_names::formatVCacheName(/*layerIdx=*/0, /*isPast=*/true);
         auto const checkKVCacheDType = [&](int32_t layerIdx, bool isPast) {
             std::string const kBindingName = binding_names::formatKCacheName(layerIdx, isPast);
-            DataType const kCacheType = mEngine->getTensorDataType(kBindingName.c_str());
+            DataType const kCacheType = enginePtr()->getTensorDataType(kBindingName.c_str());
             std::string const vBindingName = binding_names::formatVCacheName(layerIdx, isPast);
-            DataType const vCacheType = mEngine->getTensorDataType(vBindingName.c_str());
+            DataType const vCacheType = enginePtr()->getTensorDataType(vBindingName.c_str());
             if (kCacheType != kCacheType0 || vCacheType != kCacheType0)
             {
                 LOG_ERROR(
@@ -482,10 +532,10 @@ bool LLMEngineRunner::validateKVCacheType() const
     else
     {
         auto kvBindingName0 = binding_names::formatKVCacheName(/*layerIdx=*/0, /*isPast=*/true);
-        DataType const kvCacheType = mEngine->getTensorDataType(kvBindingName0.c_str());
+        DataType const kvCacheType = enginePtr()->getTensorDataType(kvBindingName0.c_str());
         auto const checkKVCacheDType = [&](int32_t layerIdx, bool isPast) {
             std::string const kvBindingName = binding_names::formatKVCacheName(layerIdx, isPast);
-            DataType const dt = mEngine->getTensorDataType(kvBindingName.c_str());
+            DataType const dt = enginePtr()->getTensorDataType(kvBindingName.c_str());
             if (dt != kvCacheType)
             {
                 LOG_ERROR(
@@ -776,14 +826,14 @@ bool LLMEngineRunner::validateConfigFromEngine()
         return true;
     };
 
-    LOG_DEBUG("Prefill profile info: %s", printEngineInfo(mEngine.get(), kPREFILL_PROFILE_INDEX).c_str());
-    LOG_DEBUG("Generation profile info: %s", printEngineInfo(mEngine.get(), kGENERATION_PROFILE_INDEX).c_str());
+    LOG_DEBUG("Prefill profile info: %s", printEngineInfo(enginePtr(), kPREFILL_PROFILE_INDEX).c_str());
+    LOG_DEBUG("Generation profile info: %s", printEngineInfo(enginePtr(), kGENERATION_PROFILE_INDEX).c_str());
 
     int32_t nbKVCacheInputs{0};
     int32_t nbTRTNativeKCacheInputs{0};
     int32_t nbTRTNativeVCacheInputs{0};
     int32_t nbDeepstackEmbedsInputs{0};
-    int32_t numIOBindings = mEngine->getNbIOTensors();
+    int32_t numIOBindings = enginePtr()->getNbIOTensors();
 
     // Lambda to validate KV cache dimensions against profile shape.
     // Uses per-layer config when available (heterogeneous models), falls back to scalar config.
@@ -806,16 +856,16 @@ bool LLMEngineRunner::validateConfigFromEngine()
     bool isOk{true};
     for (int32_t i = 0; i < numIOBindings; ++i)
     {
-        std::string const bindingName = mEngine->getIOTensorName(i);
-        Dims const tensorDim = mEngine->getTensorShape(bindingName.c_str());
+        std::string const bindingName = enginePtr()->getIOTensorName(i);
+        Dims const tensorDim = enginePtr()->getTensorShape(bindingName.c_str());
 
         if (identifyKVCacheBinding(bindingName, tensorDim))
         {
             // Get max profile shapes for both prefill and generation profiles
             Dims const maxKVCacheShapePrefill
-                = mEngine->getProfileShape(bindingName.c_str(), kPREFILL_PROFILE_INDEX, OptProfileSelector::kMAX);
+                = enginePtr()->getProfileShape(bindingName.c_str(), kPREFILL_PROFILE_INDEX, OptProfileSelector::kMAX);
             Dims const maxKVCacheShapeGen
-                = mEngine->getProfileShape(bindingName.c_str(), kGENERATION_PROFILE_INDEX, OptProfileSelector::kMAX);
+                = enginePtr()->getProfileShape(bindingName.c_str(), kGENERATION_PROFILE_INDEX, OptProfileSelector::kMAX);
 
             // Validate both profiles (nbKVCacheInputs is the local KV layer index)
             isOk &= validateKVCacheProfile(maxKVCacheShapePrefill, "prefill", nbKVCacheInputs);
@@ -907,7 +957,7 @@ bool LLMEngineRunner::validateConfigFromEngine()
         mConfig.numDeepstackFeatures, nbDeepstackEmbedsInputs, "numDeepstackFeatures");
 
     Dims const maxInputPrefillShape
-        = mEngine->getProfileShape(binding_names::kInputsEmbeds, kPREFILL_PROFILE_INDEX, OptProfileSelector::kMAX);
+        = enginePtr()->getProfileShape(binding_names::kInputsEmbeds, kPREFILL_PROFILE_INDEX, OptProfileSelector::kMAX);
 
     // inputs_embeds is 3D: [batch_size, seq_len, hidden_size]
     isOk &= validate_eq_engine_with_config(
@@ -920,11 +970,11 @@ bool LLMEngineRunner::validateConfigFromEngine()
 
     // Obtain vocab size from the engine.
     // Logits shape is [batch_size, num_tokens/num_selected_tokens, vocab_size] for both EAGLE and vanilla models
-    Dims const logitsDim = mEngine->getTensorShape(binding_names::kLogits);
+    Dims const logitsDim = enginePtr()->getTensorShape(binding_names::kLogits);
     isOk &= validate_eq_engine_with_config(mConfig.outputVocabSize, logitsDim.d[2], "outputVocabSize");
 
     // Obtain rotary dim from the engine.
-    Dims const ropeCosSinCacheDim = mEngine->getTensorShape(binding_names::kRopeCosSin);
+    Dims const ropeCosSinCacheDim = enginePtr()->getTensorShape(binding_names::kRopeCosSin);
     isOk &= validate_eq_engine_with_config(mConfig.rotaryDim, ropeCosSinCacheDim.d[2], "rotaryDim");
 
     if (!isOk)
@@ -2009,7 +2059,7 @@ bool LLMEngineRunner::resetLoraWeights()
     for (auto const& loraWeightsTensorName : getLoraWeightsTensorNames())
     {
         nvinfer1::Dims emptyLoraShape
-            = mEngine->getProfileShape(loraWeightsTensorName.c_str(), 0, nvinfer1::OptProfileSelector::kMAX);
+            = enginePtr()->getProfileShape(loraWeightsTensorName.c_str(), 0, nvinfer1::OptProfileSelector::kMAX);
 
         // Use dummy tensor as zero tensor for LoRA weights
         resetStatus
@@ -2092,10 +2142,10 @@ std::vector<std::string> LLMEngineRunner::getLoraWeightsTensorNames() const
 {
     std::vector<std::string> loraWeightsTensorNames;
     // Get the number of bindings in the engine
-    int32_t numBindings = mEngine->getNbIOTensors();
+    int32_t numBindings = enginePtr()->getNbIOTensors();
     for (int32_t i = 0; i < numBindings; ++i)
     {
-        char const* bindingName = mEngine->getIOTensorName(i);
+        char const* bindingName = enginePtr()->getIOTensorName(i);
         std::string bindingNameStr(bindingName);
         if (binding_names::isLoraBinding(bindingNameStr))
         {
@@ -2156,7 +2206,7 @@ bool LLMEngineRunner::switchLoraWeights(std::string const& loraWeightsName)
         {
             // Tensor not found in this LoRA adapter, use dummy tensor as zero tensor with shape kEMPTY_LORA_RANK
             nvinfer1::Dims shape
-                = mEngine->getProfileShape(loraWeightsTensorName.c_str(), 0, nvinfer1::OptProfileSelector::kMAX);
+                = enginePtr()->getProfileShape(loraWeightsTensorName.c_str(), 0, nvinfer1::OptProfileSelector::kMAX);
             if (loraWeightsTensorName.find(binding_names::kLoraAPrefix) != std::string::npos)
             {
                 // LoRA A has shape [k, rank], set rank to kEMPTY_LORA_RANK
@@ -2220,7 +2270,7 @@ int32_t LLMEngineRunner::getMaxLoraWeightsDimension() const
     for (auto const& loraWeightsTensorName : getLoraWeightsTensorNames())
     {
         nvinfer1::Dims maxShape
-            = mEngine->getProfileShape(loraWeightsTensorName.c_str(), 0, nvinfer1::OptProfileSelector::kMAX);
+            = enginePtr()->getProfileShape(loraWeightsTensorName.c_str(), 0, nvinfer1::OptProfileSelector::kMAX);
 
         if (loraWeightsTensorName.find(binding_names::kLoraAPrefix) != std::string::npos)
         {

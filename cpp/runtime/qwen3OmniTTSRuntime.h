@@ -23,6 +23,7 @@
 #include "runtime/llmInferenceRuntime.h"
 #include "runtime/llmRuntimeUtils.h"
 #include "tokenizer/tokenizer.h"
+#include <functional>
 #include <memory>
 #include <string>
 #include <unordered_map>
@@ -95,8 +96,38 @@ public:
     Qwen3OmniTTSRuntime(std::string const& talkerEngineDir, std::string const& codePredictorEngineDir,
         std::string const& tokenizerDir, cudaStream_t stream);
 
+    /*!
+     * @brief Construct a TTS runtime that SHARES talker/code-predictor engine weights with another runtime.
+     *
+     * Reuses the borrowed (read-only) Talker and CodePredictor ICudaEngines from an existing runtime
+     * (e.g. slot 0) instead of re-deserializing them, which halves per-slot weight memory. Directories
+     * are still required for the non-engine assets (tokenizer, embedding tables, codec embeddings) which
+     * are loaded per-instance. Each runtime still allocates its own execution contexts, KV caches, and
+     * workspace via the borrowed-engine LLMEngineRunner ctor, so concurrent slots never contend.
+     *
+     * @param talkerEngine Non-owning Talker engine to reuse (from getTalkerEngine() of another runtime; must not be null)
+     * @param codePredictorEngine Non-owning CodePredictor engine to reuse (must not be null)
+     * @param talkerEngineDir Directory with talker non-engine assets (config, MLP weights, embedding table)
+     * @param codePredictorEngineDir Directory with code_predictor config + codec embeddings
+     * @param tokenizerDir Directory containing tokenizer files. If empty, defaults to talkerEngineDir/../
+     * @param stream CUDA stream for operations
+     * @throws std::runtime_error on any initialization failure
+     */
+    Qwen3OmniTTSRuntime(nvinfer1::ICudaEngine* talkerEngine, nvinfer1::ICudaEngine* codePredictorEngine,
+        std::string const& talkerEngineDir, std::string const& codePredictorEngineDir,
+        std::string const& tokenizerDir, cudaStream_t stream);
+
     //! @brief Destructor
     ~Qwen3OmniTTSRuntime();
+
+    //! @brief Borrowed (non-owning) Talker engine pointer, for sharing across slot-pool instances.
+    nvinfer1::ICudaEngine* getTalkerEngine() const { return mTalkerLLMRunner ? mTalkerLLMRunner->getEngine() : nullptr; }
+
+    //! @brief Borrowed (non-owning) CodePredictor engine pointer, for sharing across slot-pool instances.
+    nvinfer1::ICudaEngine* getCodePredictorEngine() const
+    {
+        return mCodePredictorRunner ? mCodePredictorRunner->getEngine() : nullptr;
+    }
 
     // ========== Core API ==========
 
@@ -106,6 +137,11 @@ public:
      * Contains sampling parameters and input data for audio generation.
      * Sampling parameters are provided per-request (not from config.json).
      */
+    //! Standalone-TTS streaming chunk callback: (chunkRvqCodes [numFrames][numCodesPerFrame], batchIdx, isFinal).
+    //! Distinct from the 1-param AudioChunkCallback used by the Thinker→Talker ThinkerTalkerStreamingConfig below.
+    using StreamingChunkCallback
+        = std::function<void(std::vector<std::vector<int32_t>> const& chunkRvqCodes, int32_t batchIdx, bool isFinal)>;
+
     struct TalkerGenerationRequest
     {
         int32_t maxAudioLength{4096}; //!< Maximum number of audio codec tokens to generate
@@ -120,12 +156,27 @@ public:
         // Speaker selection (optional, defaults to config default)
         std::string speakerName{""}; //!< Speaker name (e.g., "f245", "m02") - empty means use default
         int32_t speakerId{-1};       //!< Speaker ID - if >= 0, overrides speakerName
+        //! BASE PORT: optional external speaker embedding [talkerHiddenSize] (from speaker_encoder /
+        //! reference audio). When non-empty, row-6 of the assistant preamble uses this vector directly
+        //! instead of the CustomVoice speakerId embedding-table lookup. Empty = CustomVoice token path.
+        std::vector<float> speakerEmbedding;
 
         // Input: conversation messages for this request (runtime tokenizes internally)
         std::vector<Message> messages;
         bool applyChatTemplate{true};   //!< Whether to apply chat template formatting
         bool addGenerationPrompt{true}; //!< Whether to add generation prompt at the end
         bool enableThinking{false};     //!< Whether to enable thinking mode
+
+        // ===== Optional streaming hooks (standalone-TTS streaming path) =====
+        //! Emit a chunk every N audio frames. 0 = disabled (non-streaming behavior). Applies to the FIRST chunk.
+        int32_t codecChunkFrames{0};
+        //! Size of subsequent emitted chunks after the first. 0 means reuse codecChunkFrames.
+        int32_t subsequentChunkFrames{0};
+        //! Invoked from the Talker decode loop when codecChunkFrames frames accumulate, and once more at
+        //! end-of-generation with isFinal=true for any remainder. Signature: (chunkRvqCodes [N][codes], batchIdx, isFinal).
+        StreamingChunkCallback onAudioChunkReady{};
+        //! Optional polled cancel hook. Returning true cancels the request mid-stream.
+        std::function<bool()> shouldCancel{};
     };
 
     /*!
@@ -363,6 +414,7 @@ private:
         std::unordered_set<int32_t> seenTokenSet;   //!< Host-side seen tokens for repetition penalty
         int32_t numSeenTokens{0};                   //!< Count of unique seen tokens
         std::vector<std::vector<int32_t>> rvqCodes; //!< Generated RVQ codes [numFrames][numCodesPerFrame]
+        int32_t lastChunkEnd{0}; //!< Frame index of last emitted streaming chunk (standalone-TTS streaming path)
     };
 
     /*!
@@ -384,10 +436,21 @@ private:
      */
     //! @param prefillSeqLens Per-batch prefill sequence lengths for correct hidden-state extraction
     //!        after batched prefill with padding. Empty for single-batch callers.
+    //! Optional per-batch streaming hook bundle (standalone-TTS streaming path).
+    //! Empty vector disables streaming (preserves non-streaming behavior).
+    struct PerBatchStreamingHooks
+    {
+        int32_t codecChunkFrames{0};      //!< Size of the first emitted chunk.
+        int32_t subsequentChunkFrames{0}; //!< Size of subsequent chunks (0 = reuse codecChunkFrames).
+        StreamingChunkCallback onAudioChunkReady{};
+        std::function<bool()> shouldCancel{};
+    };
+
     bool runTalkerGenerationLoop(std::vector<PerBatchTalkerState>& states, int32_t activeBatchSize, int32_t maxFrames,
         SamplingParams const& talkerSamplingParams, SamplingParams const& predictorSamplingParams,
         float repetitionPenalty, std::vector<rt::Tensor const*> const& trailingTextHiddens, cudaStream_t stream,
-        std::vector<int64_t> const& prefillSeqLens = {});
+        std::vector<int64_t> const& prefillSeqLens = {},
+        std::vector<PerBatchStreamingHooks> const& streamingHooks = {});
 
     /*!
      * @brief Run a single Talker decode frame (used by the Thinker-Talker streaming path).
@@ -486,6 +549,9 @@ private:
      * @return True on success, false on failure
      */
     bool initializeEngineRunners(std::string const& talkerEngineDir, std::string const& codePredictorEngineDir);
+    //! @brief Build the Talker + CodePredictor runners from borrowed (shared, read-only) engines.
+    bool initializeEngineRunnersShared(nvinfer1::ICudaEngine* talkerEngine, nvinfer1::ICudaEngine* codePredictorEngine,
+        std::string const& talkerEngineDir, std::string const& codePredictorEngineDir);
 
     /*!
      * @brief Load CodePredictor lm_head weights and small_to_mtp_projection
@@ -540,6 +606,8 @@ private:
 
     // ========== Embedding Tables ==========
     rt::Tensor mTextEmbeddingTable; //!< Text embedding table [thinkerVocabSize, thinkerHiddenSize] (for standalone TTS)
+    rt::Tensor mTextEmbeddingScales; //!< FP8 per-group scales [vocabSize, hiddenSize/blockSize] FP32 (empty when table is FP16)
+    bool mTextEmbeddingIsFp8{false}; //!< true when mTextEmbeddingTable is FP8 e4m3 (then mTextEmbeddingScales is used)
     rt::Tensor mTalkerEmbeddingTable; //!< Talker LLM embedding table [vocabSize, hiddenSize]
     std::vector<rt::Tensor>
         mCodePredictorEmbeddingTables; //!< CodePredictor embedding tables (mNumRvqLayers) [codebookSize, hiddenSize]
@@ -552,6 +620,7 @@ private:
     // TTS special token embeddings (initialized from thinker embedding table)
     // Initialized in constructor from Thinker embedding table
     rt::Tensor mTtsPadEmbed; //!< TTS pad embedding [talkerHiddenSize] FP16
+    rt::Tensor mSpeakerEmbeddingBuffer; //!< BASE PORT: external speaker embedding [talkerHiddenSize] FP16 (row-6 conditioning)
     rt::Tensor mTtsBosEmbed; //!< TTS bos embedding [talkerHiddenSize] FP16
     rt::Tensor mTtsEosEmbed; //!< TTS eos embedding [talkerHiddenSize] FP16
 
@@ -620,7 +689,8 @@ private:
      * @return True on success, false on failure
      */
     bool projectToTalkerInput(rt::Tensor const& thinkerEmbed, int32_t speakerId, rt::Tensor& output,
-        int64_t& outputSeqLen, cudaStream_t stream);
+        int64_t& outputSeqLen, cudaStream_t stream,
+        std::vector<float> const& speakerEmbedding = {});
 
     //! Embed token IDs, run MLP projection, and reshape buffers ready for Talker prefill.
     //! Populates mTalkerInputEmbeds and mTalkerHiddenStatesBuffer as side effects.
@@ -683,6 +753,10 @@ private:
      */
     void appendTrailingToken(int32_t tokenId, rt::Tensor const& thinkerEmbedTable, rt::Tensor& trailingTextHidden,
         int32_t trailingIdx, cudaStream_t stream);
+
+    //! \brief Returns the FP8 dequant scales iff \p table is the FP8 text-embedding table (by pointer identity);
+    //! otherwise std::nullopt. Lets every embeddingLookup call attach scales uniformly and safely.
+    rt::OptionalInputTensor scalesFor(rt::Tensor const& table) const;
 
     /*!
      * @brief Append tts_eos embedding at the end of trailingTextHidden
