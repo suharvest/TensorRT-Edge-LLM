@@ -25,6 +25,13 @@ if(TARGET trt_edgellm_cutedsl_cudart_shim)
 endif()
 
 add_cross_build_link_options(qwen3_tts_inference)
+# CuTe DSL artifact (Talker MLP GEMM) references cudaKernelSetAttributeForDevice
+# (a CUDA >=12.9 runtime symbol). On CUDA 12.6 toolchains the symbol is provided by
+# this shim, linked whole-archive exactly as the LLM examples do.
+if(TARGET trt_edgellm_cutedsl_cudart_shim)
+  target_link_libraries(qwen3_tts_inference PRIVATE
+    "-Wl,--whole-archive" trt_edgellm_cutedsl_cudart_shim "-Wl,--no-whole-archive")
+endif()
 
 # Set output directory
 set_target_properties(
