@@ -102,8 +102,33 @@ public:
     LLMEngineRunner(std::filesystem::path const& enginePath, std::filesystem::path const& configPath,
         std::unordered_map<std::string, std::string> const& loraWeightsMap, cudaStream_t stream);
 
+    /*!
+     * @brief Construct LLM engine runner from a borrowed (shared, read-only) TensorRT engine.
+     *
+     * Reuses an already-deserialized ICudaEngine owned by another LLMEngineRunner instance
+     * (the engine weights are read-only and safe to share across slots). This instance does
+     * NOT take ownership of the engine and must outlive nothing beyond it. Every other
+     * resource — the per-instance IExecutionContext (kUSER_MANAGED), KV/recurrent cache,
+     * RoPE cache, and all workspace tensors — is allocated fresh and is NOT shared, so
+     * concurrent slots never contend.
+     *
+     * @param borrowedEngine Non-owning pointer to a live, deserialized engine to reuse (must not be null)
+     * @param configPath Path to the model configuration file (same engine/config pairing as the owner)
+     * @param loraWeightsMap Map of LoRA weight names to file paths
+     * @param stream CUDA stream for operations
+     * @throws std::runtime_error If configuration parsing or per-instance initialization fails, or a CUDA
+     * operation fails
+     */
+    LLMEngineRunner(nvinfer1::ICudaEngine* borrowedEngine, std::filesystem::path const& configPath,
+        std::unordered_map<std::string, std::string> const& loraWeightsMap, cudaStream_t stream);
+
     //! @brief Destructor
     ~LLMEngineRunner() noexcept;
+
+    //! @brief Get the borrowed (non-owning) TensorRT engine pointer for sharing across slots.
+    //! @return Raw pointer to the live ICudaEngine (owned by this runner via mEngine, or borrowed).
+    //! @note The returned engine is read-only weights shared state; callers must NOT delete it.
+    nvinfer1::ICudaEngine* getEngine() const noexcept { return mEngine ? mEngine.get() : mBorrowedEngine; }
 
     /*!
      * @brief Get the required context memory size for this engine
@@ -249,6 +274,7 @@ public:
 private:
     std::unique_ptr<nvinfer1::IRuntime> mRuntime;                      //!< TensorRT runtime
     std::unique_ptr<nvinfer1::ICudaEngine> mEngine;                    //!< TensorRT engine
+    nvinfer1::ICudaEngine* mBorrowedEngine{nullptr};                  //!< Non-owning engine (shared-engine ctor)
     std::unique_ptr<nvinfer1::IExecutionContext> mTRTExecutionContext; //!< Prefill and Generation execution context
 
     //! Holds the CUDA graph captured for the decoding step. Each CUDA graph is associated with a unique key value
@@ -304,6 +330,15 @@ private:
      * @param configJson JSON configuration object
      * @return True on success, false on failure
      */
+    //! @brief Active engine pointer: owned (mEngine) or borrowed (mBorrowedEngine).
+    nvinfer1::ICudaEngine* enginePtr() const noexcept { return mEngine ? mEngine.get() : mBorrowedEngine; }
+
+    //! @brief Shared per-instance initialization after the engine is available (owned or borrowed).
+    //! Creates the kUSER_MANAGED execution context, RoPE cache, KV/recurrent cache, and all workspace
+    //! tensors. Both constructors funnel through this so the two paths stay in lockstep.
+    void initFromEngine(std::filesystem::path const& configPath,
+        std::unordered_map<std::string, std::string> const& loraWeightsMap, cudaStream_t stream);
+
     bool initializeConfigFromJson(Json const& configJson) noexcept;
 
     /*!

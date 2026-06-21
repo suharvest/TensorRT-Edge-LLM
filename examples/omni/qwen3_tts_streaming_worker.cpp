@@ -759,14 +759,23 @@ bool initSlotPool(Args const& args, bool useStateful, bool useAsyncVocode, int64
             slot->inUse.store(false);
             CUDA_CHECK(cudaStreamCreate(&slot->stream));
 
-            // BASE PORT (v0.8.0): every slot deserializes its OWN Talker + CodePredictor engines via the
-            // path-based ctor. The D2-1 shared-engine ctor (slots 1..N-1 sharing slot 0's ICudaEngines to
-            // halve weight memory) is DEFERRED — it needs LLMEngineRunner::getEngine() + a shared-engine ctor
-            // that are not on v0.8.0's runtime yet. N=1 is unaffected (single slot, single deserialize). For
-            // N>1 this means independent instances (more VRAM) — validate the 8GB Orin Nano budget with
-            // tegrastats before raising --max_slots, and re-introduce the shared-engine ctor as the OOM fix.
-            slot->runtime = std::make_unique<Qwen3OmniTTSRuntime>(
-                args.talkerEngineDir, args.codePredictorEngineDir, args.tokenizerDir, slot->stream);
+            // D2-1 shared-engine pool: slot 0 deserializes its OWN Talker + CodePredictor engines via the
+            // path-based ctor; slots 1..N-1 SHARE slot 0's borrowed (read-only) ICudaEngines via the
+            // shared-engine ctor — halving per-slot weight memory. Each slot still gets its own execution
+            // contexts, KV caches, workspace, Code2Wav, CUDA stream and worker thread, so concurrent slots
+            // never contend. N=1 is unaffected (single slot, single deserialize).
+            if (i == 0)
+            {
+                slot->runtime = std::make_unique<Qwen3OmniTTSRuntime>(
+                    args.talkerEngineDir, args.codePredictorEngineDir, args.tokenizerDir, slot->stream);
+            }
+            else
+            {
+                Qwen3OmniTTSRuntime* owner = slots.front()->runtime.get();
+                slot->runtime = std::make_unique<Qwen3OmniTTSRuntime>(owner->getTalkerEngine(),
+                    owner->getCodePredictorEngine(), args.talkerEngineDir, args.codePredictorEngineDir,
+                    args.tokenizerDir, slot->stream);
+            }
 
             // Per-slot STATELESS Code2Wav. Each owns its own engine+context+buffers,
             // so concurrent slots never contend (avoids the StatefulCode2WavRunner

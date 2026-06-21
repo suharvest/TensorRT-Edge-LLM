@@ -96,8 +96,38 @@ public:
     Qwen3OmniTTSRuntime(std::string const& talkerEngineDir, std::string const& codePredictorEngineDir,
         std::string const& tokenizerDir, cudaStream_t stream);
 
+    /*!
+     * @brief Construct a TTS runtime that SHARES talker/code-predictor engine weights with another runtime.
+     *
+     * Reuses the borrowed (read-only) Talker and CodePredictor ICudaEngines from an existing runtime
+     * (e.g. slot 0) instead of re-deserializing them, which halves per-slot weight memory. Directories
+     * are still required for the non-engine assets (tokenizer, embedding tables, codec embeddings) which
+     * are loaded per-instance. Each runtime still allocates its own execution contexts, KV caches, and
+     * workspace via the borrowed-engine LLMEngineRunner ctor, so concurrent slots never contend.
+     *
+     * @param talkerEngine Non-owning Talker engine to reuse (from getTalkerEngine() of another runtime; must not be null)
+     * @param codePredictorEngine Non-owning CodePredictor engine to reuse (must not be null)
+     * @param talkerEngineDir Directory with talker non-engine assets (config, MLP weights, embedding table)
+     * @param codePredictorEngineDir Directory with code_predictor config + codec embeddings
+     * @param tokenizerDir Directory containing tokenizer files. If empty, defaults to talkerEngineDir/../
+     * @param stream CUDA stream for operations
+     * @throws std::runtime_error on any initialization failure
+     */
+    Qwen3OmniTTSRuntime(nvinfer1::ICudaEngine* talkerEngine, nvinfer1::ICudaEngine* codePredictorEngine,
+        std::string const& talkerEngineDir, std::string const& codePredictorEngineDir,
+        std::string const& tokenizerDir, cudaStream_t stream);
+
     //! @brief Destructor
     ~Qwen3OmniTTSRuntime();
+
+    //! @brief Borrowed (non-owning) Talker engine pointer, for sharing across slot-pool instances.
+    nvinfer1::ICudaEngine* getTalkerEngine() const { return mTalkerLLMRunner ? mTalkerLLMRunner->getEngine() : nullptr; }
+
+    //! @brief Borrowed (non-owning) CodePredictor engine pointer, for sharing across slot-pool instances.
+    nvinfer1::ICudaEngine* getCodePredictorEngine() const
+    {
+        return mCodePredictorRunner ? mCodePredictorRunner->getEngine() : nullptr;
+    }
 
     // ========== Core API ==========
 
@@ -519,6 +549,9 @@ private:
      * @return True on success, false on failure
      */
     bool initializeEngineRunners(std::string const& talkerEngineDir, std::string const& codePredictorEngineDir);
+    //! @brief Build the Talker + CodePredictor runners from borrowed (shared, read-only) engines.
+    bool initializeEngineRunnersShared(nvinfer1::ICudaEngine* talkerEngine, nvinfer1::ICudaEngine* codePredictorEngine,
+        std::string const& talkerEngineDir, std::string const& codePredictorEngineDir);
 
     /*!
      * @brief Load CodePredictor lm_head weights and small_to_mtp_projection
