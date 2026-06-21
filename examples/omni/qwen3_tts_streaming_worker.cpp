@@ -343,8 +343,12 @@ Qwen3OmniTTSRuntime::TalkerGenerationRequest buildRequest(Json const& item)
     req.talkerTopK = item.value("talker_top_k", 50);
     req.talkerTopP = item.value("talker_top_p", 1.0f);
     req.repetitionPenalty = item.value("repetition_penalty", 1.05f);
-    // NOTE (base port): codec_eos_logit_offset / predictor_* / language are CustomVoice-only fields not present
-    // on the v0.8.0 base TalkerGenerationRequest — intentionally dropped. Base uses a fixed speaker.
+    // NOTE (base port): codec_eos_logit_offset / predictor_* are CustomVoice-only fields not present
+    // on the v0.8.0 base TalkerGenerationRequest — still dropped. Base uses a fixed speaker.
+    // CustomVoice language conditioning: pass per-request language through to the runtime, which maps
+    // it to a codec language id and selects the 9-row prefix. Empty string => langId=-1 => 8-row Base
+    // path (unchanged), so omitting "language" keeps the Base behavior intact.
+    req.language = item.value("language", "");
     req.speakerName = item.value("speaker", "");
     req.speakerId = item.value("speaker_id", -1);
     // BASE PORT: optional precomputed external speaker embedding (base64 LE float32 array). When present,
