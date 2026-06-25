@@ -21,6 +21,7 @@
 
 #include <algorithm>
 #include <cassert>
+#include <cuda_bf16.h>
 #include <cuda_fp16.h>
 #include <mutex>
 #include <optional>
@@ -46,11 +47,13 @@ std::vector<PluginField> Int4GroupwiseGemmPluginCreator::mPluginAttributes;
 
 REGISTER_TENSORRT_PLUGIN(Int4GroupwiseGemmPluginCreator);
 
-Int4GroupwiseGemmPlugin::Int4GroupwiseGemmPlugin(std::string const& name, int32_t N, int32_t K, int32_t groupSize)
+Int4GroupwiseGemmPlugin::Int4GroupwiseGemmPlugin(
+    std::string const& name, int32_t N, int32_t K, int32_t groupSize, DataType outputType)
     : mLayerName(name)
     , mGemmN(N)
     , mGemmK(K)
     , mGroupSize(groupSize)
+    , mOutputType(outputType)
 {
 }
 
@@ -71,6 +74,12 @@ Int4GroupwiseGemmPlugin::Int4GroupwiseGemmPlugin(std::string const& name, Plugin
         else if (fieldName == "group_size")
         {
             mGroupSize = *static_cast<int32_t const*>(fc->fields[i].data);
+        }
+        else if (fieldName == "output_dtype")
+        {
+            // Optional, opt-in. Absent -> kHALF (legacy, byte-identical). Stored as the
+            // nvinfer1::DataType enum value cast to int32.
+            mOutputType = static_cast<DataType>(*static_cast<int32_t const*>(fc->fields[i].data));
         }
     }
 }
@@ -101,7 +110,7 @@ IPluginV3* Int4GroupwiseGemmPlugin::clone() noexcept
 {
     try
     {
-        auto* plugin = new Int4GroupwiseGemmPlugin(mLayerName, mGemmN, mGemmK, mGroupSize);
+        auto* plugin = new Int4GroupwiseGemmPlugin(mLayerName, mGemmN, mGemmK, mGroupSize, mOutputType);
         plugin->setPluginNamespace(mNamespace.c_str());
         return plugin;
     }
@@ -142,7 +151,8 @@ int32_t Int4GroupwiseGemmPlugin::getOutputDataTypes(DataType* outputTypes, [[may
     try
     {
         assert(nbOutputs == 1);
-        outputTypes[0] = DataType::kHALF;
+        // kHALF by default (legacy). Opt-in kBF16 enables the overflow-safe path.
+        outputTypes[0] = mOutputType;
         return 0;
     }
     catch (std::exception const& e)
@@ -211,7 +221,8 @@ bool Int4GroupwiseGemmPlugin::supportsFormatCombination(int32_t pos, DynamicPlug
         }
         case 3:
         {
-            status &= tensorDesc.type == DataType::kHALF;
+            // Output dtype follows mOutputType: kHALF (legacy) or kBF16 (opt-in).
+            status &= tensorDesc.type == mOutputType;
             status &= tensorDesc.format == PluginFormat::kLINEAR;
             status &= tensorDesc.dims.nbDims == 3;
             status &= tensorDesc.dims.d[2] == mGemmN;
@@ -250,7 +261,6 @@ int32_t Int4GroupwiseGemmPlugin::enqueue(PluginTensorDesc const* inputDesc, Plug
         half* gemmInPtr = reinterpret_cast<half*>(const_cast<void*>(inputs[0]));
         int8_t* weightsInPtr = reinterpret_cast<int8_t*>(const_cast<void*>(inputs[1]));
         half* ScaleInPtr = reinterpret_cast<half*>(const_cast<void*>(inputs[2]));
-        half* gemmOutDevicePtr = reinterpret_cast<half*>(outputs[0]);
 
         // gemm_forward_cuda_new requires N divisible by its CTA_N tile size (128).
         // Smaller / non-aligned N (e.g. GDN's in_proj_a / in_proj_b = num_recurrent_heads
@@ -260,19 +270,45 @@ int32_t Int4GroupwiseGemmPlugin::enqueue(PluginTensorDesc const* inputDesc, Plug
         // solutions: 1) Add more GEMV instantiations for larger M (e.g. 8, 16, 32). 2) Add a fallback GEMV kernel that
         // can handle arbitrary M without template instantiation (e.g. using dynamic shared memory).
         bool const useGemv = (M <= trt_edgellm::kernel::kGemvMaxM) || (mGemmN % trt_edgellm::kernel::kGemmCtaN != 0);
-        if (useGemv)
+
+        // Activation input stays FP16 in both paths; only the output dtype differs.
+        // kBF16 (opt-in) routes to the FP32-accumulate / BF16-store kernels that avoid
+        // the FP16 output overflow on overflow-prone linears (e.g. down_proj).
+        if (mOutputType == DataType::kBF16)
         {
-            for (int32_t m_start = 0; m_start < M; m_start += trt_edgellm::kernel::kGemvMaxM)
+            __nv_bfloat16* gemmOutDevicePtr = reinterpret_cast<__nv_bfloat16*>(outputs[0]);
+            if (useGemv)
             {
-                int32_t const m_chunk = std::min(trt_edgellm::kernel::kGemvMaxM, M - m_start);
-                trt_edgellm::kernel::gemv_forward_cuda_new(gemmInPtr + m_start * mGemmK, weightsInPtr, ScaleInPtr,
-                    gemmOutDevicePtr + m_start * mGemmN, m_chunk, mGemmN, mGemmK, mGroupSize, stream);
+                for (int32_t m_start = 0; m_start < M; m_start += trt_edgellm::kernel::kGemvMaxM)
+                {
+                    int32_t const m_chunk = std::min(trt_edgellm::kernel::kGemvMaxM, M - m_start);
+                    trt_edgellm::kernel::gemv_forward_cuda_new_bf16(gemmInPtr + m_start * mGemmK, weightsInPtr,
+                        ScaleInPtr, gemmOutDevicePtr + m_start * mGemmN, m_chunk, mGemmN, mGemmK, mGroupSize, stream);
+                }
+            }
+            else
+            {
+                trt_edgellm::kernel::gemm_forward_cuda_new_bf16(
+                    gemmInPtr, weightsInPtr, ScaleInPtr, gemmOutDevicePtr, M, mGemmN, mGemmK, mGroupSize, stream);
             }
         }
         else
         {
-            trt_edgellm::kernel::gemm_forward_cuda_new(
-                gemmInPtr, weightsInPtr, ScaleInPtr, gemmOutDevicePtr, M, mGemmN, mGemmK, mGroupSize, stream);
+            half* gemmOutDevicePtr = reinterpret_cast<half*>(outputs[0]);
+            if (useGemv)
+            {
+                for (int32_t m_start = 0; m_start < M; m_start += trt_edgellm::kernel::kGemvMaxM)
+                {
+                    int32_t const m_chunk = std::min(trt_edgellm::kernel::kGemvMaxM, M - m_start);
+                    trt_edgellm::kernel::gemv_forward_cuda_new(gemmInPtr + m_start * mGemmK, weightsInPtr, ScaleInPtr,
+                        gemmOutDevicePtr + m_start * mGemmN, m_chunk, mGemmN, mGemmK, mGroupSize, stream);
+                }
+            }
+            else
+            {
+                trt_edgellm::kernel::gemm_forward_cuda_new(
+                    gemmInPtr, weightsInPtr, ScaleInPtr, gemmOutDevicePtr, M, mGemmN, mGemmK, mGroupSize, stream);
+            }
         }
         return 0;
     }
@@ -299,6 +335,10 @@ PluginFieldCollection const* Int4GroupwiseGemmPlugin::getFieldsToSerialize() noe
     mDataToSerialize.emplace_back("gemm_n", &mGemmN, PluginFieldType::kINT32, 1);
     mDataToSerialize.emplace_back("gemm_k", &mGemmK, PluginFieldType::kINT32, 1);
     mDataToSerialize.emplace_back("group_size", &mGroupSize, PluginFieldType::kINT32, 1);
+    // Persist the output dtype so a deserialized engine restores the opt-in BF16
+    // path. mOutputTypeSerialized backs the field pointer for the lifetime of the FC.
+    mOutputTypeSerialized = static_cast<int32_t>(mOutputType);
+    mDataToSerialize.emplace_back("output_dtype", &mOutputTypeSerialized, PluginFieldType::kINT32, 1);
 
     mFCToSerialize.nbFields = mDataToSerialize.size();
     mFCToSerialize.fields = mDataToSerialize.data();
@@ -314,6 +354,8 @@ Int4GroupwiseGemmPluginCreator::Int4GroupwiseGemmPluginCreator()
     mPluginAttributes.emplace_back(PluginField("gemm_n", nullptr, PluginFieldType::kINT32, 1));
     mPluginAttributes.emplace_back(PluginField("gemm_k", nullptr, PluginFieldType::kINT32, 1));
     mPluginAttributes.emplace_back(PluginField("group_size", nullptr, PluginFieldType::kINT32, 1));
+    // Optional, opt-in output dtype (nvinfer1::DataType enum as int32). Absent -> kHALF.
+    mPluginAttributes.emplace_back(PluginField("output_dtype", nullptr, PluginFieldType::kINT32, 1));
 
     mFieldCollection.nbFields = mPluginAttributes.size();
     mFieldCollection.fields = mPluginAttributes.data();
