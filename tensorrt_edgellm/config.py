@@ -313,6 +313,14 @@ class ModelConfig:
     # existing model is affected unless it opts in. Ignored when the backbone is
     # quantized (FP8/NVFP4/AWQ/...): those paths keep their own dtype contract.
     mixed_precision: bool = False
+    # Opt-in: allow the mixed-precision hybrid graph to coexist with a quantized
+    # backbone.  Default False keeps the legacy contract (mixed_precision is
+    # ignored when quantized).  When True AND quant is INT4-AWQ, the residual
+    # stream / RMSNorm run BF16, attention q/k/v/o stay FP16 (unquantized), and
+    # the MLP runs INT4 weights with the down_proj emitting BF16 output (the
+    # overflow-safe path).  Only honoured for INT4-AWQ; FP8/NVFP4/MXFP8 linears
+    # require FP16 input and are left on the legacy path.
+    mixed_precision_with_quant: bool = False
     # When True, embed_tokens and lm_head share the same weight tensor
     tie_word_embeddings: bool = False
     # Sliding window attention size; -1 means no sliding window.
@@ -432,11 +440,17 @@ class ModelConfig:
     def mixed_precision_active(self) -> bool:
         """True when the generic BF16-residual / FP16-attention hybrid path is on.
 
-        Only honoured for an unquantized backbone — quantized linears
-        (FP8/NVFP4/AWQ/...) carry their own dtype contract and are left on the
-        legacy FP16 path even if ``mixed_precision`` is requested.
+        Honoured for an unquantized backbone, or — when ``mixed_precision_with_quant``
+        is explicitly opted in — for an INT4-AWQ backbone (residual/MLP BF16,
+        attention FP16 unquantized, down_proj INT4+BF16-output).  FP8/NVFP4/MXFP8
+        linears require FP16 input and are always left on the legacy FP16 path even
+        if ``mixed_precision`` is requested.
         """
-        return bool(self.mixed_precision) and not self.quant.is_quantized
+        if not self.mixed_precision:
+            return False
+        if not self.quant.is_quantized:
+            return True
+        return bool(self.mixed_precision_with_quant) and self.quant.quant_type == QUANT_INT4_AWQ
 
     @property
     def residual_dtype(self) -> "torch.dtype":  # noqa: F821
