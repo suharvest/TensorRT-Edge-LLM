@@ -902,6 +902,8 @@ class ModelConfig:
             torch_dtype=llm_dict.get("torch_dtype",
                                      llm_dict.get("dtype", "bfloat16")),
             mixed_precision=bool(llm_dict.get("mixed_precision", False)),
+            mixed_precision_with_quant=bool(
+                llm_dict.get("mixed_precision_with_quant", False)),
             tie_word_embeddings=llm_dict.get("tie_word_embeddings", False),
             sliding_window_size=sliding_window_size,
             layer_types=layer_types,
