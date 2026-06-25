@@ -450,7 +450,8 @@ class ModelConfig:
             return False
         if not self.quant.is_quantized:
             return True
-        return bool(self.mixed_precision_with_quant) and self.quant.quant_type == QUANT_INT4_AWQ
+        return (bool(self.mixed_precision_with_quant) and self.quant.quant_type
+                in (QUANT_INT4_AWQ, QUANT_INT4_AWQ_MODELOPT))
 
     @property
     def residual_dtype(self) -> "torch.dtype":  # noqa: F821
