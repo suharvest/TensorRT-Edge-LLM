@@ -52,6 +52,12 @@ def _require_fp16_input(hidden_states: torch.Tensor, layer_name: str) -> None:
             f"{layer_name} expects float16 input, got {hidden_states.dtype}")
 
 
+def _require_bf16_input(hidden_states: torch.Tensor, layer_name: str) -> None:
+    if hidden_states.dtype != torch.bfloat16:
+        raise TypeError(
+            f"{layer_name} expects bfloat16 input, got {hidden_states.dtype}")
+
+
 __all__ = [
     "LinearBase",
     "LinearMethodBase",
@@ -60,6 +66,7 @@ __all__ = [
     "RowParallelLinear",
     "is_nvfp4_linear",
     "FP16Linear",
+    "BF16Linear",
     "FP8Linear",
     "MXFP8Linear",
     "AWQLinear",
@@ -167,6 +174,44 @@ class FP16Linear(LinearBase):
 
     def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
         _require_fp16_input(hidden_states, "FP16Linear")
+        bias = self.bias if self.bias is not None else None
+        return F.linear(hidden_states, self.weight, bias)
+
+
+# ---------------------------------------------------------------------------
+# BF16Linear
+# ---------------------------------------------------------------------------
+
+
+class BF16Linear(nn.Module):
+    """Plain bfloat16 linear (mixed-precision residual / MLP / lm_head path).
+
+    Identical to :class:`FP16Linear` but in bfloat16.  Used only when
+    ``config.mixed_precision_active`` selects the BF16 residual stream so the
+    MLP and lm_head matmuls accumulate in BF16, avoiding the FP16 overflow that
+    the legacy path hits on the residual stream.  Activations must be bfloat16.
+    """
+
+    def __init__(self,
+                 in_features: int,
+                 out_features: int,
+                 bias: bool = False) -> None:
+        super().__init__()
+        self.in_features = in_features
+        self.out_features = out_features
+        self.weight = nn.Parameter(torch.empty(out_features,
+                                               in_features,
+                                               dtype=torch.bfloat16),
+                                   requires_grad=False)
+        if bias:
+            self.bias = nn.Parameter(torch.empty(out_features,
+                                                 dtype=torch.bfloat16),
+                                     requires_grad=False)
+        else:
+            self.register_parameter("bias", None)
+
+    def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
+        _require_bf16_input(hidden_states, "BF16Linear")
         bias = self.bias if self.bias is not None else None
         return F.linear(hidden_states, self.weight, bias)
 
@@ -710,6 +755,15 @@ class INT8SQLinear(LinearBase):
 # Factory
 # ---------------------------------------------------------------------------
 
+# Attention projection module suffixes.  In mixed-precision mode these stay
+# FP16 (the attention island); every other unquantized linear runs in BF16.
+_ATTENTION_PROJ_SUFFIXES = (".q_proj", ".k_proj", ".v_proj", ".o_proj")
+
+
+def _is_attention_projection(module_name: str) -> bool:
+    """True when *module_name* is a q/k/v/o attention projection."""
+    return any(module_name.endswith(s) for s in _ATTENTION_PROJ_SUFFIXES)
+
 
 def make_linear(
     config: ModelConfig,
@@ -761,7 +815,15 @@ def make_linear(
                                     tp_mode=tp_mode)
 
     if quant_type == QUANT_FP16:
-        layer = FP16Linear(in_features, out_features, bias)
+        # Mixed-precision: the residual-stream linears (MLP, lm_head) run in
+        # BF16 while the attention projections (q/k/v/o_proj) stay FP16.  This
+        # is purely additive — without ``mixed_precision_active`` every
+        # unquantized linear is FP16, exactly as before.
+        if config.mixed_precision_active and not _is_attention_projection(
+                module_name):
+            layer = BF16Linear(in_features, out_features, bias)
+        else:
+            layer = FP16Linear(in_features, out_features, bias)
     elif quant_type == QUANT_FP8:
         layer = FP8Linear(in_features, out_features, bias)
     elif quant_type == QUANT_MXFP8:
