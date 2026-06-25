@@ -17,6 +17,7 @@
 
 #pragma once
 
+#include <cuda_bf16.h>
 #include <cuda_fp16.h>
 #include <stdint.h>
 
@@ -52,6 +53,21 @@ void gemv_forward_cuda_new(half const* in_feats, int8_t const* kernel, half cons
     int m, int n, int k, int group_size, cudaStream_t stream);
 
 /*!
+ * @brief BF16-output variant of gemv_forward_cuda_new (opt-in mixed-precision path).
+ *
+ * Identical INT4 weight / FP16 activation compute as gemv_forward_cuda_new, but the
+ * per-output-channel accumulation is reduced in FP32 and stored as BF16. This avoids
+ * FP16 overflow when an output channel's pre-activation magnitude exceeds the FP16
+ * range (max 65504) — e.g. SparkTTS/Qwen down_proj output channel 62 (~2.3e5). The
+ * existing FP16 path is left untouched; callers opt into this variant only for
+ * overflow-prone linears under config.mixed_precision.
+ *
+ * @param out_feats Output features [M, N] in BF16
+ */
+void gemv_forward_cuda_new_bf16(half const* in_feats, int8_t const* kernel, half const* scaling_factors,
+    __nv_bfloat16* out_feats, int m, int n, int k, int group_size, cudaStream_t stream);
+
+/*!
  * @brief INT4 group-wise quantized GEMM (matrix-matrix multiplication)
  *
  * Optimized for batch size > 1. Performs: out = in @ W_dequantized
@@ -69,5 +85,18 @@ void gemv_forward_cuda_new(half const* in_feats, int8_t const* kernel, half cons
  */
 void gemm_forward_cuda_new(half const* in_feats, int8_t const* kernel, half const* scaling_factors, half* out_feats,
     int m, int n, int k, int group_size, cudaStream_t stream) noexcept;
+
+/*!
+ * @brief BF16-output variant of gemm_forward_cuda_new (opt-in mixed-precision path).
+ *
+ * Same INT4 weight / FP16 activation tiled GEMM as gemm_forward_cuda_new, but the
+ * tensor-core accumulation is performed in FP32 (mma f32.f16.f16.f32) and the result
+ * is stored as BF16. This prevents FP16 overflow / inf in the accumulator and output
+ * for overflow-prone linears (down_proj). The existing FP16 path is untouched.
+ *
+ * @param out_feats Output features [M, N] in BF16
+ */
+void gemm_forward_cuda_new_bf16(half const* in_feats, int8_t const* kernel, half const* scaling_factors,
+    __nv_bfloat16* out_feats, int m, int n, int k, int group_size, cudaStream_t stream) noexcept;
 } // namespace kernel
 } // namespace trt_edgellm
