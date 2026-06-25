@@ -461,6 +461,7 @@ def _fix_initializer_dtypes(
     preserve_fp32_patterns: "tuple[str, ...]" = (),
     match_fp32_matmul_initializers: bool = False,
     match_fp32_elementwise_initializers: bool = False,
+    match_consumer_float_dtype: bool = False,
 ) -> None:
     """Single-pass ONNX initializer fixup for TRT compatibility.
 
@@ -565,6 +566,33 @@ def _fix_initializer_dtypes(
         """Does ``init_name`` match any caller-supplied preserve pattern?"""
         return any(p in init_name for p in preserve_fp32_patterns)
 
+    # Mixed-precision: pick each stray-FP32 weight's downgrade target from the
+    # dtype of the tensor it is matmul'd against, so a BF16 residual-stream
+    # weight downgrades to BF16 and an FP16 attention weight to FP16 (a
+    # strongly-typed graph requires both MatMul inputs to share a dtype). Only
+    # active when requested; legacy path keeps the unconditional FP32->FP16.
+    _BF16 = 16  # onnx TensorProto.BFLOAT16
+    _FP16 = 10  # onnx TensorProto.FLOAT16
+    consumer_float_dtype: dict[str, int] = {}
+    if match_consumer_float_dtype:
+        vi_elem: dict[str, int] = {}
+        for value in (list(model.graph.input) + list(model.graph.value_info) +
+                      list(model.graph.output)):
+            tt = value.type.tensor_type
+            if tt.HasField("elem_type"):
+                vi_elem[value.name] = tt.elem_type
+        for init in model.graph.initializer:
+            vi_elem[init.name] = init.data_type
+        for node in model.graph.node:
+            if node.op_type != "MatMul" or len(node.input) < 2:
+                continue
+            for init_idx, other_idx in ((0, 1), (1, 0)):
+                if node.input[init_idx] not in init_map:
+                    continue
+                other = vi_elem.get(node.input[other_idx])
+                if other in (_BF16, _FP16):
+                    consumer_float_dtype[node.input[init_idx]] = other
+
     n_to_fp16 = 0
     n_to_fp32 = 0
     for init in model.graph.initializer:
@@ -611,12 +639,18 @@ def _fix_initializer_dtypes(
                 or init.name.endswith("_scale")
                 or init.name.endswith("_scale_2")):
             continue  # keep quantization scales as FP32
+        target = consumer_float_dtype.get(init.name, 10)  # default FLOAT16
         data = np.frombuffer(init.raw_data, dtype=np.float32).reshape(dims)
-        init.data_type = 10  # FLOAT16
-        init.raw_data = data.astype(np.float16).tobytes()
+        if target == _BF16:
+            import ml_dtypes  # provided transitively by onnx/numpy stack
+            init.data_type = _BF16
+            init.raw_data = data.astype(ml_dtypes.bfloat16).tobytes()
+        else:
+            init.data_type = 10  # FLOAT16
+            init.raw_data = data.astype(np.float16).tobytes()
         n_to_fp16 += 1
-        logger.info("_fix_initializer_dtypes: %s %s FP32→FP16", init.name,
-                    dims)
+        logger.info("_fix_initializer_dtypes: %s %s FP32→%s", init.name, dims,
+                    "BF16" if target == _BF16 else "FP16")
 
     if match_fp32_matmul_initializers:
         for init in model.graph.initializer:
@@ -749,6 +783,9 @@ def _export_model(
                             match_fp32_elementwise_initializers=bool(
                                 getattr(model,
                                         "match_fp32_elementwise_initializers",
+                                        False)),
+                            match_consumer_float_dtype=bool(
+                                getattr(model.config, "mixed_precision_active",
                                         False)))
     _strip_attention_plugin_optional_inputs(output_path)
     external_weight_files = externalize_model_weights(
