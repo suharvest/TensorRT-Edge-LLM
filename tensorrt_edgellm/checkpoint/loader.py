@@ -184,13 +184,14 @@ def load_weights(
     config = getattr(model, "config", None)
     if (hasattr(model, "tie_weights") and config is not None
             and getattr(config, "tie_word_embeddings", False)):
-        from ..models.linear import FP16Linear
-        if isinstance(getattr(model, "lm_head", None), FP16Linear):
+        from ..models.linear import BF16Linear, FP16Linear
+        if isinstance(getattr(model, "lm_head", None),
+                      (FP16Linear, BF16Linear)):
             model.tie_weights()
             logger.info("Tied lm_head.weight to embed_tokens.weight")
         else:
             logger.debug(
-                "Skipping tied lm_head.weight for non-FP16 lm_head type %s",
+                "Skipping tied lm_head.weight for non-FP16/BF16 lm_head type %s",
                 type(getattr(model, "lm_head", None)).__name__)
 
 
@@ -420,8 +421,21 @@ def _set_tensor(model: nn.Module,
     except (AttributeError, IndexError, TypeError):
         return False
 
-    if tensor.dtype == torch.bfloat16:
-        tensor = tensor.to(torch.float16)
+    # Cast checkpoint tensors to match the destination's declared dtype when it
+    # is half-precision (FP16 / BF16).  The module tree fixes each weight's
+    # dtype at construction (FP16 attention vs. BF16 residual/MLP in the
+    # mixed-precision path; FP16 everywhere on the legacy path), so honouring
+    # the destination keeps each island in its intended precision.  When the
+    # destination is unknown (plain attribute / pre-load nn.Embedding), fall
+    # back to the legacy behaviour: BF16 -> FP16.
+    if tensor.dtype in (torch.bfloat16, torch.float16):
+        dst = module._parameters.get(attr) if attr in module._parameters \
+            else module._buffers.get(attr)
+        dst_dtype = getattr(dst, "dtype", None)
+        if dst_dtype in (torch.float16, torch.bfloat16):
+            tensor = tensor.to(dst_dtype)
+        elif tensor.dtype == torch.bfloat16:
+            tensor = tensor.to(torch.float16)
 
     tensor = _shard_for_module(module, attr, tensor, mapping)
 
