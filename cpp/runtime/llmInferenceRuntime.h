@@ -83,6 +83,39 @@ public:
     LLMInferenceRuntime(std::string const& engineDir, std::string const& multimodalEngineDir,
         std::unordered_map<std::string, std::string> const& loraWeightsMap, cudaStream_t stream);
 
+    /*!
+     * @brief Construct a vanilla-only runtime that SHARES the base LLM engine weights with another runtime.
+     *
+     * Reuses a borrowed (read-only) base ICudaEngine from an existing runtime (e.g. slot 0 of a
+     * voice-worker slot pool) via getBaseEngine(), instead of re-deserializing llm.engine. This removes
+     * the per-slot copy of the (large, read-only) base engine weights. Every other resource — the
+     * per-instance EngineExecutor execution context, KV/RoPE caches, PipelineIO tensors, CUDA-graph
+     * cache, sampling workspace, tokenizer and embedding table — is allocated fresh per instance, so
+     * concurrent slots never contend on mutable state. The borrowing runtime does NOT own the engine;
+     * the owner (slot 0) must outlive every borrower.
+     *
+     * Supports the vanilla (no spec-decode), non-multimodal path only — which is what the SparkTTS /
+     * voice slot pools use. The engine/config pairing must match the owner.
+     *
+     * @param borrowedBaseEngine Non-owning base engine to reuse (from getBaseEngine(); must not be null)
+     * @param engineDir Directory containing engine config + non-engine assets (config.json, embedding.safetensors, tokenizer)
+     * @param multimodalEngineDir Directory containing multimodal engine files (empty for the voice path)
+     * @param loraWeightsMap Map of LoRA weight names to file paths
+     * @param stream CUDA stream for operations
+     * @throws std::runtime_error if directories do not contain expected data, or runner initialization fails
+     */
+    LLMInferenceRuntime(nvinfer1::ICudaEngine* borrowedBaseEngine, std::string const& engineDir,
+        std::string const& multimodalEngineDir,
+        std::unordered_map<std::string, std::string> const& loraWeightsMap, cudaStream_t stream);
+
+    //! @brief Borrowed (non-owning) base LLM engine pointer, for sharing weights across slot-pool instances.
+    //! @return Raw pointer to the live base ICudaEngine (owned via the base executor, or borrowed).
+    //! @note Read-only shared weights; callers must NOT delete it and must keep the owner (slot 0) alive.
+    nvinfer1::ICudaEngine* getBaseEngine() const noexcept
+    {
+        return mBaseExecutor ? mBaseExecutor->getEnginePtr() : nullptr;
+    }
+
     //! @brief Destructor
     ~LLMInferenceRuntime() noexcept = default;
 
@@ -217,10 +250,14 @@ public:
     }
 
 private:
-    //! @brief Common initialization logic shared between both constructors
+    //! @brief Common initialization logic shared between all constructors.
+    //! @param borrowedBaseEngine Optional non-owning base engine to reuse instead of deserializing
+    //!        llm.engine (shared-engine ctor). nullptr = own the engine (path ctors). Only valid for
+    //!        the vanilla (no draftingConfig) path.
     void initializeCommon(std::string const& engineDir, std::string const& multimodalEngineDir,
         std::unordered_map<std::string, std::string> const& loraWeightsMap,
-        std::optional<SpecDecodeDraftingConfig> const& draftingConfig, cudaStream_t stream);
+        std::optional<SpecDecodeDraftingConfig> const& draftingConfig, cudaStream_t stream,
+        nvinfer1::ICudaEngine* borrowedBaseEngine = nullptr);
 
     //! @brief Capture a CUDA graph on the base executor for the default (no-adapter)
     //! state, then one additional graph per registered LoRA adapter. Returns the

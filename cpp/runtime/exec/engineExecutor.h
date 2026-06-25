@@ -64,6 +64,29 @@ public:
     static std::unique_ptr<EngineExecutor> createForLLM(std::filesystem::path const& enginePath,
         LLMEngineConfig const& cfg, std::optional<int32_t> specDecodeBaseOutputHiddenDim = std::nullopt);
 
+    //! @brief Build an EngineExecutor that SHARES (borrows) an already-deserialized engine.
+    //!
+    //! Reuses a live, read-only ICudaEngine owned by another EngineExecutor (e.g. slot 0 of a
+    //! voice-worker slot pool) instead of re-deserializing the engine file, which removes the
+    //! per-slot copy of the (large, read-only) engine weights. This instance does NOT own the
+    //! borrowed engine; the owner must outlive every borrower. Every other resource — the
+    //! per-instance IExecutionContext (kUSER_MANAGED), the CUDA-graph cache, and (via the owning
+    //! runtime) the KV/RoPE/workspace tensors — is allocated fresh and is NOT shared, so concurrent
+    //! slots never contend on mutable state.
+    //!
+    //! @param borrowedEngine Non-owning pointer to a live deserialized engine (from getEnginePtr();
+    //!                        must not be null and must be the same engine/config pairing as the owner)
+    //! @param cfg LLM engine config (same as the owner) — used to build the TensorRegistry
+    //! @param specDecodeBaseOutputHiddenDim Optional spec-decode base hidden dim (match the owner)
+    //! @throws std::runtime_error if the per-instance execution context cannot be created
+    static std::unique_ptr<EngineExecutor> createForLLMBorrowed(nvinfer1::ICudaEngine* borrowedEngine,
+        LLMEngineConfig const& cfg, std::optional<int32_t> specDecodeBaseOutputHiddenDim = std::nullopt);
+
+    //! @brief Borrowed (non-owning) engine pointer, for sharing weights across slot-pool instances.
+    //! @return Raw pointer to the live ICudaEngine (owned via mEngine, or borrowed via mBorrowedEngine).
+    //! @note Read-only shared weights; callers must NOT delete it and must keep the owner alive.
+    nvinfer1::ICudaEngine* getEnginePtr() const noexcept { return mEngine ? mEngine.get() : mBorrowedEngine; }
+
     //! Build an EngineExecutor for the SpecDecode draft engine. The factory builds the
     //! TensorRegistry internally via `buildRegistryForSpecDecodeDraft(bundle)`.
     static std::unique_ptr<EngineExecutor> createForSpecDecodeDraft(
@@ -158,9 +181,28 @@ private:
      */
     EngineExecutor(std::filesystem::path const& enginePath, TensorRegistry registry);
 
-    std::unique_ptr<nvinfer1::IRuntime> mRuntime;
-    std::unique_ptr<nvinfer1::ICudaEngine> mEngine;
-    std::unique_ptr<nvinfer1::IExecutionContext> mContext;
+    /*!
+     * @brief Construct an EngineExecutor that borrows (shares) an already-deserialized engine.
+     *
+     * Does not create an IRuntime or deserialize an engine file; creates only a fresh
+     * per-instance USER_MANAGED execution context off the borrowed engine. The borrowed
+     * engine is NOT owned and must outlive this instance.
+     *
+     * Private — use the `createForLLMBorrowed` factory.
+     *
+     * @param borrowedEngine Non-owning pointer to a live deserialized engine (must not be null)
+     * @param registry TensorRegistry describing the binding layout
+     * @throws std::runtime_error if the execution context cannot be created
+     */
+    EngineExecutor(nvinfer1::ICudaEngine* borrowedEngine, TensorRegistry registry);
+
+    //! Resolve the active engine pointer (owned mEngine, or borrowed mBorrowedEngine).
+    nvinfer1::ICudaEngine* enginePtr() const noexcept { return mEngine ? mEngine.get() : mBorrowedEngine; }
+
+    std::unique_ptr<nvinfer1::IRuntime> mRuntime;          //!< TRT runtime (null in borrowed mode)
+    std::unique_ptr<nvinfer1::ICudaEngine> mEngine;        //!< Owned engine (null in borrowed mode)
+    nvinfer1::ICudaEngine* mBorrowedEngine{nullptr};       //!< Non-owning engine (borrowed/shared mode)
+    std::unique_ptr<nvinfer1::IExecutionContext> mContext; //!< Per-instance execution context (never shared)
     TensorRegistry mRegistry;
 
     //! A captured CUDA graph together with its binding snapshot for verification.
