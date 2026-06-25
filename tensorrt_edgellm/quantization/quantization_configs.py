@@ -202,6 +202,16 @@ _AUDIO_PREFIXES = (
 )
 _AUDIO_PATTERNS = tuple(f"*{p}.*" for p in _AUDIO_PREFIXES)
 
+# Attention projection wildcards. Used by build_quant_config(exclude_attention=True)
+# to keep q/k/v/o_proj in FP16 (unquantized) — required by the mixed-precision
+# overflow-safe path where attention is an FP16 island and only the MLP is INT4.
+_ATTENTION_PROJ_PATTERNS = (
+    "*q_proj*",
+    "*k_proj*",
+    "*v_proj*",
+    "*o_proj*",
+)
+
 
 def _audio_quant_cfg(input_cfg: Optional[Dict[str, Any]],
                      weight_cfg: Dict[str, Any]) -> Dict[str, Dict[str, Any]]:
@@ -379,6 +389,7 @@ def build_quant_config(
     kv_cache_quantization: Optional[str] = None,
     visual_quantization: Optional[str] = None,
     audio_quantization: Optional[str] = None,
+    exclude_attention: bool = False,
 ) -> Dict[str, Any]:
     """Build a composite ModelOpt quantization config from method names.
 
@@ -438,6 +449,10 @@ def build_quant_config(
         groups_to_disable.append(_VISUAL_PATTERNS)
     if audio_quantization is None:
         groups_to_disable.append(_AUDIO_PATTERNS)
+    if exclude_attention:
+        # Keep attention q/k/v/o_proj in FP16 (mixed-precision overflow-safe
+        # path: attention is an FP16 island, only the MLP is INT4).
+        groups_to_disable.append(_ATTENTION_PROJ_PATTERNS)
     cfg["quant_cfg"] = _merge_quant_cfg(
         cfg["quant_cfg"],
         _disable_groups(*groups_to_disable),
