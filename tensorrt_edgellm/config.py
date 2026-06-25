@@ -302,6 +302,17 @@ class ModelConfig:
     attention_bias: bool = False
     # Weight dtype in the checkpoint
     torch_dtype: str = "bfloat16"
+    # ------------------------------------------ mixed-precision compute path
+    # When True, the (non-quantized) decoder runs a generic hybrid-precision
+    # graph: attention (q/k/v/o_proj, RoPE, SDPA, KV cache) stays FP16 while the
+    # residual stream, RMSNorm, MLP, embedding and lm_head run in BF16, with
+    # explicit Cast nodes inserted at the attention boundary.  This removes FP16
+    # overflow on the residual/MLP path for models whose activations exceed the
+    # FP16 range, while keeping the FP16 attention plugins / KV cache untouched.
+    # Default False -> behaviour is byte-identical to the legacy FP16 path; no
+    # existing model is affected unless it opts in. Ignored when the backbone is
+    # quantized (FP8/NVFP4/AWQ/...): those paths keep their own dtype contract.
+    mixed_precision: bool = False
     # When True, embed_tokens and lm_head share the same weight tensor
     tie_word_embeddings: bool = False
     # Sliding window attention size; -1 means no sliding window.
@@ -417,6 +428,35 @@ class ModelConfig:
         }
         return _MAP.get(self.torch_dtype, torch.bfloat16)
 
+    @property
+    def mixed_precision_active(self) -> bool:
+        """True when the generic BF16-residual / FP16-attention hybrid path is on.
+
+        Only honoured for an unquantized backbone — quantized linears
+        (FP8/NVFP4/AWQ/...) carry their own dtype contract and are left on the
+        legacy FP16 path even if ``mixed_precision`` is requested.
+        """
+        return bool(self.mixed_precision) and not self.quant.is_quantized
+
+    @property
+    def residual_dtype(self) -> "torch.dtype":  # noqa: F821
+        """Dtype of the residual stream / RMSNorm / MLP / embedding / lm_head.
+
+        BF16 in mixed-precision mode, FP16 otherwise (legacy default).
+        """
+        import torch
+        return torch.bfloat16 if self.mixed_precision_active else torch.float16
+
+    @property
+    def attention_dtype(self) -> "torch.dtype":  # noqa: F821
+        """Dtype of the attention island (q/k/v/o_proj, RoPE, SDPA, KV cache).
+
+        Always FP16 — the attention plugins and KV cache stay FP16 in both the
+        legacy and the mixed-precision paths.
+        """
+        import torch
+        return torch.float16
+
     # ------------------------------------------------------------------
     # Factory
     # ------------------------------------------------------------------
@@ -517,6 +557,7 @@ class ModelConfig:
             attention_bias=bool(llm_dict.get("attention_bias", False)),
             torch_dtype=llm_dict.get("torch_dtype",
                                      llm_dict.get("dtype", "bfloat16")),
+            mixed_precision=bool(llm_dict.get("mixed_precision", False)),
             tie_word_embeddings=llm_dict.get("tie_word_embeddings", False),
             sliding_window_size=sliding_window_size,
             layer_types=layer_types,
