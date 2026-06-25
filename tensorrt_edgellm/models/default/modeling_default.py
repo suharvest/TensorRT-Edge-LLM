@@ -44,7 +44,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 from ...config import ModelConfig
-from ..linear import FP16Linear, TPMode, make_linear
+from ..linear import BF16Linear, FP16Linear, TPMode, make_linear
 from ..ops import attention_plugin
 
 __all__ = [
@@ -165,13 +165,21 @@ class RMSNorm(nn.Module):
     """Root-mean-square layer normalisation.
 
     Buffer: ``weight`` [hidden_size].
+
+    ``dtype`` selects the stored weight dtype (and therefore the stream dtype
+    on export).  It defaults to FP16 — the legacy behaviour — and is set to
+    BF16 by the mixed-precision residual path.  The norm itself always computes
+    in FP32 internally (see :meth:`forward`); ``dtype`` only fixes the
+    weight/output dtype so no redundant Cast node is emitted.
     """
 
-    def __init__(self, hidden_size: int, eps: float = 1e-6) -> None:
+    def __init__(self,
+                 hidden_size: int,
+                 eps: float = 1e-6,
+                 dtype: "torch.dtype" = torch.float16) -> None:
         super().__init__()
         self.variance_epsilon = eps
-        self.weight = nn.Parameter(torch.ones(hidden_size,
-                                              dtype=torch.float16))
+        self.weight = nn.Parameter(torch.ones(hidden_size, dtype=dtype))
 
     def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
         input_dtype = hidden_states.dtype
@@ -371,9 +379,17 @@ class DecoderLayer(nn.Module):
         self.layer_idx = layer_idx
         self.self_attn = Attention(config, layer_idx=layer_idx)
         self.mlp = MLP(config, layer_idx=layer_idx)
-        self.input_layernorm = RMSNorm(config.hidden_size, config.rms_norm_eps)
+        # Residual-stream norms follow the residual dtype (BF16 in
+        # mixed-precision mode, FP16 otherwise).
+        residual_dtype = config.residual_dtype
+        self.attention_dtype = config.attention_dtype
+        self.mixed_precision = config.mixed_precision_active
+        self.input_layernorm = RMSNorm(config.hidden_size,
+                                       config.rms_norm_eps,
+                                       dtype=residual_dtype)
         self.post_attention_layernorm = RMSNorm(config.hidden_size,
-                                                config.rms_norm_eps)
+                                                config.rms_norm_eps,
+                                                dtype=residual_dtype)
 
     def forward(
         self,
@@ -386,8 +402,14 @@ class DecoderLayer(nn.Module):
         attention_pos_id: "torch.Tensor | None" = None,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         residual = hidden_states
+        normed = self.input_layernorm(hidden_states)
+        if self.mixed_precision:
+            # Cast the normed residual into the FP16 attention island. The
+            # attention block (q/k/v/o_proj, RoPE, SDPA, KV cache) runs FP16;
+            # its output is cast back to the BF16 residual stream below.
+            normed = normed.to(self.attention_dtype)
         attn_output, present_key_value = self.self_attn(
-            self.input_layernorm(hidden_states),
+            normed,
             past_key_value,
             rope_rotary_cos_sin,
             context_lengths,
@@ -395,6 +417,9 @@ class DecoderLayer(nn.Module):
             attention_mask=attention_mask,
             attention_pos_id=attention_pos_id,
         )
+        if self.mixed_precision:
+            # Boundary Cast FP16 -> BF16 before the residual add.
+            attn_output = attn_output.to(residual.dtype)
         hidden_states = residual + attn_output
 
         residual = hidden_states
@@ -424,12 +449,21 @@ class Transformer(nn.Module):
 
     def __init__(self, config: ModelConfig) -> None:
         super().__init__()
-        self.embed_tokens = nn.Embedding(config.vocab_size, config.hidden_size)
+        # embed_tokens stays FP16: the C++ runtime does the embedding lookup
+        # from the FP16 ``embedding.safetensors`` and feeds the engine an FP16
+        # ``inputs_embeds``; the BF16 residual stream begins one Cast later
+        # (see forward). tie_weights() handles the FP16->BF16 lm_head clone.
+        self.embed_tokens = nn.Embedding(config.vocab_size, config.hidden_size,
+                                         dtype=torch.float16)
         self.layers = nn.ModuleList([
             DecoderLayer(config, layer_idx=i)
             for i in range(config.num_hidden_layers)
         ])
-        self.norm = RMSNorm(config.hidden_size, config.rms_norm_eps)
+        self.norm = RMSNorm(config.hidden_size,
+                            config.rms_norm_eps,
+                            dtype=config.residual_dtype)
+        self.mixed_precision = config.mixed_precision_active
+        self.residual_dtype = config.residual_dtype
         # Populated at the end of each forward; see module docstring.
         self.last_pre_norm_hidden_states: "torch.Tensor | None" = None
 
@@ -447,6 +481,11 @@ class Transformer(nn.Module):
         dflash_target_layer_ids: "List[int] | None" = None,
     ) -> Tuple[torch.Tensor, Tuple, "Tuple | None", "torch.Tensor | None"]:
         hidden_states = inputs_embeds
+        if self.mixed_precision:
+            # Engine input is FP16; upcast the residual stream to BF16 here so
+            # the whole decoder runs the mixed-precision graph. This single
+            # leading Cast keeps the inputs_embeds binding FP16 (no C++ change).
+            hidden_states = hidden_states.to(self.residual_dtype)
         present_key_values_list: List[torch.Tensor] = []
         all_hidden_states: list = []
         dflash_hidden_list: list = []
@@ -546,11 +585,14 @@ class CausalLM(nn.Module):
         """
         if not self.config.tie_word_embeddings:
             return
-        if not isinstance(self.lm_head, FP16Linear):
+        if not isinstance(self.lm_head, (FP16Linear, BF16Linear)):
             return
         embed_weight = self.model.embed_tokens.weight
-        self.lm_head.weight = nn.Parameter(embed_weight.detach().clone(),
-                                           requires_grad=False)
+        # Match lm_head's stored dtype (FP16 on the legacy path, BF16 on the
+        # mixed-precision path) so the tied clone keeps the residual dtype.
+        self.lm_head.weight = nn.Parameter(
+            embed_weight.detach().clone().to(self.lm_head.weight.dtype),
+            requires_grad=False)
 
     def onnx_export_spec(self) -> OnnxSpec:
         """Return all model-specific parameters needed for ONNX export.
@@ -577,6 +619,10 @@ class CausalLM(nn.Module):
         device = next(itertools.chain(self.parameters(),
                                       self.buffers())).device
         dtype16 = torch.float16
+        # The engine I/O contract is unchanged by mixed precision: inputs_embeds
+        # stays FP16 (so the C++ embedding lookup and binding need no change) and
+        # the residual stream is upcast to BF16 *inside* the graph by the first
+        # node (see Transformer.forward). The KV cache stays FP16 too.
         batch_size, seq_len, past_len, max_pos = (_BATCH_SIZE, _SEQ_LEN,
                                                   _PAST_LEN, _MAX_POS)
 
