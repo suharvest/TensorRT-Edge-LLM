@@ -601,6 +601,7 @@ def quantize_and_export(
     device: str = "cuda",
     dataset: str = "cnn_dailymail",
     num_samples: int = 512,
+    exclude_attention: bool = False,
 ) -> str:
     """Load a HuggingFace model, quantize it, and export a unified checkpoint.
 
@@ -654,6 +655,7 @@ def quantize_and_export(
             kv_cache_quantization,
             visual_quantization=visual_quantization,
             audio_quantization=audio_quantization,
+            exclude_attention=exclude_attention,
         )
         if is_qwen3_asr_model(model_dir):
             # ASR multimodal calibration: stream real (audio, transcript)

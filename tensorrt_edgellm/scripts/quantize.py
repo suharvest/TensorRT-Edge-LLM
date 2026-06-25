@@ -70,6 +70,13 @@ def _add_common_args(parser):
     parser.add_argument("--device", default="cuda")
     parser.add_argument("--dataset", default="cnn_dailymail")
     parser.add_argument("--num_samples", type=int, default=512)
+    parser.add_argument(
+        "--exclude_attention",
+        action="store_true",
+        help=("Keep attention q/k/v/o_proj in FP16 (unquantized). Required for "
+              "the mixed-precision overflow-safe path: attention FP16 island + "
+              "INT4 MLP."),
+    )
 
 
 def main():
@@ -103,6 +110,7 @@ def main():
             device=args.device,
             dataset=args.dataset,
             num_samples=args.num_samples,
+            exclude_attention=args.exclude_attention,
         )
     elif args.command == "draft":
         from ..quantization.models.eagle3_draft import \
