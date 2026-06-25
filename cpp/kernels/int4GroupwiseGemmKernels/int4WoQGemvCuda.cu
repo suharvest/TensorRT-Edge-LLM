@@ -41,6 +41,7 @@
 
 #include "common/checkMacros.h"
 #include "dequantize.cuh"
+#include <cuda_bf16.h>
 #include <cuda_fp16.h>
 #include <stdexcept>
 #include <string>
@@ -92,9 +93,27 @@ __device__ __forceinline__ int make_divisible(int c, int divisor)
     return (c + divisor - 1) / divisor;
 }
 
-template <int NPerBlock, int Batch, int BlockSize, int GroupSize>
+// Convert the FP32 reduced accumulator to the requested output dtype. The BF16 path
+// (mixed-precision, opt-in) is what prevents FP16 overflow when an output channel's
+// magnitude exceeds the FP16 range (>65504 -> inf).
+template <typename OutT>
+__device__ __forceinline__ OutT gemvStoreCast(float acc);
+
+template <>
+__device__ __forceinline__ half gemvStoreCast<half>(float acc)
+{
+    return static_cast<half>(acc);
+}
+
+template <>
+__device__ __forceinline__ __nv_bfloat16 gemvStoreCast<__nv_bfloat16>(float acc)
+{
+    return __float2bfloat16(acc);
+}
+
+template <int NPerBlock, int Batch, int BlockSize, int GroupSize, typename OutT = half>
 __global__ void gemv_kernel(
-    half const* inputs, uint32_t const* weight, half const* scales, half* outputs, int const IC, int const OC)
+    half const* inputs, uint32_t const* weight, half const* scales, OutT* outputs, int const IC, int const OC)
 {
     int const kStride = 64;
     int const kElemsPerThread = MEM_ACCESS_SIZE / 4;
@@ -209,12 +228,13 @@ __global__ void gemv_kernel(
         {
             acc += out_smem[j][i];
         }
-        outputs[batch_idx * OC + blk_row_offset + oc_idx] = static_cast<half>(acc);
+        outputs[batch_idx * OC + blk_row_offset + oc_idx] = gemvStoreCast<OutT>(acc);
     }
 }
 
-void gemv_forward_cuda_new(half const* in_feats, int8_t const* weights_device, half const* scaling_factors,
-    half* out_feats, int m, int n, int k, int group_size, cudaStream_t stream)
+template <typename OutT>
+static void gemv_forward_cuda_new_impl(half const* in_feats, int8_t const* weights_device, half const* scaling_factors,
+    OutT* out_feats, int m, int n, int k, int group_size, cudaStream_t stream)
 {
     auto kernel = reinterpret_cast<uint32_t const*>(weights_device);
     static constexpr int N_PER_BLOCK = 2;
@@ -229,31 +249,44 @@ void gemv_forward_cuda_new(half const* in_feats, int8_t const* weights_device, h
     switch (m)
     {
     case 1:
-        gemv_kernel<N_PER_BLOCK, 1, BLOCK_SIZE, 128>
+        gemv_kernel<N_PER_BLOCK, 1, BLOCK_SIZE, 128, OutT>
             <<<num_blocks, num_threads, 0, stream>>>(in_feats, kernel, scaling_factors, out_feats, k, n);
         break;
     case 2:
-        gemv_kernel<N_PER_BLOCK, 2, BLOCK_SIZE, 128>
+        gemv_kernel<N_PER_BLOCK, 2, BLOCK_SIZE, 128, OutT>
             <<<num_blocks, num_threads, 0, stream>>>(in_feats, kernel, scaling_factors, out_feats, k, n);
         break;
     case 3:
-        gemv_kernel<N_PER_BLOCK, 3, BLOCK_SIZE, 128>
+        gemv_kernel<N_PER_BLOCK, 3, BLOCK_SIZE, 128, OutT>
             <<<num_blocks, num_threads, 0, stream>>>(in_feats, kernel, scaling_factors, out_feats, k, n);
         break;
     case 4:
-        gemv_kernel<N_PER_BLOCK, 4, BLOCK_SIZE, 128>
+        gemv_kernel<N_PER_BLOCK, 4, BLOCK_SIZE, 128, OutT>
             <<<num_blocks, num_threads, 0, stream>>>(in_feats, kernel, scaling_factors, out_feats, k, n);
         break;
     case 5:
-        gemv_kernel<N_PER_BLOCK, 5, BLOCK_SIZE, 128>
+        gemv_kernel<N_PER_BLOCK, 5, BLOCK_SIZE, 128, OutT>
             <<<num_blocks, num_threads, 0, stream>>>(in_feats, kernel, scaling_factors, out_feats, k, n);
         break;
     case 6:
-        gemv_kernel<N_PER_BLOCK, 6, BLOCK_SIZE, 128>
+        gemv_kernel<N_PER_BLOCK, 6, BLOCK_SIZE, 128, OutT>
             <<<num_blocks, num_threads, 0, stream>>>(in_feats, kernel, scaling_factors, out_feats, k, n);
         break;
     default: throw std::runtime_error("Unsupported batch size for gemv kernel.\n");
     }
+}
+
+void gemv_forward_cuda_new(half const* in_feats, int8_t const* weights_device, half const* scaling_factors,
+    half* out_feats, int m, int n, int k, int group_size, cudaStream_t stream)
+{
+    gemv_forward_cuda_new_impl<half>(in_feats, weights_device, scaling_factors, out_feats, m, n, k, group_size, stream);
+}
+
+void gemv_forward_cuda_new_bf16(half const* in_feats, int8_t const* weights_device, half const* scaling_factors,
+    __nv_bfloat16* out_feats, int m, int n, int k, int group_size, cudaStream_t stream)
+{
+    gemv_forward_cuda_new_impl<__nv_bfloat16>(
+        in_feats, weights_device, scaling_factors, out_feats, m, n, k, group_size, stream);
 }
 
 } // namespace kernel
