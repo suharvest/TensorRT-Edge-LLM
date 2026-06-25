@@ -71,10 +71,22 @@ LLMInferenceRuntime::LLMInferenceRuntime(std::string const& engineDir, std::stri
     initializeCommon(engineDir, multimodalEngineDir, loraWeightsMap, std::nullopt, stream);
 }
 
+LLMInferenceRuntime::LLMInferenceRuntime(nvinfer1::ICudaEngine* borrowedBaseEngine, std::string const& engineDir,
+    std::string const& multimodalEngineDir, std::unordered_map<std::string, std::string> const& loraWeightsMap,
+    cudaStream_t stream)
+{
+    ELLM_CHECK(borrowedBaseEngine != nullptr, "shared-engine ctor requires a non-null borrowed base engine");
+    initializeCommon(engineDir, multimodalEngineDir, loraWeightsMap, std::nullopt, stream, borrowedBaseEngine);
+}
+
 void LLMInferenceRuntime::initializeCommon(std::string const& engineDir, std::string const& multimodalEngineDir,
     std::unordered_map<std::string, std::string> const& loraWeightsMap,
-    std::optional<SpecDecodeDraftingConfig> const& draftingConfig, cudaStream_t stream)
+    std::optional<SpecDecodeDraftingConfig> const& draftingConfig, cudaStream_t stream,
+    nvinfer1::ICudaEngine* borrowedBaseEngine)
 {
+    ELLM_CHECK(borrowedBaseEngine == nullptr || !draftingConfig.has_value(),
+        "shared-engine (borrowed) path does not support speculative decoding");
+
     // -----------------------------------------------------------------------
     // 1. Load shared embedding table (shared between base and draft models).
     // -----------------------------------------------------------------------
@@ -108,7 +120,19 @@ void LLMInferenceRuntime::initializeCommon(std::string const& engineDir, std::st
         std::optional<int32_t> const specDecodeBaseOutputHiddenDim = mDeployment.specConfig.has_value()
             ? std::optional<int32_t>{mDeployment.specConfig->baseOutputHiddenDim}
             : std::nullopt;
-        mBaseExecutor = EngineExecutor::createForLLM(baseEnginePath, mDeployment.base, specDecodeBaseOutputHiddenDim);
+        if (borrowedBaseEngine != nullptr)
+        {
+            // Shared-engine path: reuse the owner's deserialized base engine weights; only a fresh
+            // per-instance execution context (+ this runtime's own KV/PipelineIO/workspace) is allocated.
+            mBaseExecutor = EngineExecutor::createForLLMBorrowed(
+                borrowedBaseEngine, mDeployment.base, specDecodeBaseOutputHiddenDim);
+            LOG_INFO("Base EngineExecutor sharing borrowed engine weights (no re-deserialization).");
+        }
+        else
+        {
+            mBaseExecutor
+                = EngineExecutor::createForLLM(baseEnginePath, mDeployment.base, specDecodeBaseOutputHiddenDim);
+        }
     }
     catch (std::exception const& e)
     {
