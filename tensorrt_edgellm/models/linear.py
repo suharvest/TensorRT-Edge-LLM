@@ -520,11 +520,15 @@ class AWQLinear(LinearBase):
         out_features: int,
         group_size: int = 128,
         bias: bool = False,
+        output_bf16: bool = False,
     ) -> None:
         super().__init__()
         self.in_features = in_features
         self.out_features = out_features
         self.group_size = group_size
+        # Opt-in: emit BF16 output (overflow-safe down_proj path under
+        # mixed_precision_with_quant). Default False -> FP16, byte-identical.
+        self.output_bf16 = output_bf16
         # Initialized in AWQ layout [in, out//8] int32; loader repacks to
         # [out//2, in] int8 (swizzled plugin layout) before inference/export.
         self.register_buffer(
@@ -546,7 +550,13 @@ class AWQLinear(LinearBase):
             self.bias = None
 
     def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
-        _require_fp16_input(hidden_states, "AWQLinear")
+        # The INT4 kernel takes FP16 activation. Under the mixed-precision path
+        # the residual stream is BF16, so accept BF16 input and cast to FP16 at
+        # the MLP-island boundary (mirrors the FP16 attention island). When
+        # output_bf16 is set, the GEMM emits BF16 directly (down_proj), so the
+        # overflow-prone output never lands in FP16.
+        if hidden_states.dtype != torch.float16:
+            hidden_states = hidden_states.to(torch.float16)
         out = int4_groupwise_gemm(
             hidden_states,
             self.qweight,
@@ -554,9 +564,10 @@ class AWQLinear(LinearBase):
             self.out_features,
             self.in_features,
             self.group_size,
+            output_dtype="bfloat16" if self.output_bf16 else "float16",
         )
         if self.bias is not None:
-            out = out + self.bias
+            out = out + self.bias.to(out.dtype)
         return out
 
 
@@ -830,8 +841,18 @@ def make_linear(
         layer = MXFP8Linear(in_features, out_features, config.quant.group_size,
                             bias)
     elif quant_type == QUANT_INT4_AWQ:
-        layer = AWQLinear(in_features, out_features, config.quant.group_size,
-                          bias)
+        # Under the mixed-precision+quant path the residual stream is BF16; the
+        # MLP down_proj is the overflow-prone linear, so emit BF16 output for it
+        # (gate/up stay FP16 for the SwiGLU mul). Attention projections are
+        # excluded by construction (they are FP16 unquantized here).
+        output_bf16 = (config.mixed_precision_active
+                       and module_name.endswith(".down_proj")
+                       and not _is_attention_projection(module_name))
+        layer = AWQLinear(in_features,
+                          out_features,
+                          config.quant.group_size,
+                          bias,
+                          output_bf16=output_bf16)
     elif quant_type == QUANT_INT4_AWQ_MODELOPT:
         layer = ModelOptAWQPrepackedLinear(in_features, out_features,
                                            config.quant.group_size, bias)
