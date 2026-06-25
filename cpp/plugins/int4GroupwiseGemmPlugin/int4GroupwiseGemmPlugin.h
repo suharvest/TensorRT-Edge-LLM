@@ -43,8 +43,11 @@ public:
      * @param N Output dimension (columns in weight matrix)
      * @param K Input dimension (rows in weight matrix)
      * @param groupSize Quantization group size
+     * @param outputType Plugin output dtype (kHALF default, opt-in kBF16 for the
+     *        mixed-precision overflow-safe path)
      */
-    Int4GroupwiseGemmPlugin(std::string const& name, int32_t N, int32_t K, int32_t groupSize);
+    Int4GroupwiseGemmPlugin(std::string const& name, int32_t N, int32_t K, int32_t groupSize,
+        nvinfer1::DataType outputType = nvinfer1::DataType::kHALF);
 
     /*!
      * @brief Construct from field collection
@@ -176,6 +179,11 @@ private:
     int32_t mGemmN{};
     int32_t mGemmK{};
     int32_t mGroupSize{};
+    //! Plugin output dtype. kHALF (default, legacy/byte-identical) or kBF16 (opt-in
+    //! mixed-precision overflow-safe path). Serialized as an int32 "output_dtype" field.
+    nvinfer1::DataType mOutputType{nvinfer1::DataType::kHALF};
+    //! Scratch backing store for the int32 "output_dtype" serialization field.
+    int32_t mOutputTypeSerialized{};
 
     std::vector<nvinfer1::PluginField> mDataToSerialize;
     nvinfer1::PluginFieldCollection mFCToSerialize;
