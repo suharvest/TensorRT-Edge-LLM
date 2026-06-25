@@ -478,6 +478,18 @@ def _(weight, weight_scale, block_size):
 # ---------------------------------------------------------------------------
 
 
+def _int4_gemm_out_dtype(hidden_states: torch.Tensor,
+                         output_dtype: str) -> torch.dtype:
+    """Resolve the GEMM output torch dtype.
+
+    Default ``"float16"`` -> preserve the input dtype (legacy, byte-identical).
+    ``"bfloat16"`` -> opt-in BF16 output (overflow-safe down_proj path).
+    """
+    if output_dtype == "bfloat16":
+        return torch.bfloat16
+    return hidden_states.dtype
+
+
 @torch.library.custom_op("trt::int4_groupwise_gemm", mutates_args=())
 def int4_groupwise_gemm(
     hidden_states: torch.Tensor,  # [*, in_features] float16
@@ -486,21 +498,28 @@ def int4_groupwise_gemm(
     gemm_n: int,
     gemm_k: int,
     group_size: int,
+    output_dtype: str = "float16",
 ) -> torch.Tensor:
     """Stub: INT4 groupwise GEMM - returns zero tensor of correct shape."""
     *leading, _ = hidden_states.shape
     return torch.zeros(*leading,
                        gemm_n,
-                       dtype=hidden_states.dtype,
+                       dtype=_int4_gemm_out_dtype(hidden_states, output_dtype),
                        device=hidden_states.device)
 
 
 @int4_groupwise_gemm.register_fake
-def _(hidden_states, qweight, scales, gemm_n, gemm_k, group_size):
+def _(hidden_states,
+      qweight,
+      scales,
+      gemm_n,
+      gemm_k,
+      group_size,
+      output_dtype: str = "float16"):
     *leading, _ = hidden_states.shape
     return torch.empty(*leading,
                        gemm_n,
-                       dtype=hidden_states.dtype,
+                       dtype=_int4_gemm_out_dtype(hidden_states, output_dtype),
                        device=hidden_states.device)
 
 

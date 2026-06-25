@@ -254,6 +254,8 @@ def _int4_groupwise_gemm_translation(
     gemm_k: int,
     group_size: int,
 ) -> onnxscript.FLOAT16:
+    # Legacy FP16-output path. output_dtype attribute is omitted so the engine
+    # stays byte-identical to pre-mixed-precision graphs.
     return _trt_edgellm.Int4GroupwiseGemmPlugin(
         hidden_states,
         qweight,
@@ -262,6 +264,49 @@ def _int4_groupwise_gemm_translation(
         gemm_k=gemm_k,
         group_size=group_size,
     )
+
+
+# nvinfer1::DataType::kBF16 == 5 (TensorRT enum). The plugin reads this int32
+# attribute and routes to the FP32-accumulate / BF16-store kernels.
+_TRT_DATATYPE_BF16 = 5
+
+
+@script()
+def _int4_groupwise_gemm_bf16_translation(
+    hidden_states: onnxscript.FLOAT16,
+    qweight: onnxscript.INT8,
+    scales: onnxscript.FLOAT16,
+    gemm_n: int,
+    gemm_k: int,
+    group_size: int,
+) -> onnxscript.BFLOAT16:
+    # Opt-in BF16-output path: FP16 activation in, BF16 out (overflow-safe).
+    return _trt_edgellm.Int4GroupwiseGemmPlugin(
+        hidden_states,
+        qweight,
+        scales,
+        gemm_n=gemm_n,
+        gemm_k=gemm_k,
+        group_size=group_size,
+        output_dtype=_TRT_DATATYPE_BF16,
+    )
+
+
+def _int4_groupwise_gemm_dispatch(
+    hidden_states,
+    qweight,
+    scales,
+    gemm_n,
+    gemm_k,
+    group_size,
+    output_dtype: str = "float16",
+):
+    if output_dtype == "bfloat16":
+        return _int4_groupwise_gemm_bf16_translation(hidden_states, qweight,
+                                                     scales, gemm_n, gemm_k,
+                                                     group_size)
+    return _int4_groupwise_gemm_translation(hidden_states, qweight, scales,
+                                            gemm_n, gemm_k, group_size)
 
 
 # ---------------------------------------------------------------------------
@@ -907,7 +952,7 @@ def build_custom_translation_table() -> dict:
         torch.ops.trt.mxfp8_weight_dq.default:
         _mxfp8_weight_dq_translation,
         torch.ops.trt.int4_groupwise_gemm.default:
-        _int4_groupwise_gemm_translation,
+        _int4_groupwise_gemm_dispatch,
         torch.ops.trt.int8_sq_act_qdq.default:
         _int8_sq_act_qdq_translation,
         torch.ops.trt.int8_sq_weight_dq.default:

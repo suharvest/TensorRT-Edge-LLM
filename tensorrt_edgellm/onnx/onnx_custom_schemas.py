@@ -520,14 +520,19 @@ _int4_groupwise_gemm_schema = OpSchema(
         OpSchema.FormalParameter(
             name="output",
             description="Output tensor",
-            type_str="T",
+            type_str="TOut",
         ),
     ],
     type_constraints=[
         (
             "T",
             ["tensor(float)", "tensor(float16)", "tensor(bfloat16)"],
-            "Input and output data type.",
+            "Input data type.",
+        ),
+        (
+            "TOut",
+            ["tensor(float)", "tensor(float16)", "tensor(bfloat16)"],
+            "Output data type (FP16 default, opt-in BF16).",
         ),
     ],
     attributes=[
@@ -548,6 +553,13 @@ _int4_groupwise_gemm_schema = OpSchema(
             type=OpSchema.AttrType.INT,
             description="Group size",
             required=True,
+        ),
+        OpSchema.Attribute(
+            name="output_dtype",
+            type=OpSchema.AttrType.INT,
+            description=("Optional output dtype as nvinfer1::DataType enum int "
+                         "(kHALF default when absent, kBF16=5 opt-in)."),
+            required=False,
         ),
     ],
 )
