@@ -266,9 +266,11 @@ def _int4_groupwise_gemm_translation(
     )
 
 
-# nvinfer1::DataType::kBF16 == 5 (TensorRT enum). The plugin reads this int32
-# attribute and routes to the FP32-accumulate / BF16-store kernels.
-_TRT_DATATYPE_BF16 = 5
+# nvinfer1::DataType::kBF16 == 7 (TensorRT enum: kFLOAT=0 kHALF=1 kINT8=2 kINT32=3
+# kBOOL=4 kUINT8=5 kFP8=6 kBF16=7). The plugin reads this int32 attribute and routes
+# to the FP32-accumulate / BF16-store kernels. (NOTE: 5 is kUINT8 — using it makes
+# TensorRT reject the plugin output as an illegal UINT8 intermediate.)
+_TRT_DATATYPE_BF16 = 7
 
 
 @script()
