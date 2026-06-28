@@ -1,5 +1,5 @@
-# SPDX-FileCopyrightText: Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES.
-# All rights reserved. SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION &
+# AFFILIATES. All rights reserved. SPDX-License-Identifier: Apache-2.0
 #
 # Licensed under the Apache License, Version 2.0 (the "License"); you may not
 # use this file except in compliance with the License. You may obtain a copy of
@@ -14,6 +14,17 @@
 # the License.
 
 cmake_minimum_required(VERSION 3.20 FATAL_ERROR)
+
+# Record whether the user explicitly requested CUDA architectures *before*
+# project() runs. enable_language(CUDA) (CMP0104 NEW) initializes
+# CMAKE_CUDA_ARCHITECTURES to a compiler default, so testing it afterwards
+# cannot tell a user-provided -DCMAKE_CUDA_ARCHITECTURES from that default.
+set(_EDGELLM_USER_CUDA_ARCHS FALSE)
+if(DEFINED CMAKE_CUDA_ARCHITECTURES)
+  if(NOT CMAKE_CUDA_ARCHITECTURES STREQUAL "")
+    set(_EDGELLM_USER_CUDA_ARCHS TRUE)
+  endif()
+endif()
 
 project(
   tensorrt_edgellm_sdk
@@ -61,7 +72,10 @@ endif()
 set_ifndef(CUDA_CTK_VERSION 12.8)
 set_ifndef(CUDA_DIR /usr/local/cuda-${CUDA_CTK_VERSION})
 
-if(NOT DEFINED AARCH64_BUILD)
+# Apply the project's default architecture set only when the user did not pass
+# an explicit -DCMAKE_CUDA_ARCHITECTURES (e.g. a native Jetson SM87 build), and
+# not for the aarch64 cross toolchain which selects its own.
+if(NOT _EDGELLM_USER_CUDA_ARCHS AND NOT DEFINED AARCH64_BUILD)
   set(CMAKE_CUDA_ARCHITECTURES 80;86;89)
   if(CUDA_CTK_VERSION VERSION_GREATER_EQUAL 12.8)
     list(APPEND CMAKE_CUDA_ARCHITECTURES 100a 120)
