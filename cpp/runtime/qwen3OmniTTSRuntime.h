@@ -154,6 +154,13 @@ public:
         //!<            even if chunkRvqCodes is empty (signals end-of-stream).
         //!< Each request gets its own callback; per-batch streams are fully independent.
         std::function<void(std::vector<std::vector<int32_t>> const& chunkRvqCodes, bool isFinal)> onChunkReady;
+
+        //!< Optional polled cancel hook (re-port of the v0.8.x cancel protocol, spec patch #7).
+        //!< Checked once per decoded frame from the Talker generation loop. Returning true marks
+        //!< this batch finished: its streaming emitter (if any) flushes immediately with
+        //!< isFinal=true (end-of-stream signal) and the loop returns normally with the frames
+        //!< generated so far. Unset (default) = upstream behavior, no per-frame check.
+        std::function<bool()> shouldCancel;
     };
 
     /*!
@@ -438,6 +445,9 @@ private:
     {
         int32_t chunkFrames{0};
         std::function<void(std::vector<std::vector<int32_t>> const& chunkRvqCodes, bool isFinal)> onChunk;
+        //! Optional per-batch cancel poll (from TalkerGenerationRequest::shouldCancel). Checked once
+        //! per decoded frame; returning true finishes the batch and flushes its emitter (isFinal=true).
+        std::function<bool()> shouldCancel;
     };
 
     //! @param prefillSeqLens Per-batch prefill sequence lengths for correct hidden-state extraction

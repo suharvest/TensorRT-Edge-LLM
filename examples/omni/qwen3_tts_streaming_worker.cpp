@@ -22,9 +22,11 @@
  *     first/subsequent chunk surgery. `first_chunk_frames` is used as the
  *     uniform chunk size (latency-critical knob); `chunk_frames` is still
  *     accepted but folded into uniform chunking.
- *   * Cancel: v0.9.0 has no runtime cancel mechanism yet (M3). Cancel lines
- *     are acknowledged with tripped=false and error
- *     "cancel_not_supported_yet"; generation runs to completion.
+ *   * Cancel (M3): {"type":"cancel","id":X} trips the per-id atomic flag; the
+ *     runtime polls TalkerGenerationRequest::shouldCancel per decoded frame,
+ *     the stream ends with is_final=true, and the worker emits `cancelled`
+ *     (same events/fields as the v0.8.0 worker: cancel_ack{tripped} →
+ *     final chunk → cancelled).
  *   * Slots: every slot constructs its own runtime via the path-based ctor
  *     (v0.9.0 has no shared-engine ctor yet — M3). max_slots=1 is the M1
  *     validated configuration.
@@ -112,7 +114,7 @@ void printUsage(char const* programName)
               << "  {\"id\":\"...\",\"text\":\"...\",\"speaker\":\"Vivian\",\n"
               << "   \"stream\":true,\"first_chunk_frames\":8,\"chunk_frames\":10,\n"
               << "   \"chunk_format\":\"pcm_s16le\",\"chunk_transport\":\"base64\"}\n"
-              << "Cancel (M1: acknowledged but not supported yet):\n"
+              << "Cancel (trips the in-flight request with that id; stream ends with is_final=true):\n"
               << "  {\"type\":\"cancel\",\"id\":\"...\"}\n";
 }
 
@@ -314,6 +316,42 @@ void emitEvent(Json payload)
     std::cout << line << std::endl;
 }
 
+// ===== cancel map (per-id → slot's cancel flag) =====
+//
+// A cancel line {"type":"cancel","id":X} trips the atomic<bool> belonging to
+// the in-flight request with that id. The flag lives on the slot (see TtsSlot)
+// and the request's shouldCancel lambda polls it from the runtime decode loop.
+// cancelMapMu guards the map; the worker thread registers its flag when it
+// starts a request and unregisters at request end. (Verbatim re-port of the
+// v0.8.0 worker cancel protocol on top of the M3 runtime shouldCancel hook.)
+
+std::mutex cancelMapMu;
+std::unordered_map<std::string, std::atomic<bool>*> cancelMap;
+
+void registerCancel(std::string const& id, std::atomic<bool>* flag)
+{
+    std::lock_guard<std::mutex> lk(cancelMapMu);
+    cancelMap[id] = flag;
+}
+
+void unregisterCancel(std::string const& id)
+{
+    std::lock_guard<std::mutex> lk(cancelMapMu);
+    cancelMap.erase(id);
+}
+
+bool tripCancel(std::string const& id)
+{
+    std::lock_guard<std::mutex> lk(cancelMapMu);
+    auto it = cancelMap.find(id);
+    if (it == cancelMap.end())
+    {
+        return false;
+    }
+    it->second->store(true, std::memory_order_release);
+    return true;
+}
+
 // ===== request builder =====
 
 Qwen3OmniTTSRuntime::TalkerGenerationRequest buildRequest(Json const& item)
@@ -380,6 +418,7 @@ struct TtsSlot
     int32_t slotId{-1};
     std::atomic<bool> inUse{false};    //!< True from enqueue until request completion.
     std::atomic<bool> shutdown{false}; //!< Set at teardown so the worker thread exits.
+    std::atomic<bool> cancelled{false}; //!< Per-slot cancel flag, registered in cancelMap while a request runs.
 
     std::unique_ptr<Qwen3OmniTTSRuntime> runtime;
     std::unique_ptr<Code2WavRunner> code2wav; //!< Per-slot stateless vocoder.
@@ -432,6 +471,13 @@ void processRequest(TtsSlot& slot, Json const& item, bool useStateful, bool useA
     cudaStream_t const stream = slot.stream;
 
     std::string const requestId = item.value("id", "");
+    // Reset and register this slot's cancel flag for the in-flight request.
+    slot.cancelled.store(false, std::memory_order_release);
+    std::atomic<bool>& cancelled = slot.cancelled;
+    if (!requestId.empty())
+    {
+        registerCancel(requestId, &cancelled);
+    }
 
     int32_t chunkIndex = 0;
     auto const requestStart = std::chrono::steady_clock::now();
@@ -455,11 +501,10 @@ void processRequest(TtsSlot& slot, Json const& item, bool useStateful, bool useA
     try
     {
         auto request = buildRequest(item);
-        // v0.9.0 native streaming has a single uniform chunk size (no
-        // first/subsequent split). Use `first_chunk_frames` — the
-        // latency-critical knob — as the uniform size; `chunk_frames` remains
-        // accepted for protocol compatibility but is folded into uniform
-        // chunking (differentiated chunk sizes may return in M3).
+        // Cooperative cancel: the runtime decode loop polls this flag once per
+        // frame; when tripped the stream ends with isFinal=true and
+        // handleAudioGeneration returns normally.
+        request.shouldCancel = [&cancelled]() { return cancelled.load(std::memory_order_acquire); };
         int32_t const firstChunkFrames = std::max(1, item.value("first_chunk_frames", 8));
         bool const streaming = item.value("stream", true);
         std::string const chunkFormat = item.value("chunk_format", "pcm_s16le");
@@ -614,7 +659,12 @@ void processRequest(TtsSlot& slot, Json const& item, bool useStateful, bool useA
             std::rethrow_exception(vocodeError);
         }
 
-        if (!ok)
+        if (cancelled.load(std::memory_order_acquire))
+        {
+            emitEvent(Json{{"event", "cancelled"}, {"ok", true},
+                {"request_id", requestId}, {"id", requestId}, {"reason", "cancelled"}});
+        }
+        else if (!ok)
         {
             emitEvent(Json{{"event", "error"}, {"ok", false},
                 {"request_id", requestId}, {"id", requestId}, {"error", "handleAudioGeneration failed"}});
@@ -658,6 +708,7 @@ void processRequest(TtsSlot& slot, Json const& item, bool useStateful, bool useA
 
     if (!requestId.empty())
     {
+        unregisterCancel(requestId);
         unbindSession(requestId);
     }
     // Release the slot for reuse. Order matters: drop the id→slot mapping FIRST
@@ -833,15 +884,15 @@ int main(int argc, char** argv)
             continue;
         }
 
-        // Cancel message: {"type":"cancel","id":"..."} — M1: v0.9.0 has no
-        // runtime cancel mechanism yet (spec patch #7, M3). Keep the protocol
-        // surface (cancel_ack with tripped) but report not-supported; the
-        // in-flight request runs to completion.
+        // Cancel message: {"type":"cancel","id":"..."} — trips the per-id atomic
+        // flag registered by the in-flight request; the runtime decode loop polls
+        // it per frame, the stream ends with is_final=true, and the worker emits a
+        // `cancelled` event. tripped=false when no in-flight request has that id.
         if (item.is_object() && item.value("type", "") == "cancel")
         {
             std::string const cid = item.value("id", "");
-            emitEvent(Json{{"event", "cancel_ack"}, {"request_id", cid}, {"id", cid}, {"tripped", false},
-                {"error", "cancel_not_supported_yet"}});
+            bool const tripped = tripCancel(cid);
+            emitEvent(Json{{"event", "cancel_ack"}, {"request_id", cid}, {"id", cid}, {"tripped", tripped}});
             continue;
         }
 

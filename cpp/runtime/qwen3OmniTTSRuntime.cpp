@@ -124,14 +124,19 @@ struct ChunkEmitter
     }
 
     // Final flush — always invoked once per active emitter at end-of-stream, even if buffer empty
-    // (callers rely on this as the end-of-stream signal).
+    // (callers rely on this as the end-of-stream signal). Idempotent: a cancelled batch flushes
+    // immediately at the cancel point AND the loop-exit flush pass runs for every emitter, so the
+    // second call must be a no-op (exactly one isFinal=true per streaming request).
     void flushFinal()
     {
-        if (!active())
+        if (!active() || finalFlushed)
             return;
+        finalFlushed = true;
         onChunk(buffer, /*isFinal=*/true);
         buffer.clear();
     }
+
+    bool finalFlushed{false};
 };
 } // anonymous namespace
 
@@ -1427,12 +1432,12 @@ bool Qwen3OmniTTSRuntime::handleAudioGeneration(
 
     std::vector<rt::Tensor const*> trailingPtrs(activeBatchSize, nullptr);
 
-    // Wire optional per-request streaming callbacks. Empty vector when no request has streaming on
-    // (zero overhead for the non-streaming path).
+    // Wire optional per-request streaming callbacks + cancel polls. Empty vector when no request
+    // has streaming or cancel on (zero overhead for the plain non-streaming path).
     std::vector<PerBatchStreamingHandler> streamingHandlers;
     for (auto const& r : requests)
     {
-        if (r.streamingChunkFrames > 0 && r.onChunkReady)
+        if ((r.streamingChunkFrames > 0 && r.onChunkReady) || r.shouldCancel)
         {
             streamingHandlers.resize(activeBatchSize);
             break;
@@ -1444,6 +1449,7 @@ bool Qwen3OmniTTSRuntime::handleAudioGeneration(
         {
             streamingHandlers[b].chunkFrames = requests[b].streamingChunkFrames;
             streamingHandlers[b].onChunk = requests[b].onChunkReady;
+            streamingHandlers[b].shouldCancel = requests[b].shouldCancel;
         }
     }
 
@@ -1889,6 +1895,21 @@ bool Qwen3OmniTTSRuntime::runTalkerGenerationLoop(std::vector<PerBatchTalkerStat
 
                 states[b].codecToken = hostTokens[b];
                 states[b].talkerFrames++;
+
+                // ===== Cancel poll (re-port of the v0.8.x cancel protocol, spec patch #7) =====
+                // Checked once per decoded frame at the v0.8.x insertion point (post-sample,
+                // pre-EOS-check). A tripped batch is marked finished and its streaming emitter
+                // flushes immediately with isFinal=true (prompt end-of-stream for the consumer;
+                // other batches keep decoding). flushFinal is idempotent so the loop-exit flush
+                // pass below stays a no-op for this batch. The loop then returns normally.
+                if (b < static_cast<int32_t>(streamingHandlers.size()) && streamingHandlers[b].shouldCancel
+                    && streamingHandlers[b].shouldCancel())
+                {
+                    states[b].finished = true;
+                    unfinished--;
+                    emitters[b].flushFinal();
+                    continue;
+                }
 
                 if (states[b].codecToken == codecEosId || states[b].talkerFrames >= maxFrames)
                 {
