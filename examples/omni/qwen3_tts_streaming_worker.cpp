@@ -28,9 +28,10 @@
  *   * Slots: every slot constructs its own runtime via the path-based ctor
  *     (v0.9.0 has no shared-engine ctor yet — M3). max_slots=1 is the M1
  *     validated configuration.
- *   * `language` / `speaker_embedding_b64` request fields are accepted but
- *     ignored (runtime support returns with the M2 patches); a warning is
- *     logged to stderr when they are present.
+ *   * `language` (CustomVoice 9-row language conditioning) and
+ *     `speaker_embedding_b64` (external voice-clone embedding, base64
+ *     LE float32) are passed through to the runtime (M2 patches). Omitting
+ *     them keeps the upstream 8-row named-speaker behavior.
  *
  * Concurrency model (unchanged): N worker threads, each bound to ONE slot
  * (runtime + stateless Code2Wav + CUDA stream). A runtime instance is never
@@ -192,6 +193,55 @@ std::string base64Encode(uint8_t const* data, size_t len)
     return out;
 }
 
+// Decode base64 -> raw bytes (used for the precomputed speaker embedding).
+std::vector<uint8_t> base64Decode(std::string const& in)
+{
+    auto val = [](char c) -> int {
+        if (c >= 'A' && c <= 'Z') return c - 'A';
+        if (c >= 'a' && c <= 'z') return c - 'a' + 26;
+        if (c >= '0' && c <= '9') return c - '0' + 52;
+        if (c == '+') return 62;
+        if (c == '/') return 63;
+        return -1; // '=' padding or whitespace
+    };
+    std::vector<uint8_t> out;
+    out.reserve((in.size() / 4) * 3);
+    int buf = 0, bits = 0;
+    for (char const c : in)
+    {
+        int const d = val(c);
+        if (d < 0) continue;
+        buf = (buf << 6) | d;
+        bits += 6;
+        if (bits >= 8)
+        {
+            bits -= 8;
+            out.push_back(static_cast<uint8_t>((buf >> bits) & 0xFF));
+        }
+    }
+    return out;
+}
+
+// Decode a base64 little-endian float32 array -> float vector (speaker embedding).
+std::vector<float> base64ToFloatVec(std::string const& b64)
+{
+    std::vector<uint8_t> const bytes = base64Decode(b64);
+    size_t const n = bytes.size() / sizeof(float);
+    std::vector<float> out(n);
+    for (size_t i = 0; i < n; ++i)
+    {
+        union
+        {
+            uint32_t u;
+            float f;
+        } conv;
+        conv.u = static_cast<uint32_t>(bytes[i * 4]) | (static_cast<uint32_t>(bytes[i * 4 + 1]) << 8)
+            | (static_cast<uint32_t>(bytes[i * 4 + 2]) << 16) | (static_cast<uint32_t>(bytes[i * 4 + 3]) << 24);
+        out[i] = conv.f;
+    }
+    return out;
+}
+
 std::vector<int16_t> floatToPcm16(std::vector<float> const& samples)
 {
     std::vector<int16_t> pcm(samples.size());
@@ -277,20 +327,18 @@ Qwen3OmniTTSRuntime::TalkerGenerationRequest buildRequest(Json const& item)
     req.speakerName = item.value("speaker", "");
     req.speakerId = item.value("speaker_id", -1);
 
-    // M1: `language` (CustomVoice 9-row conditioning) and `speaker_embedding_b64`
-    // (external voice-clone embedding) need the M2 runtime patches — the v0.9.0
-    // TalkerGenerationRequest has no fields for them yet. Accept-and-warn so the
-    // protocol surface stays stable for the consumer.
-    if (!item.value("language", "").empty())
+    // CustomVoice language conditioning: pass per-request language through to the runtime, which
+    // maps it to a codec language id and selects the 9-row prefix. Empty/omitted => langId=-1 =>
+    // the upstream 8-row path, unchanged.
+    req.language = item.value("language", "");
+    // Optional precomputed external speaker embedding (base64 LE float32 array). When present, the
+    // runtime uses it as the speaker-row conditioning vector instead of a named-speaker token.
     {
-        std::cerr << "[worker] warning: request field 'language' is not supported yet on v0.9.0 (M2); ignored"
-                  << std::endl;
-    }
-    if (!item.value("speaker_embedding_b64", "").empty())
-    {
-        std::cerr << "[worker] warning: request field 'speaker_embedding_b64' is not supported yet on v0.9.0 (M2); "
-                     "ignored"
-                  << std::endl;
+        std::string const spkB64 = item.value("speaker_embedding_b64", "");
+        if (!spkB64.empty())
+        {
+            req.speakerEmbedding = base64ToFloatVec(spkB64);
+        }
     }
 
     Message msg;
