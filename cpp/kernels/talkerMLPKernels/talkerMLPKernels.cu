@@ -603,7 +603,8 @@ template <int32_t VEC_SIZE = 8>
 __global__ void assistantPreambleKernel(half const* __restrict__ projected, half const* __restrict__ ttsPadEmbed,
     half const* __restrict__ ttsBosEmbed, half const* __restrict__ ttsEosEmbed, half const* __restrict__ embTable,
     int32_t codecNothinkId, int32_t codecThinkId, int32_t codecThinkBosId, int32_t codecThinkEosId, int32_t speakerId,
-    int32_t codecPadId, int32_t codecBosId, int32_t langId, int32_t textLen, int32_t hiddenDim,
+    int32_t codecPadId, int32_t codecBosId, int32_t langId, int32_t textLen,
+    half const* __restrict__ speakerEmbedding, bool hasSpeakerEmbedding, int32_t hiddenDim,
     half* __restrict__ output)
 {
     // No-lang: 8 fixed prefix rows (0-7); lang: 9 fixed prefix rows (0-8) with langId injected at row 5.
@@ -640,8 +641,17 @@ __global__ void assistantPreambleKernel(half const* __restrict__ projected, half
                 srcB = embTable + static_cast<int64_t>(codecThinkEosId) * hiddenDim;
                 break;
             case 6:
-                srcA = ttsPadEmbed;
-                srcB = embTable + static_cast<int64_t>(speakerId) * hiddenDim;
+                // External speaker embedding (Base / speaker_encoder path): the row IS the embedding
+                // vector (no ttsPad add). Default (hasSpeakerEmbedding=false): ttsPad + embTable[speakerId].
+                if (hasSpeakerEmbedding)
+                {
+                    srcA = speakerEmbedding;
+                }
+                else
+                {
+                    srcA = ttsPadEmbed;
+                    srcB = embTable + static_cast<int64_t>(speakerId) * hiddenDim;
+                }
                 break;
             default: // rowIdx == 7
                 srcA = ttsBosEmbed;
@@ -675,8 +685,17 @@ __global__ void assistantPreambleKernel(half const* __restrict__ projected, half
                 srcB = embTable + static_cast<int64_t>(codecThinkEosId) * hiddenDim;
                 break;
             case 7:
-                srcA = ttsPadEmbed;
-                srcB = embTable + static_cast<int64_t>(speakerId) * hiddenDim;
+                // External speaker embedding occupies the speaker row directly when supplied;
+                // CustomVoice default (hasSpeakerEmbedding=false) uses ttsPad + embTable[speakerId].
+                if (hasSpeakerEmbedding)
+                {
+                    srcA = speakerEmbedding;
+                }
+                else
+                {
+                    srcA = ttsPadEmbed;
+                    srcB = embTable + static_cast<int64_t>(speakerId) * hiddenDim;
+                }
                 break;
             default: // rowIdx == 8
                 srcA = ttsBosEmbed;
@@ -735,7 +754,8 @@ __global__ void assistantPreambleKernel(half const* __restrict__ projected, half
 void invokeAssistantPreamble(rt::Tensor const& projected, rt::Tensor const& ttsPadEmbed, rt::Tensor const& ttsBosEmbed,
     rt::Tensor const& ttsEosEmbed, rt::Tensor const& talkerEmbTable, int32_t codecNothinkId, int32_t codecThinkId,
     int32_t codecThinkBosId, int32_t codecThinkEosId, int32_t speakerId, int32_t codecPadId, int32_t codecBosId,
-    int32_t langId, int32_t textLen, rt::Tensor& output, cudaStream_t stream)
+    int32_t langId, int32_t textLen, rt::Tensor& output, cudaStream_t stream, half const* speakerEmbeddingPtr,
+    bool hasSpeakerEmbedding)
 {
     constexpr int32_t kVecSize = 8;
 
@@ -758,7 +778,7 @@ void invokeAssistantPreamble(rt::Tensor const& projected, rt::Tensor const& ttsP
 
     assistantPreambleKernel<kVecSize><<<grid, block, 0, stream>>>(projPtr, padPtr, bosPtr, eosPtr, embPtr,
         codecNothinkId, codecThinkId, codecThinkBosId, codecThinkEosId, speakerId, codecPadId, codecBosId, langId,
-        textLen, hiddenDim, outPtr);
+        textLen, speakerEmbeddingPtr, hasSpeakerEmbedding, hiddenDim, outPtr);
     CUDA_CHECK(cudaPeekAtLastError());
 }
 

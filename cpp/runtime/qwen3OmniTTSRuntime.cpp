@@ -805,6 +805,8 @@ void Qwen3OmniTTSRuntime::initializeTTSEmbeddings(cudaStream_t stream)
     mTtsPadEmbed = rt::Tensor({hiddenSize}, rt::DeviceType::kGPU, nvinfer1::DataType::kHALF);
     mTtsBosEmbed = rt::Tensor({hiddenSize}, rt::DeviceType::kGPU, nvinfer1::DataType::kHALF);
     mTtsEosEmbed = rt::Tensor({hiddenSize}, rt::DeviceType::kGPU, nvinfer1::DataType::kHALF);
+    // Device buffer for the optional external speaker embedding (speaker-row conditioning).
+    mSpeakerEmbeddingBuffer = rt::Tensor({hiddenSize}, rt::DeviceType::kGPU, nvinfer1::DataType::kHALF);
 
     __half* const projectedPtr = static_cast<__half*>(ttsProjected.rawPointer());
     size_t const embedSize = hiddenSize * sizeof(__half);
@@ -820,7 +822,7 @@ void Qwen3OmniTTSRuntime::initializeTTSEmbeddings(cudaStream_t stream)
 }
 
 bool Qwen3OmniTTSRuntime::projectToTalkerInput(rt::Tensor const& thinkerEmbed, int32_t speakerId, int32_t langId,
-    rt::Tensor& output, int64_t& outputSeqLen, cudaStream_t stream)
+    rt::Tensor& output, int64_t& outputSeqLen, cudaStream_t stream, std::vector<float> const& speakerEmbedding)
 {
     int64_t const seqLen = thinkerEmbed.getShape()[0];
     int64_t const hiddenSize = mTalkerConfig.talkerHiddenSize;
@@ -853,12 +855,33 @@ bool Qwen3OmniTTSRuntime::projectToTalkerInput(rt::Tensor const& thinkerEmbed, i
     kernel::invokeTalkerMLP(thinkerEmbed, mTextFC1Weight, mTextFC1Bias, mTextFC2Weight, mTextFC2Bias, mProjectedBuffer,
         mMLPWorkspace, stream);
 
+    // When an external speaker embedding is supplied (Base / speaker_encoder path), convert it to
+    // FP16 + upload; the preamble kernel uses it as the speaker-row vector instead of a speaker token.
+    bool const hasSpeakerEmbedding = !speakerEmbedding.empty();
+    if (hasSpeakerEmbedding)
+    {
+        if (static_cast<int64_t>(speakerEmbedding.size()) != hiddenSize)
+        {
+            LOG_ERROR("projectToTalkerInput: speaker embedding size %zu != hidden size %ld", speakerEmbedding.size(),
+                hiddenSize);
+            return false;
+        }
+        std::vector<__half> speakerHalf(speakerEmbedding.size());
+        for (size_t i = 0; i < speakerEmbedding.size(); ++i)
+        {
+            speakerHalf[i] = __float2half(speakerEmbedding[i]);
+        }
+        CUDA_CHECK(cudaMemcpyAsync(mSpeakerEmbeddingBuffer.rawPointer(), speakerHalf.data(),
+            speakerHalf.size() * sizeof(__half), cudaMemcpyHostToDevice, stream));
+    }
+
     // Fused kernel: build complete non-streaming prefill buffer
     check::check(output.reshape({outputSeqLen, hiddenSize}), "Tensor reshape failed");
     kernel::invokeAssistantPreamble(mProjectedBuffer, mTtsPadEmbed, mTtsBosEmbed, mTtsEosEmbed, mTalkerEmbeddingTable,
         mTalkerConfig.codecNothinkId, mTalkerConfig.codecThinkId, mTalkerConfig.codecThinkBosId,
         mTalkerConfig.codecThinkEosId, speakerId, mTalkerConfig.codecPadId, mTalkerConfig.codecBosId, langId,
-        static_cast<int32_t>(N), output, stream);
+        static_cast<int32_t>(N), output, stream,
+        hasSpeakerEmbedding ? mSpeakerEmbeddingBuffer.dataPointer<__half>() : nullptr, hasSpeakerEmbedding);
 
     return true;
 }
@@ -1215,7 +1238,8 @@ bool Qwen3OmniTTSRuntime::prepareTalkerInput(std::vector<int32_t> const& textTok
 
     // MLP projection: thinker embed → talker input embeds (non-streaming; +3 prefix rows when langId>=0)
     int64_t const hiddenSize = mTalkerConfig.talkerHiddenSize;
-    if (!projectToTalkerInput(mThinkerEmbedBuffer, speakerId, langId, mTalkerInputEmbeds, outSeqLen, stream))
+    if (!projectToTalkerInput(mThinkerEmbedBuffer, speakerId, langId, mTalkerInputEmbeds, outSeqLen, stream,
+            request.speakerEmbedding))
     {
         LOG_ERROR("MLP projection failed");
         return false;

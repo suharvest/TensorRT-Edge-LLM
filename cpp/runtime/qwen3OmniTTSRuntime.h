@@ -131,6 +131,12 @@ public:
         //!< language-conditioned prefix. Empty (default) or unknown language = upstream 8-row path, unchanged.
         std::string language{""};
 
+        //!< Optional external speaker embedding (Base / speaker_encoder voice-clone path), FP32,
+        //!< length = talkerHiddenSize. When non-empty it becomes the speaker-row conditioning vector
+        //!< directly, overriding the speakerName/speakerId token path. Empty (default) = upstream
+        //!< named-speaker token path, unchanged.
+        std::vector<float> speakerEmbedding;
+
         // Input: conversation messages for this request (runtime tokenizes internally)
         std::vector<Message> messages;
         bool applyChatTemplate{true};   //!< Whether to apply chat template formatting
@@ -634,6 +640,7 @@ private:
     rt::Tensor mTtsPadEmbed; //!< TTS pad embedding [talkerHiddenSize] FP16
     rt::Tensor mTtsBosEmbed; //!< TTS bos embedding [talkerHiddenSize] FP16
     rt::Tensor mTtsEosEmbed; //!< TTS eos embedding [talkerHiddenSize] FP16
+    rt::Tensor mSpeakerEmbeddingBuffer; //!< Optional external speaker embedding [talkerHiddenSize] FP16 (speaker-row conditioning)
 
     // ========== Workspace Tensors (allocated at maxBatchSize) ==========
     // Buffers used for per-batch prefill (not batched engine execution, reused per-batch)
@@ -700,7 +707,7 @@ private:
      * @return True on success, false on failure
      */
     bool projectToTalkerInput(rt::Tensor const& thinkerEmbed, int32_t speakerId, int32_t langId, rt::Tensor& output,
-        int64_t& outputSeqLen, cudaStream_t stream);
+        int64_t& outputSeqLen, cudaStream_t stream, std::vector<float> const& speakerEmbedding = {});
 
     //! Embed token IDs, run MLP projection, and reshape buffers ready for Talker prefill.
     //! Populates mTalkerInputEmbeds and mTalkerHiddenStatesBuffer as side effects.

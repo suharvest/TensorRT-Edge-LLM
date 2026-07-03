@@ -133,10 +133,15 @@ void invokeScatter(rt::Tensor const& source, rt::Tensor const& indices, rt::Tens
 //! \param textLen        Number of text token rows (N)
 //! \param output         Full output buffer (FP16)
 //! \param stream         CUDA stream
+//! \param speakerEmbeddingPtr  Optional external speaker embedding [H] (FP16, device). When
+//!                        hasSpeakerEmbedding is true, the speaker row (row 6 no-lang / row 7 lang)
+//!                        IS this vector (no ttsPad add) instead of ttsPad + embTable[speakerId].
+//! \param hasSpeakerEmbedding  Enable the external speaker-embedding source (default false = upstream)
 void invokeAssistantPreamble(rt::Tensor const& projected, rt::Tensor const& ttsPadEmbed, rt::Tensor const& ttsBosEmbed,
     rt::Tensor const& ttsEosEmbed, rt::Tensor const& talkerEmbTable, int32_t codecNothinkId, int32_t codecThinkId,
     int32_t codecThinkBosId, int32_t codecThinkEosId, int32_t speakerId, int32_t codecPadId, int32_t codecBosId,
-    int32_t langId, int32_t textLen, rt::Tensor& output, cudaStream_t stream);
+    int32_t langId, int32_t textLen, rt::Tensor& output, cudaStream_t stream,
+    half const* speakerEmbeddingPtr = nullptr, bool hasSpeakerEmbedding = false);
 
 //! \brief Fused residual connection for TTS decode input
 //!
