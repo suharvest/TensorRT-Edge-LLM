@@ -494,15 +494,15 @@ class ModelConfig:
     # Default False -> behaviour is byte-identical to the legacy FP16 path; no
     # existing model is affected unless it opts in. Ignored when the backbone is
     # quantized (FP8/NVFP4/AWQ/...): those paths keep their own dtype contract.
-    mixed_precision: bool = False
+    bf16_residual: bool = False
     # Opt-in: allow the mixed-precision hybrid graph to coexist with a quantized
-    # backbone.  Default False keeps the legacy contract (mixed_precision is
+    # backbone.  Default False keeps the legacy contract (bf16_residual is
     # ignored when quantized).  When True AND quant is INT4-AWQ, the residual
     # stream / RMSNorm run BF16, attention q/k/v/o stay FP16 (unquantized), and
     # the MLP runs INT4 weights with the down_proj emitting BF16 output (the
     # overflow-safe path).  Only honoured for INT4-AWQ; FP8/NVFP4/MXFP8 linears
     # require FP16 input and are left on the legacy path.
-    mixed_precision_with_quant: bool = False
+    bf16_residual_with_quant: bool = False
     # When True, embed_tokens and lm_head share the same weight tensor
     tie_word_embeddings: bool = False
     # Sliding window attention size; -1 means no sliding window.
@@ -725,20 +725,20 @@ class ModelConfig:
         return c
 
     @property
-    def mixed_precision_active(self) -> bool:
+    def bf16_residual_active(self) -> bool:
         """True when the generic BF16-residual / FP16-attention hybrid path is on.
 
-        Honoured for an unquantized backbone, or — when ``mixed_precision_with_quant``
+        Honoured for an unquantized backbone, or — when ``bf16_residual_with_quant``
         is explicitly opted in — for an INT4-AWQ backbone (residual/MLP BF16,
         attention FP16 unquantized, down_proj INT4+BF16-output).  FP8/NVFP4/MXFP8
         linears require FP16 input and are always left on the legacy FP16 path even
-        if ``mixed_precision`` is requested.
+        if ``bf16_residual`` is requested.
         """
-        if not self.mixed_precision:
+        if not self.bf16_residual:
             return False
         if not self.quant.is_quantized:
             return True
-        return (bool(self.mixed_precision_with_quant) and self.quant.quant_type
+        return (bool(self.bf16_residual_with_quant) and self.quant.quant_type
                 in (QUANT_INT4_AWQ, QUANT_INT4_AWQ_MODELOPT))
 
     @property
@@ -748,7 +748,7 @@ class ModelConfig:
         BF16 in mixed-precision mode, FP16 otherwise (legacy default).
         """
         import torch
-        return torch.bfloat16 if self.mixed_precision_active else torch.float16
+        return torch.bfloat16 if self.bf16_residual_active else torch.float16
 
     @property
     def attention_dtype(self) -> "torch.dtype":  # noqa: F821
@@ -902,9 +902,9 @@ class ModelConfig:
                                                  None),
             torch_dtype=llm_dict.get("torch_dtype",
                                      llm_dict.get("dtype", "bfloat16")),
-            mixed_precision=bool(llm_dict.get("mixed_precision", False)),
-            mixed_precision_with_quant=bool(
-                llm_dict.get("mixed_precision_with_quant", False)),
+            bf16_residual=bool(llm_dict.get("bf16_residual", False)),
+            bf16_residual_with_quant=bool(
+                llm_dict.get("bf16_residual_with_quant", False)),
             tie_word_embeddings=llm_dict.get("tie_word_embeddings", False),
             sliding_window_size=sliding_window_size,
             layer_types=layer_types,

@@ -6,7 +6,7 @@ Covers the opt-in dtype routing that lets an INT4-AWQ backbone coexist with the
 BF16-residual / FP16-attention mixed-precision graph, with the MLP down_proj
 emitting BF16 output (so its overflow-prone activation never lands in FP16):
 
-  * ``config.mixed_precision_active`` truth table
+  * ``config.bf16_residual_active`` truth table
   * ``make_linear`` routes down_proj -> AWQLinear(output_bf16=True); gate/up stay
     FP16; behaviour is byte-identical without the opt-in flag
   * ``int4_groupwise_gemm`` op returns BF16 only when output_dtype='bfloat16'
@@ -24,7 +24,7 @@ from tensorrt_edgellm.models import linear as L
 from tensorrt_edgellm.models.ops import int4_groupwise_gemm
 
 
-def _cfg(mixed_precision, quant_type, with_quant):
+def _cfg(bf16_residual, quant_type, with_quant):
     return ModelConfig(
         model_type="qwen2",
         hidden_size=896,
@@ -38,8 +38,8 @@ def _cfg(mixed_precision, quant_type, with_quant):
         rope_theta=1000000.0,
         max_position_embeddings=32768,
         quant=QuantConfig(quant_type=quant_type, group_size=128),
-        mixed_precision=mixed_precision,
-        mixed_precision_with_quant=with_quant,
+        bf16_residual=bf16_residual,
+        bf16_residual_with_quant=with_quant,
     )
 
 
@@ -53,8 +53,8 @@ def _cfg(mixed_precision, quant_type, with_quant):
         (False, QUANT_INT4_AWQ, True, False),  # no mp
     ],
 )
-def test_mixed_precision_active(mp, qtype, flag, expected):
-    assert _cfg(mp, qtype, flag).mixed_precision_active is expected
+def test_bf16_residual_active(mp, qtype, flag, expected):
+    assert _cfg(mp, qtype, flag).bf16_residual_active is expected
 
 
 def test_make_linear_down_proj_bf16_output():

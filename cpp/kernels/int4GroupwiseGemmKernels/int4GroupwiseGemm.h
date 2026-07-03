@@ -60,7 +60,7 @@ void gemv_forward_cuda_new(half const* in_feats, int8_t const* kernel, half cons
  * FP16 overflow when an output channel's pre-activation magnitude exceeds the FP16
  * range (max 65504) — e.g. SparkTTS/Qwen down_proj output channel 62 (~2.3e5). The
  * existing FP16 path is left untouched; callers opt into this variant only for
- * overflow-prone linears under config.mixed_precision.
+ * overflow-prone linears under config.bf16_residual.
  *
  * @param out_feats Output features [M, N] in BF16
  */

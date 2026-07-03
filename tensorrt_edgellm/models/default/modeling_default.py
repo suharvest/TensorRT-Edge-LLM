@@ -383,7 +383,7 @@ class DecoderLayer(nn.Module):
         # mixed-precision mode, FP16 otherwise).
         residual_dtype = config.residual_dtype
         self.attention_dtype = config.attention_dtype
-        self.mixed_precision = config.mixed_precision_active
+        self.bf16_residual = config.bf16_residual_active
         self.input_layernorm = RMSNorm(config.hidden_size,
                                        config.rms_norm_eps,
                                        dtype=residual_dtype)
@@ -403,7 +403,7 @@ class DecoderLayer(nn.Module):
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         residual = hidden_states
         normed = self.input_layernorm(hidden_states)
-        if self.mixed_precision:
+        if self.bf16_residual:
             # Cast the normed residual into the FP16 attention island. The
             # attention block (q/k/v/o_proj, RoPE, SDPA, KV cache) runs FP16;
             # its output is cast back to the BF16 residual stream below.
@@ -417,7 +417,7 @@ class DecoderLayer(nn.Module):
             attention_mask=attention_mask,
             attention_pos_id=attention_pos_id,
         )
-        if self.mixed_precision:
+        if self.bf16_residual:
             # Boundary Cast FP16 -> BF16 before the residual add.
             attn_output = attn_output.to(residual.dtype)
         hidden_states = residual + attn_output
@@ -462,7 +462,7 @@ class Transformer(nn.Module):
         self.norm = RMSNorm(config.hidden_size,
                             config.rms_norm_eps,
                             dtype=config.residual_dtype)
-        self.mixed_precision = config.mixed_precision_active
+        self.bf16_residual = config.bf16_residual_active
         self.residual_dtype = config.residual_dtype
         # Populated at the end of each forward; see module docstring.
         self.last_pre_norm_hidden_states: "torch.Tensor | None" = None
@@ -481,7 +481,7 @@ class Transformer(nn.Module):
         dflash_target_layer_ids: "List[int] | None" = None,
     ) -> Tuple[torch.Tensor, Tuple, "Tuple | None", "torch.Tensor | None"]:
         hidden_states = inputs_embeds
-        if self.mixed_precision:
+        if self.bf16_residual:
             # Engine input is FP16; upcast the residual stream to BF16 here so
             # the whole decoder runs the mixed-precision graph. This single
             # leading Cast keeps the inputs_embeds binding FP16 (no C++ change).

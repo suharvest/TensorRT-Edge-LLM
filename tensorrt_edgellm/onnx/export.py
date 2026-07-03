@@ -785,7 +785,7 @@ def _export_model(
                                         "match_fp32_elementwise_initializers",
                                         False)),
                             match_consumer_float_dtype=bool(
-                                getattr(model.config, "mixed_precision_active",
+                                getattr(model.config, "bf16_residual_active",
                                         False)))
     _strip_attention_plugin_optional_inputs(output_path)
     external_weight_files = externalize_model_weights(

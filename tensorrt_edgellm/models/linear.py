@@ -187,7 +187,7 @@ class BF16Linear(nn.Module):
     """Plain bfloat16 linear (mixed-precision residual / MLP / lm_head path).
 
     Identical to :class:`FP16Linear` but in bfloat16.  Used only when
-    ``config.mixed_precision_active`` selects the BF16 residual stream so the
+    ``config.bf16_residual_active`` selects the BF16 residual stream so the
     MLP and lm_head matmuls accumulate in BF16, avoiding the FP16 overflow that
     the legacy path hits on the residual stream.  Activations must be bfloat16.
     """
@@ -527,7 +527,7 @@ class AWQLinear(LinearBase):
         self.out_features = out_features
         self.group_size = group_size
         # Opt-in: emit BF16 output (overflow-safe down_proj path under
-        # mixed_precision_with_quant). Default False -> FP16, byte-identical.
+        # bf16_residual_with_quant). Default False -> FP16, byte-identical.
         self.output_bf16 = output_bf16
         # Initialized in AWQ layout [in, out//8] int32; loader repacks to
         # [out//2, in] int8 (swizzled plugin layout) before inference/export.
@@ -599,7 +599,7 @@ class ModelOptAWQPrepackedLinear(LinearBase):
         self.out_features = out_features
         self.group_size = group_size
         # Opt-in BF16 output (overflow-safe down_proj path under
-        # mixed_precision_with_quant). Default False -> FP16, byte-identical.
+        # bf16_residual_with_quant). Default False -> FP16, byte-identical.
         self.output_bf16 = output_bf16
         # Loaded from checkpoint as uint8; cast to int8 by the loader.
         self.register_buffer(
@@ -838,9 +838,9 @@ def make_linear(
     if quant_type == QUANT_FP16:
         # Mixed-precision: the residual-stream linears (MLP, lm_head) run in
         # BF16 while the attention projections (q/k/v/o_proj) stay FP16.  This
-        # is purely additive — without ``mixed_precision_active`` every
+        # is purely additive — without ``bf16_residual_active`` every
         # unquantized linear is FP16, exactly as before.
-        if config.mixed_precision_active and not _is_attention_projection(
+        if config.bf16_residual_active and not _is_attention_projection(
                 module_name):
             layer = BF16Linear(in_features, out_features, bias)
         else:
@@ -855,7 +855,7 @@ def make_linear(
         # MLP down_proj is the overflow-prone linear, so emit BF16 output for it
         # (gate/up stay FP16 for the SwiGLU mul). Attention projections are
         # excluded by construction (they are FP16 unquantized here).
-        output_bf16 = (config.mixed_precision_active
+        output_bf16 = (config.bf16_residual_active
                        and module_name.endswith(".down_proj")
                        and not _is_attention_projection(module_name))
         layer = AWQLinear(in_features,
@@ -864,7 +864,7 @@ def make_linear(
                           bias,
                           output_bf16=output_bf16)
     elif quant_type == QUANT_INT4_AWQ_MODELOPT:
-        output_bf16 = (config.mixed_precision_active
+        output_bf16 = (config.bf16_residual_active
                        and module_name.endswith(".down_proj")
                        and not _is_attention_projection(module_name))
         layer = ModelOptAWQPrepackedLinear(in_features,
