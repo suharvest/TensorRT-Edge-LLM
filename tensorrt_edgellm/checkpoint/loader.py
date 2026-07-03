@@ -407,7 +407,8 @@ def _set_tensor(model: nn.Module,
                 mapping: Optional[Mapping] = None) -> bool:
     """Assign *tensor* to the buffer or parameter at *key* inside *model*.
 
-    Bfloat16 tensors are cast to float16 on the fly. The export pipeline
+    Float-typed checkpoint tensors (FP32 / BF16 / FP16) are cast on the fly
+    to the destination's declared half-precision dtype. The export pipeline
     assumes FP16 activations and the C++ runtime requires FP16 (or FP8)
     weight files. Doing the cast here avoids a separate post-loading sweep.
 
@@ -425,10 +426,16 @@ def _set_tensor(model: nn.Module,
     # is half-precision (FP16 / BF16).  The module tree fixes each weight's
     # dtype at construction (FP16 attention vs. BF16 residual/MLP in the
     # mixed-precision path; FP16 everywhere on the legacy path), so honouring
-    # the destination keeps each island in its intended precision.  When the
-    # destination is unknown (plain attribute / pre-load nn.Embedding), fall
-    # back to the legacy behaviour: BF16 -> FP16.
-    if tensor.dtype in (torch.bfloat16, torch.float16):
+    # the destination keeps each island in its intended precision.  FP32
+    # sources (e.g. the SparkTTS checkpoint) must be cast too: a raw assign
+    # would replace an FP16Linear weight with a float32 Parameter and leave
+    # the whole model in a mixed-dtype state.  Destinations that deliberately
+    # declare FP32 (quant scales such as ``weights_scaling_factor`` /
+    # ``input_scale``) are untouched — the cast only fires when the
+    # destination itself is FP16/BF16.  When the destination is unknown
+    # (plain attribute / pre-load nn.Embedding), fall back to the legacy
+    # behaviour: BF16 -> FP16, FP32 kept as-is.
+    if tensor.dtype in (torch.float32, torch.bfloat16, torch.float16):
         dst = module._parameters.get(attr) if attr in module._parameters \
             else module._buffers.get(attr)
         dst_dtype = getattr(dst, "dtype", None)
