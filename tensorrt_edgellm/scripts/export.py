@@ -1952,8 +1952,11 @@ def main() -> None:
 
     if (model_type == "qwen3_tts"
             and config.get("tts_model_type") != "custom_voice"):
-        p.error("Only Qwen3-TTS CustomVoice checkpoints are supported. "
-                f"Got tts_model_type={config.get('tts_model_type')!r}.")
+        logger.warning(
+            "Qwen3-TTS non-CustomVoice checkpoint (tts_model_type=%r): exporting "
+            "Talker/CodePredictor/Code2Wav for the BASE path (P3a local patch, "
+            "mirrors v0.8.0 port commit ba9ecdb).",
+            config.get('tts_model_type'))
 
     if args.eagle_base and args.mtp:
         p.error("--eagle-base and --mtp cannot be enabled together")
