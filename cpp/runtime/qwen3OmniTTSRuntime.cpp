@@ -33,6 +33,7 @@
 #include "profiling/timer.h"
 #include "sampler/sampling.h"
 #include <algorithm>
+#include <cctype>
 #include <chrono>
 #include <cmath>
 #include <cuda_runtime.h>
@@ -401,6 +402,21 @@ bool Qwen3OmniTTSRuntime::validateAndFillConfig(std::string const& talkerEngineD
 
     // Codec special tokens (from talker vocab)
     mTalkerConfig.codecNothinkId = configJson["codec_nothink_id"].get<int32_t>();
+    // CustomVoice: the language-conditioned prefill path needs codec_think_id + a codec_language_id
+    // map. Both are optional — absent keys leave the map empty and the 9-row path unreachable.
+    if (configJson.contains("codec_think_id"))
+    {
+        mTalkerConfig.codecThinkId = configJson["codec_think_id"].get<int32_t>();
+    }
+    if (configJson.contains("codec_language_id") && configJson["codec_language_id"].is_object())
+    {
+        for (auto const& [k, v] : configJson["codec_language_id"].items())
+        {
+            mTalkerConfig.codecLanguageId[k] = v.get<int32_t>();
+        }
+        LOG_INFO("CustomVoice language config: codecThinkId=%d, codecLanguageId entries=%zu",
+            mTalkerConfig.codecThinkId, mTalkerConfig.codecLanguageId.size());
+    }
     mTalkerConfig.codecThinkBosId = configJson["codec_think_bos_id"].get<int32_t>();
     mTalkerConfig.codecThinkEosId = configJson["codec_think_eos_id"].get<int32_t>();
     mTalkerConfig.codecPadId = configJson["codec_pad_id"].get<int32_t>();
@@ -803,8 +819,8 @@ void Qwen3OmniTTSRuntime::initializeTTSEmbeddings(cudaStream_t stream)
     LOG_INFO("TTS embeddings initialized");
 }
 
-bool Qwen3OmniTTSRuntime::projectToTalkerInput(
-    rt::Tensor const& thinkerEmbed, int32_t speakerId, rt::Tensor& output, int64_t& outputSeqLen, cudaStream_t stream)
+bool Qwen3OmniTTSRuntime::projectToTalkerInput(rt::Tensor const& thinkerEmbed, int32_t speakerId, int32_t langId,
+    rt::Tensor& output, int64_t& outputSeqLen, cudaStream_t stream)
 {
     int64_t const seqLen = thinkerEmbed.getShape()[0];
     int64_t const hiddenSize = mTalkerConfig.talkerHiddenSize;
@@ -812,10 +828,13 @@ bool Qwen3OmniTTSRuntime::projectToTalkerInput(
 
     // N = text tokens after stripping 3-token role prefix and 5-token suffix
     int64_t const N = seqLen - kAssistantPrefixLen - kAssistantTrailingSuffix;
-    // Non-streaming prefill: 8 fixed prefix rows + N text rows + 2 suffix rows
-    outputSeqLen = kNonStreamingPrefixRows + N + 2; // = seqLen + 2
-    LOG_INFO("projectToTalkerInput: seqLen=%ld, N=%ld (stripped prefix=%d suffix=%d), outputSeqLen=%ld, speakerId=%d",
-        seqLen, N, kAssistantPrefixLen, kAssistantTrailingSuffix, outputSeqLen, speakerId);
+    // Non-streaming prefill: kFixedPrefixLen rows + N text rows + 2 suffix rows.
+    // langId >= 0 uses the 9-row CustomVoice language prefix; otherwise the upstream 8-row prefix.
+    int64_t const kFixedPrefixLen = (langId >= 0) ? 9 : kNonStreamingPrefixRows;
+    outputSeqLen = kFixedPrefixLen + N + 2;
+    LOG_INFO("projectToTalkerInput: seqLen=%ld, N=%ld (stripped prefix=%d suffix=%d), outputSeqLen=%ld, speakerId=%d, "
+             "langId=%d, prefixRows=%ld",
+        seqLen, N, kAssistantPrefixLen, kAssistantTrailingSuffix, outputSeqLen, speakerId, langId, kFixedPrefixLen);
 
     // Defensive guard: N <= 0 means the request carried no synthesizable assistant text after
     // stripping the fixed role prefix/suffix (e.g. an empty / malformed prompt, or a wrong-tokenizer
@@ -837,8 +856,9 @@ bool Qwen3OmniTTSRuntime::projectToTalkerInput(
     // Fused kernel: build complete non-streaming prefill buffer
     check::check(output.reshape({outputSeqLen, hiddenSize}), "Tensor reshape failed");
     kernel::invokeAssistantPreamble(mProjectedBuffer, mTtsPadEmbed, mTtsBosEmbed, mTtsEosEmbed, mTalkerEmbeddingTable,
-        mTalkerConfig.codecNothinkId, mTalkerConfig.codecThinkBosId, mTalkerConfig.codecThinkEosId, speakerId,
-        mTalkerConfig.codecPadId, mTalkerConfig.codecBosId, static_cast<int32_t>(N), output, stream);
+        mTalkerConfig.codecNothinkId, mTalkerConfig.codecThinkId, mTalkerConfig.codecThinkBosId,
+        mTalkerConfig.codecThinkEosId, speakerId, mTalkerConfig.codecPadId, mTalkerConfig.codecBosId, langId,
+        static_cast<int32_t>(N), output, stream);
 
     return true;
 }
@@ -1170,9 +1190,32 @@ bool Qwen3OmniTTSRuntime::prepareTalkerInput(std::vector<int32_t> const& textTok
         speakerId = getSpeakerIdByName(request.speakerName);
     }
 
-    // MLP projection: thinker embed → talker input embeds (non-streaming, outputSeqLen = seqLen + 2)
+    // CustomVoice language conditioning: resolve language string -> codec token ID.
+    // Lower-case the request string; lookup in codecLanguageId map. -1 means the upstream no-language path.
+    int32_t langId = -1;
+    if (!request.language.empty())
+    {
+        std::string langLc = request.language;
+        std::transform(langLc.begin(), langLc.end(), langLc.begin(),
+            [](unsigned char ch) { return static_cast<char>(std::tolower(ch)); });
+        auto it = mTalkerConfig.codecLanguageId.find(langLc);
+        if (it != mTalkerConfig.codecLanguageId.end())
+        {
+            langId = it->second;
+            LOG_INFO("CustomVoice language conditioning enabled: language=\"%s\" -> codec_id=%d", langLc.c_str(),
+                langId);
+        }
+        else
+        {
+            LOG_WARNING("Requested language=\"%s\" not found in codec_language_id map (size=%zu); "
+                        "falling back to no-language prefill path",
+                langLc.c_str(), mTalkerConfig.codecLanguageId.size());
+        }
+    }
+
+    // MLP projection: thinker embed → talker input embeds (non-streaming; +3 prefix rows when langId>=0)
     int64_t const hiddenSize = mTalkerConfig.talkerHiddenSize;
-    if (!projectToTalkerInput(mThinkerEmbedBuffer, speakerId, mTalkerInputEmbeds, outSeqLen, stream))
+    if (!projectToTalkerInput(mThinkerEmbedBuffer, speakerId, langId, mTalkerInputEmbeds, outSeqLen, stream))
     {
         LOG_ERROR("MLP projection failed");
         return false;
@@ -2347,9 +2390,12 @@ bool Qwen3OmniTTSRuntime::buildTalkerPrefillFromSegments(std::vector<int32_t> co
         rt::Tensor assistantSlice(const_cast<__half*>(assistantProjPtr), rt::Coords{assistantInputLen, hiddenSize},
             rt::DeviceType::kGPU, nvinfer1::DataType::kHALF);
 
+        // Omni segment path does not propagate per-request language (matches the v0.8.0 branch);
+        // langId=-1 keeps the upstream 8-row restructured preamble.
         kernel::invokeAssistantPreamble(assistantSlice, mTtsPadEmbed, mTtsBosEmbed, mTtsEosEmbed, mTalkerEmbeddingTable,
-            mTalkerConfig.codecNothinkId, mTalkerConfig.codecThinkBosId, mTalkerConfig.codecThinkEosId, speakerId,
-            mTalkerConfig.codecPadId, mTalkerConfig.codecBosId, 1, preambleScratch, stream);
+            mTalkerConfig.codecNothinkId, mTalkerConfig.codecThinkId, mTalkerConfig.codecThinkBosId,
+            mTalkerConfig.codecThinkEosId, speakerId, mTalkerConfig.codecPadId, mTalkerConfig.codecBosId,
+            /*langId=*/-1, 1, preambleScratch, stream);
 
         __half* const aOut = static_cast<__half*>(mTalkerInputEmbeds.rawPointer()) + userTotalLen * hiddenSize;
         CUDA_CHECK(cudaMemcpyAsync(aOut, scratchPtr, kAssistantRestructuredLen * hiddenSize * sizeof(__half),
