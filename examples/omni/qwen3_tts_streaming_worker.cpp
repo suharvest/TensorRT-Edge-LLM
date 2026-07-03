@@ -18,10 +18,11 @@
  * request_id+id, pool saturation error with status 4429.
  *
  * M1 deltas vs the v0.8.0 worker (see docs spec edgellm-v090-tts-re-port):
- *   * Native streaming: uniform streamingChunkFrames replaces the old
- *     first/subsequent chunk surgery. `first_chunk_frames` is used as the
- *     uniform chunk size (latency-critical knob); `chunk_frames` is still
- *     accepted but folded into uniform chunking.
+ *   * Native streaming: the runtime emits uniform streamingChunkFrames =
+ *     `first_chunk_frames` (the TTFA-critical knob). Differentiated chunk
+ *     sizes are recovered WORKER-SIDE (M3): after the first chunk, runtime
+ *     chunks are aggregated up to `chunk_frames` frames before each Code2Wav
+ *     call — no runtime chunk-schedule surgery (unlike the v0.8.0 port).
  *   * Cancel (M3): {"type":"cancel","id":X} trips the per-id atomic flag; the
  *     runtime polls TalkerGenerationRequest::shouldCancel per decoded frame,
  *     the stream ends with is_final=true, and the worker emits `cancelled`
@@ -510,7 +511,15 @@ void processRequest(TtsSlot& slot, Json const& item, bool useStateful, bool useA
         // frame; when tripped the stream ends with isFinal=true and
         // handleAudioGeneration returns normally.
         request.shouldCancel = [&cancelled]() { return cancelled.load(std::memory_order_acquire); };
+        // Differentiated chunk sizes (M3, worker-side): the runtime's native
+        // streamingChunkFrames is set to first_chunk_frames (small — the
+        // TTFA-critical knob), and the worker AGGREGATES subsequent runtime
+        // chunks up to chunk_frames before vocoding (bigger Code2Wav calls =
+        // better throughput). The runtime chunk schedule itself is untouched.
+        // chunk_frames <= first_chunk_frames disables aggregation (uniform
+        // chunking, M1 behavior).
         int32_t const firstChunkFrames = std::max(1, item.value("first_chunk_frames", 8));
+        int32_t const subsequentChunkFrames = std::max(0, item.value("chunk_frames", 10));
         bool const streaming = item.value("stream", true);
         std::string const chunkFormat = item.value("chunk_format", "pcm_s16le");
         std::string const chunkTransport = item.value("chunk_transport", "base64");
@@ -606,6 +615,15 @@ void processRequest(TtsSlot& slot, Json const& item, bool useStateful, bool useA
             });
         }
 
+        // Deliver one protocol chunk (vocode + emit): async path enqueues to the
+        // overlap vocode thread, sync path vocodes inline on the slot stream.
+        std::function<void(std::vector<std::vector<int32_t>> const&, bool)> deliverChunk;
+        // Worker-side aggregation state for differentiated chunk sizes. Touched
+        // only from the runtime generation thread (onChunkReady caller), so no
+        // locking is needed.
+        std::vector<std::vector<int32_t>> aggBuffer;
+        bool firstChunkDelivered = false;
+
         if (streaming)
         {
             // v0.9.0 native streaming API. The runtime invokes onChunkReady from
@@ -616,7 +634,7 @@ void processRequest(TtsSlot& slot, Json const& item, bool useStateful, bool useA
             request.streamingChunkFrames = firstChunkFrames;
             if (useAsyncVocode)
             {
-                request.onChunkReady = [&](std::vector<std::vector<int32_t>> const& chunkRvqCodes, bool isFinal) {
+                deliverChunk = [&](std::vector<std::vector<int32_t>> const& chunkRvqCodes, bool isFinal) {
                     VocodeJob job;
                     job.poison = false;
                     job.isFinal = isFinal;
@@ -632,8 +650,43 @@ void processRequest(TtsSlot& slot, Json const& item, bool useStateful, bool useA
             }
             else
             {
-                request.onChunkReady = [&](std::vector<std::vector<int32_t>> const& chunkRvqCodes, bool isFinal) {
+                deliverChunk = [&](std::vector<std::vector<int32_t>> const& chunkRvqCodes, bool isFinal) {
                     emitChunk(chunkRvqCodes, isFinal, chunkIndex++, std::chrono::steady_clock::now(), stream);
+                };
+            }
+
+            bool const aggregate = subsequentChunkFrames > firstChunkFrames;
+            if (!aggregate)
+            {
+                // Uniform chunking (M1 behavior): relay every runtime chunk 1:1.
+                request.onChunkReady = deliverChunk;
+            }
+            else
+            {
+                // First runtime chunk goes out immediately (TTFA); subsequent
+                // runtime chunks accumulate until subsequentChunkFrames frames,
+                // then vocode as ONE bigger chunk. isFinal flushes the remainder
+                // (possibly empty) as the protocol's is_final event.
+                request.onChunkReady = [&, subsequentChunkFrames](
+                                           std::vector<std::vector<int32_t>> const& chunkRvqCodes, bool isFinal) {
+                    if (!firstChunkDelivered)
+                    {
+                        firstChunkDelivered = true;
+                        deliverChunk(chunkRvqCodes, isFinal);
+                        return;
+                    }
+                    aggBuffer.insert(aggBuffer.end(), chunkRvqCodes.begin(), chunkRvqCodes.end());
+                    if (isFinal)
+                    {
+                        deliverChunk(aggBuffer, true);
+                        aggBuffer.clear();
+                        return;
+                    }
+                    if (static_cast<int32_t>(aggBuffer.size()) >= subsequentChunkFrames)
+                    {
+                        deliverChunk(aggBuffer, false);
+                        aggBuffer.clear();
+                    }
                 };
             }
         }
