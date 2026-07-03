@@ -144,6 +144,25 @@ Qwen3OmniTTSRuntime::Qwen3OmniTTSRuntime(std::string const& talkerEngineDir, std
     std::string const& tokenizerDir, cudaStream_t stream)
     : mStream(stream)
 {
+    initializeRuntime(talkerEngineDir, codePredictorEngineDir, tokenizerDir, stream);
+}
+
+Qwen3OmniTTSRuntime::Qwen3OmniTTSRuntime(nvinfer1::ICudaEngine* talkerEngine,
+    nvinfer1::ICudaEngine* codePredictorEngine, std::string const& talkerEngineDir,
+    std::string const& codePredictorEngineDir, std::string const& tokenizerDir, cudaStream_t stream)
+    : mBorrowedTalkerEngine(talkerEngine)
+    , mBorrowedCodePredictorEngine(codePredictorEngine)
+    , mStream(stream)
+{
+    ELLM_CHECK(mBorrowedTalkerEngine != nullptr, "shared-engine ctor requires a non-null Talker engine");
+    ELLM_CHECK(mBorrowedCodePredictorEngine != nullptr, "shared-engine ctor requires a non-null CodePredictor engine");
+    LOG_INFO("Initializing Qwen3-Omni Talker runner with SHARED (borrowed) engines");
+    initializeRuntime(talkerEngineDir, codePredictorEngineDir, tokenizerDir, stream);
+}
+
+void Qwen3OmniTTSRuntime::initializeRuntime(std::string const& talkerEngineDir,
+    std::string const& codePredictorEngineDir, std::string const& tokenizerDir, cudaStream_t stream)
+{
     NVTX_SCOPED_RANGE(nvtx_range, "TalkerRunner::init", nvtx_colors::YELLOW);
     LOG_INFO("Initializing Qwen3-Omni Talker runner");
     LOG_INFO("  Talker: %s", talkerEngineDir.c_str());
@@ -306,7 +325,10 @@ bool Qwen3OmniTTSRuntime::initializeEngineRunners(
     try
     {
         mTalkerLLMConfig = rt::parseEngineConfig(talkerConfigPath);
-        mTalkerExec = rt::EngineExecutor::createForLLM(talkerEnginePath, mTalkerLLMConfig);
+        // Shared-engine ctor: borrow the already-deserialized engine (weights shared, context fresh).
+        mTalkerExec = mBorrowedTalkerEngine != nullptr
+            ? rt::EngineExecutor::createForLLMBorrowed(mBorrowedTalkerEngine, mTalkerLLMConfig)
+            : rt::EngineExecutor::createForLLM(talkerEnginePath, mTalkerLLMConfig);
         std::unordered_map<std::string, std::string> emptyLoraMap;
         mTalkerSharedRes = rt::SharedResources::createForLLM(mTalkerLLMConfig, emptyLoraMap, mStream);
         mTalkerPipelineIO = std::make_unique<rt::PipelineIO>(rt::PipelineIO::createForLLM(mTalkerLLMConfig, mStream));
@@ -336,7 +358,10 @@ bool Qwen3OmniTTSRuntime::initializeEngineRunners(
     try
     {
         mCodePredictorConfig = rt::parseEngineConfig(codePredictorConfigPath);
-        mCodePredictorExec = rt::EngineExecutor::createForLLM(codePredictorEnginePath, mCodePredictorConfig);
+        // Shared-engine ctor: borrow the already-deserialized engine (weights shared, context fresh).
+        mCodePredictorExec = mBorrowedCodePredictorEngine != nullptr
+            ? rt::EngineExecutor::createForLLMBorrowed(mBorrowedCodePredictorEngine, mCodePredictorConfig)
+            : rt::EngineExecutor::createForLLM(codePredictorEnginePath, mCodePredictorConfig);
         std::unordered_map<std::string, std::string> emptyLoraMap;
         mCodePredictorSharedRes = rt::SharedResources::createForLLM(mCodePredictorConfig, emptyLoraMap, mStream);
         mCodePredictorPipelineIO

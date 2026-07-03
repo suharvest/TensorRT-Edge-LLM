@@ -27,9 +27,11 @@
  *     the stream ends with is_final=true, and the worker emits `cancelled`
  *     (same events/fields as the v0.8.0 worker: cancel_ack{tripped} →
  *     final chunk → cancelled).
- *   * Slots: every slot constructs its own runtime via the path-based ctor
- *     (v0.9.0 has no shared-engine ctor yet — M3). max_slots=1 is the M1
- *     validated configuration.
+ *   * Slots (M3): slot 0 deserializes the engines; slots 1..N-1 share slot 0's
+ *     read-only ICudaEngines via the shared-engine ctors (Talker,
+ *     CodePredictor, Code2Wav), paying only per-slot context/KV/workspace
+ *     memory. EDGE_LLM_TTS_SHARED_ENGINE=0 forces independent per-slot
+ *     deserialization (memory A/B baseline).
  *   * `language` (CustomVoice 9-row language conditioning) and
  *     `speaker_embedding_b64` (external voice-clone embedding, base64
  *     LE float32) are passed through to the runtime (M2 patches). Omitting
@@ -399,10 +401,13 @@ Qwen3OmniTTSRuntime::TalkerGenerationRequest buildRequest(Json const& item)
 // TTS slot-pool.
 //
 // Each TtsSlot is a self-contained, single-threaded TTS lane:
-//   * runtime    — independent Qwen3OmniTTSRuntime (path-based ctor; v0.9.0
-//                  has no shared-engine ctor yet — each slot deserializes its
-//                  own Talker + CodePredictor engines. Weight sharing is M3.)
-//   * code2wav   — independent (STATELESS) Code2WavRunner per slot.
+//   * runtime    — independent Qwen3OmniTTSRuntime. Slot 0 deserializes the
+//                  Talker + CodePredictor engines; slots 1..N-1 share those
+//                  ICudaEngines (shared-engine ctor). Each slot has its own
+//                  IExecutionContexts, KV/cache state, workspace tensors.
+//   * code2wav   — independent (STATELESS) Code2WavRunner per slot; slots
+//                  1..N-1 share slot 0's Code2Wav engine weights, contexts
+//                  and buffers stay per-slot.
 //   * stream     — per-slot CUDA stream so independent slots can overlap.
 //   * worker     — the ONE OS thread that drives this slot's runtime.
 //   * queue/cv   — single-element handoff from the stdin reader to the worker.
@@ -739,10 +744,12 @@ void slotWorkerLoop(TtsSlot* slot, bool useStateful, bool useAsyncVocode)
     }
 }
 
-//! Build the N-slot pool. v0.9.0 has only the path-based runtime ctor, so
-//! EVERY slot deserializes its own Talker + CodePredictor engines (weight
-//! memory paid per slot — the shared-engine ctor returns in M3). Each slot
-//! gets its own Code2WavRunner + CUDA stream + worker thread.
+//! Build the N-slot pool. Slot 0 deserializes the Talker + CodePredictor +
+//! Code2Wav engines via the path ctors; slots 1..N-1 SHARE those read-only
+//! ICudaEngines through the shared-engine ctors (D2), paying only per-slot
+//! context/KV/workspace memory. Set EDGE_LLM_TTS_SHARED_ENGINE=0 to force
+//! independent per-slot deserialization (memory A/B baseline). Each slot gets
+//! its own Code2WavRunner (stateless), CUDA stream, and worker thread.
 bool initSlotPool(Args const& args, bool useStateful, bool useAsyncVocode, int64_t& initMsOut)
 {
     int32_t const n = std::max(1, gMaxSlots);
@@ -751,6 +758,8 @@ bool initSlotPool(Args const& args, bool useStateful, bool useAsyncVocode, int64
 
     bool const enableCudaGraph = std::getenv("EDGE_LLM_TTS_CUDA_GRAPH") == nullptr
         || std::string(std::getenv("EDGE_LLM_TTS_CUDA_GRAPH")) != "0";
+    bool const useSharedEngine = std::getenv("EDGE_LLM_TTS_SHARED_ENGINE") == nullptr
+        || std::string(std::getenv("EDGE_LLM_TTS_SHARED_ENGINE")) != "0";
 
     auto const initStart = std::chrono::steady_clock::now();
     try
@@ -762,12 +771,26 @@ bool initSlotPool(Args const& args, bool useStateful, bool useAsyncVocode, int64
             slot->inUse.store(false);
             CUDA_CHECK(cudaStreamCreate(&slot->stream));
 
-            slot->runtime = std::make_unique<Qwen3OmniTTSRuntime>(
-                args.talkerEngineDir, args.codePredictorEngineDir, args.tokenizerDir, slot->stream);
+            if (i > 0 && useSharedEngine)
+            {
+                // Shared-engine ctor: reuse slot 0's deserialized (read-only) engines.
+                // Per-slot execution contexts / KV caches / workspace stay private.
+                Qwen3OmniTTSRuntime& owner = *slots[0]->runtime;
+                slot->runtime = std::make_unique<Qwen3OmniTTSRuntime>(owner.getTalkerEngine(),
+                    owner.getCodePredictorEngine(), args.talkerEngineDir, args.codePredictorEngineDir,
+                    args.tokenizerDir, slot->stream);
+                slot->code2wav = std::make_unique<Code2WavRunner>(
+                    slots[0]->code2wav->getEnginePtr(), args.code2wavEngineDir, slot->stream);
+            }
+            else
+            {
+                slot->runtime = std::make_unique<Qwen3OmniTTSRuntime>(
+                    args.talkerEngineDir, args.codePredictorEngineDir, args.tokenizerDir, slot->stream);
 
-            // Per-slot STATELESS Code2Wav. Each owns its own engine+context+buffers,
-            // so concurrent slots never contend. useStateful only affects `ready` meta.
-            slot->code2wav = std::make_unique<Code2WavRunner>(args.code2wavEngineDir, slot->stream);
+                // Per-slot STATELESS Code2Wav. Each owns its own engine+context+buffers,
+                // so concurrent slots never contend. useStateful only affects `ready` meta.
+                slot->code2wav = std::make_unique<Code2WavRunner>(args.code2wavEngineDir, slot->stream);
+            }
 
             if (enableCudaGraph && !slot->runtime->captureDecodingCUDAGraph(slot->stream))
             {
@@ -817,8 +840,12 @@ void destroySlotPool()
             slotPtr->worker.join();
         }
     }
-    for (auto& slotPtr : gPool->slots())
+    // Free slots in REVERSE order: slots 1..N-1 borrow slot 0's engines (shared-engine ctor),
+    // so every borrower's contexts must be destroyed before the owning slot 0 releases the engines.
+    auto& allSlots = gPool->slots();
+    for (auto it = allSlots.rbegin(); it != allSlots.rend(); ++it)
     {
+        auto& slotPtr = *it;
         slotPtr->code2wav.reset();
         slotPtr->runtime.reset();
         if (slotPtr->stream != nullptr)

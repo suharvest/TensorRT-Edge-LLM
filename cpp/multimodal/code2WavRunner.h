@@ -62,6 +62,26 @@ public:
     //! \param[in] stream CUDA stream for execution
     Code2WavRunner(std::string const& engineDir, cudaStream_t stream);
 
+    //! \brief Construct a Code2WavRunner that SHARES (borrows) an already-deserialized engine.
+    //!
+    //! Reuses a live, read-only ICudaEngine owned by another Code2WavRunner (e.g. slot 0 of a
+    //! TTS slot pool) instead of re-deserializing code2wav.engine, removing the per-slot copy
+    //! of the engine weights. The borrowed engine is NOT owned: the owner must outlive this
+    //! instance. The execution context, activation memory, and I/O buffers are allocated fresh
+    //! per instance, so concurrent slots never contend on mutable state.
+    //!
+    //! \param[in] borrowedEngine Non-owning pointer to a live engine (from getEnginePtr(); non-null)
+    //! \param[in] engineDir Directory with the non-engine assets (config.json) — must match the owner
+    //! \param[in] stream CUDA stream for execution
+    Code2WavRunner(nvinfer1::ICudaEngine* borrowedEngine, std::string const& engineDir, cudaStream_t stream);
+
+    //! \brief Borrowed (non-owning) engine pointer, for sharing weights across slot-pool instances.
+    //! \note Read-only shared weights; callers must NOT delete it and must keep the owner alive.
+    nvinfer1::ICudaEngine* getEnginePtr() const noexcept
+    {
+        return mCode2WavEngine ? mCode2WavEngine.get() : mBorrowedEngine;
+    }
+
     ~Code2WavRunner() noexcept = default;
 
     //! \brief Generate audio waveform from RVQ codes (single sample)
@@ -116,10 +136,17 @@ private:
     bool runChunkedInference(
         std::vector<std::vector<int32_t>> const& codes, rt::Tensor& outputWaveform, cudaStream_t stream);
 
+    //! Resolve the active engine pointer (owned mCode2WavEngine, or borrowed mBorrowedEngine).
+    nvinfer1::ICudaEngine* enginePtr() const noexcept
+    {
+        return mCode2WavEngine ? mCode2WavEngine.get() : mBorrowedEngine;
+    }
+
     Code2WavConfig mConfig{};                                      //!< Code2Wav vocoder configuration
-    std::unique_ptr<nvinfer1::IRuntime> mRuntime;                  //!< TensorRT runtime
-    std::unique_ptr<nvinfer1::ICudaEngine> mCode2WavEngine;        //!< Code2Wav TensorRT engine
-    std::unique_ptr<nvinfer1::IExecutionContext> mCode2WavContext; //!< Code2Wav execution context
+    std::unique_ptr<nvinfer1::IRuntime> mRuntime;                  //!< TensorRT runtime (null in borrowed mode)
+    std::unique_ptr<nvinfer1::ICudaEngine> mCode2WavEngine;        //!< Code2Wav TensorRT engine (null in borrowed mode)
+    nvinfer1::ICudaEngine* mBorrowedEngine{nullptr};               //!< Non-owning engine (borrowed/shared mode)
+    std::unique_ptr<nvinfer1::IExecutionContext> mCode2WavContext; //!< Per-instance execution context (never shared)
     rt::Tensor mInputCodesDevice{};                                //!< [1, numQuantizers, seqLen] Input codes on GPU
     rt::Tensor mOutputWaveform{};                                  //!< [1, 1, waveformLen] Output waveform
     nvinfer1::DataType mWaveformDtype{nvinfer1::DataType::kHALF};  //!< Engine's actual waveform output dtype

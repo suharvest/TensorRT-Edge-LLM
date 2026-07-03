@@ -80,6 +80,31 @@ Code2WavRunner::Code2WavRunner(std::string const& engineDir, cudaStream_t stream
     LOG_INFO("Code2Wav runner initialized successfully");
 }
 
+Code2WavRunner::Code2WavRunner(nvinfer1::ICudaEngine* borrowedEngine, std::string const& engineDir, cudaStream_t stream)
+    : mBorrowedEngine(borrowedEngine)
+{
+    ELLM_CHECK(mBorrowedEngine != nullptr, "borrowed Code2Wav engine must not be null");
+
+    bool const configValid = validateAndFillConfig(engineDir);
+    ELLM_CHECK(configValid, "Failed to validate and fill config");
+
+    LOG_INFO("reusing borrowed (shared) Code2Wav engine (%d I/O tensors)", mBorrowedEngine->getNbIOTensors());
+
+    // Per-instance execution context created off the SHARED engine. The engine weights are
+    // read-only and safe to share; the context (activation memory) is NOT shared.
+    mCode2WavContext = std::unique_ptr<nvinfer1::IExecutionContext>(mBorrowedEngine->createExecutionContext());
+    ELLM_CHECK(mCode2WavContext, "Failed to create Code2Wav execution context on borrowed engine");
+
+    bool const profileSet = mCode2WavContext->setOptimizationProfileAsync(0, stream);
+    ELLM_CHECK(profileSet, "Failed to set optimization profile");
+    CUDA_CHECK(cudaStreamSynchronize(stream));
+
+    bool const bufferAllocated = allocateBuffer();
+    ELLM_CHECK(bufferAllocated, "Failed to allocate buffers");
+
+    LOG_INFO("Code2Wav runner initialized successfully (borrowed engine)");
+}
+
 bool Code2WavRunner::validateAndFillConfig(std::string const& engineDir)
 {
     std::string const configPath = engineDir + "/config.json";
@@ -154,14 +179,14 @@ bool Code2WavRunner::validateAndFillConfig(std::string const& engineDir)
 
 bool Code2WavRunner::allocateBuffer()
 {
-    if (!mCode2WavEngine || !mCode2WavContext)
+    if (!enginePtr() || !mCode2WavContext)
     {
         LOG_ERROR("Cannot allocate buffers - engine not loaded");
         return false;
     }
 
     nvinfer1::Dims const codesShapeMax
-        = mCode2WavEngine->getProfileShape(binding_names::kCode2WavCodes, 0, nvinfer1::OptProfileSelector::kMAX);
+        = enginePtr()->getProfileShape(binding_names::kCode2WavCodes, 0, nvinfer1::OptProfileSelector::kMAX);
 
     int64_t const maxSeqLen = codesShapeMax.d[2];
     int64_t const maxWaveformLen = maxSeqLen * mConfig.upsampleRate;
@@ -169,7 +194,7 @@ bool Code2WavRunner::allocateBuffer()
     // Detect engine's actual waveform output dtype (FP16 for Qwen3-Omni code2wav,
     // FP32 for Qwen3-TTS tokenizer_decoder). Allocating the wrong dtype reinterprets bytes
     // and produces garbled audio.
-    mWaveformDtype = mCode2WavEngine->getTensorDataType(binding_names::kCode2WavWaveform);
+    mWaveformDtype = enginePtr()->getTensorDataType(binding_names::kCode2WavWaveform);
     LOG_INFO("Code2Wav waveform output dtype: %s",
         mWaveformDtype == nvinfer1::DataType::kHALF        ? "FP16"
             : mWaveformDtype == nvinfer1::DataType::kFLOAT ? "FP32"
@@ -357,7 +382,7 @@ bool Code2WavRunner::generateWaveform(
     int64_t const seqLen = math::cast<int64_t>(codes[0].size());
     // Query engine's actual max profile (not mInputCodesDevice.getShape() which is mutated by prepareCodes).
     nvinfer1::Dims const codesShapeMax
-        = mCode2WavEngine->getProfileShape(binding_names::kCode2WavCodes, 0, nvinfer1::OptProfileSelector::kMAX);
+        = enginePtr()->getProfileShape(binding_names::kCode2WavCodes, 0, nvinfer1::OptProfileSelector::kMAX);
     int64_t const maxCodeLen = codesShapeMax.d[2];
     int64_t waveformLen = 0;
 
