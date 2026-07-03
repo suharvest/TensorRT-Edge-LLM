@@ -817,6 +817,17 @@ bool Qwen3OmniTTSRuntime::projectToTalkerInput(
     LOG_INFO("projectToTalkerInput: seqLen=%ld, N=%ld (stripped prefix=%d suffix=%d), outputSeqLen=%ld, speakerId=%d",
         seqLen, N, kAssistantPrefixLen, kAssistantTrailingSuffix, outputSeqLen, speakerId);
 
+    // Defensive guard: N <= 0 means the request carried no synthesizable assistant text after
+    // stripping the fixed role prefix/suffix (e.g. an empty / malformed prompt, or a wrong-tokenizer
+    // chat template that collapses the assistant turn). Feeding such a prefill into the Talker
+    // produces garbage audio rather than silence. Reject early instead of decoding nonsense.
+    if (N <= 0)
+    {
+        LOG_ERROR("projectToTalkerInput: no synthesizable text (N=%ld <= 0, seqLen=%ld); skipping Talker prefill", N,
+            seqLen);
+        return false;
+    }
+
     // Project all tokens via text_projection MLP
     check::check(mProjectedBuffer.reshape({seqLen, hiddenSize}), "Tensor reshape failed");
     check::check(mMLPWorkspace.reshape({seqLen, thinkerHiddenSize}), "Tensor reshape failed");
@@ -2347,6 +2358,21 @@ bool Qwen3OmniTTSRuntime::buildTalkerPrefillFromSegments(std::vector<int32_t> co
 
     // Step 6: Fill trailing text hidden states
     int64_t const assistantSegLen = assistantSeg.endPos - assistantSeg.startPos;
+
+    // Defensive guard: the effective synthesizable text-token count is
+    // (assistantSegLen - kAssistantTrailingOffset). When it is <= 0 the assistant turn carried no
+    // real text after the fixed role prefix (empty / malformed prompt, or a wrong-tokenizer chat
+    // template that collapses the assistant content). Decoding such a prefill produces garbage audio
+    // instead of silence, so reject early and let the caller drop this batch.
+    int64_t const effectiveTextN = assistantSegLen - kAssistantTrailingOffset;
+    if (effectiveTextN <= 0)
+    {
+        LOG_ERROR("buildTalkerPrefillFromSegments: no synthesizable text (effective N=%ld <= 0, assistantSegLen=%ld, "
+                  "offset=%d); skipping Talker prefill",
+            effectiveTextN, assistantSegLen, kAssistantTrailingOffset);
+        return false;
+    }
+
     trailingCount = std::min(static_cast<int32_t>(assistantSegLen - kAssistantTrailingOffset),
         static_cast<int32_t>(trailingTextHidden.getShape()[0]) - 1);
     if (trailingCount > 0)
