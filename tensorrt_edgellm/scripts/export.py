@@ -1337,6 +1337,17 @@ def _patch_tts_config(model_dir: str, out_dir: str) -> None:
         if v is not None:
             cfg[key] = v
 
+    # CustomVoice language conditioning map: language name -> codec token id.
+    # The C++ runtime (qwen3OmniTTSRuntime.cpp::loadConfig) reads this dict to
+    # build the 9-row language-conditioned Talker prefill; when the map is
+    # missing it loads 0 entries and silently degrades to the 8-row
+    # no-language prefix. The fp16 direct export and the int4 stage2 export
+    # both assemble the talker config here, so carrying it here fixes both.
+    # Optional for non-CustomVoice models (absent key -> nothing written).
+    lang_map = pick("codec_language_id")
+    if isinstance(lang_map, dict) and lang_map:
+        cfg["codec_language_id"] = lang_map
+
     # tts_model_type (only present in root config, not talker_config).
     if "tts_model_type" in root_config:
         cfg["tts_model_type"] = root_config["tts_model_type"]
