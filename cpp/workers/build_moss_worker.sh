@@ -1,6 +1,9 @@
 #!/usr/bin/env bash
-# Standalone build script for moss_tts_nano_worker on orin-nx.
-# Bypasses CMake (which is blocked by pre-existing gdn_decode.h CUDA 12.6 conflict).
+# LEGACY (v0.7.x line): standalone build script for moss_tts_nano_worker.
+# On the v0.9.0 branch the worker moved to examples/omni/moss_tts_nano_worker.cpp
+# and builds via the CMake target `moss_tts_nano_worker` (examples/omni/CMakeLists.txt);
+# use that instead. Kept only as a reference for the original orin-nx link recipe.
+# Bypassed CMake (which was blocked by pre-existing gdn_decode.h CUDA 12.6 conflict).
 # See docs/playbooks/tts-model-edge-port-playbook.md.
 
 set -euo pipefail
