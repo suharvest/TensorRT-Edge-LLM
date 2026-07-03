@@ -437,6 +437,34 @@ def _collect_user_token_id(model_dir: str, root: dict) -> dict:
     return {}
 
 
+def _force_qwen3_asr_mrope(cfg: dict) -> bool:
+    """Force ``rope_type: "mrope"`` on the exported Qwen3-ASR LLM config.
+
+    The Qwen3-ASR HF checkpoint ships ``rope_scaling`` with
+    ``rope_type: "linear"`` (factor 1.0) *alongside* ``mrope_section``.
+    Carried verbatim into the runtime config, the C++ ``collectRopeConfig()``
+    (cpp/runtime/llmRuntimeUtils.cpp) matches neither ``"mrope"`` nor
+    ``"default"`` + ``mrope_section``, so the engine silently runs without
+    MRoPE and transcription degrades to garbage.  Emit the validated value
+    (docs qwen3-asr-0.6b-int4-v080 §2 — previously applied as a manual
+    post-export config edit) at the factory instead: whenever
+    ``mrope_section`` is present, rewrite both type keys to ``"mrope"``.
+
+    Returns True if the config dict was modified.
+    """
+    rope_scaling = cfg.get("rope_scaling")
+    if not isinstance(rope_scaling, dict) or "mrope_section" not in rope_scaling:
+        return False
+    if (rope_scaling.get("rope_type") == "mrope"
+            and rope_scaling.get("type") == "mrope"):
+        return False
+    fixed = dict(rope_scaling)
+    fixed["rope_type"] = "mrope"
+    fixed["type"] = "mrope"
+    cfg["rope_scaling"] = fixed
+    return True
+
+
 def _patch_multimodal_token_ids(model_dir: str, llm_out_dir: str,
                                 model_type: str) -> None:
     """Inject multimodal special-token IDs into the exported LLM's ``config.json``.
@@ -483,16 +511,26 @@ def _patch_multimodal_token_ids(model_dir: str, llm_out_dir: str,
         if model_type == "qwen3_asr":
             collected["model"] = "qwen3asrthinker"
 
-    if not collected:
+    if not collected and model_type != "qwen3_asr":
         return
 
     with open(cfg_path) as f:
         cfg = json.load(f)
     cfg.update(collected)
+
+    # Qwen3-ASR: the checkpoint's rope_type "linear" must become "mrope" in
+    # the runtime config or the C++ runtime skips MRoPE entirely.
+    if model_type == "qwen3_asr" and _force_qwen3_asr_mrope(cfg):
+        logger.info(
+            "[LLM] qwen3_asr: rope_scaling rope_type/type forced to "
+            "\"mrope\" (checkpoint shipped a non-mrope rope_type with "
+            "mrope_section present)")
+
     with open(cfg_path, "w") as f:
         json.dump(cfg, f, indent=2)
-    pretty = ", ".join(f"{k}={v}" for k, v in collected.items())
-    logger.info("[LLM] Patched multimodal token IDs: %s", pretty)
+    if collected:
+        pretty = ", ".join(f"{k}={v}" for k, v in collected.items())
+        logger.info("[LLM] Patched multimodal token IDs: %s", pretty)
 
 
 # ---------------------------------------------------------------------------
